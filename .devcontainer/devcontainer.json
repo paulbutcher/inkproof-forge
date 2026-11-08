@@ -1,0 +1,31 @@
+{
+	"name": "Agents",
+	"build": { "dockerfile": "Dockerfile" },
+
+  // Runs on the host before the container exists, so that the bind mount below has
+  // a directory to attach to. Without it Docker invents one owned by root, and the
+  // container's `vscode` user cannot then write its own configuration.
+  "initializeCommand": "mkdir -p ${localEnv:HOME}/.claude-devcontainer",
+
+  // Claude's state is per-person and stays on the host.
+  "mounts": [
+    "source=${localEnv:HOME}/.claude-devcontainer,target=/home/vscode/.claude,type=bind,consistency=cached"
+  ],
+
+  // Both run once the mount is in place. `claude update` keeps the container current between image
+  // rebuilds, which it otherwise would not be: ~/.local is not mounted.
+  "postStartCommand": "claude update || true",
+
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "${containerWorkspaceFolder}"
+  },
+
+	"customizations": {
+		"vscode": {
+			"extensions": ["anthropic.claude-code"]
+		}
+	}
+}
