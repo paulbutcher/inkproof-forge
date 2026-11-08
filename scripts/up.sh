@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Build and start the forge, CI and proxies. Safe to re-run.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+# Mounted into containers; must exist before Docker creates them as root.
+mkdir -p "$STATE_DIR/secrets/ci" "$STATE_DIR/secrets/dispatcher" "$STATE_DIR/control" "$STATE_DIR/backups"
+
+docker compose --profile build --profile tools build
+docker compose run --rm --no-deps tools init-secrets
+docker compose up -d --remove-orphans forgejo ports proxy ci-proxy forge-proxy dispatcher ci-docker
+
+printf 'Waiting for Forgejo'
+i=0
+until docker compose exec -T forgejo curl -fsS http://127.0.0.1:3000/api/healthz >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 90 ] || { echo; echo "Forgejo didn't start; see: docker compose logs forgejo" >&2; exit 1; }
+  printf '.'
+  sleep 2
+done
+echo
+
+# CI: Forgejo learns the runner's secret, the job image goes into the CI
+# engine (which never pulls from a registry), then the runner starts.
+docker compose exec -T forgejo forgejo forgejo-cli actions register \
+  --name ci --secret "$(tr -d '[:space:]' < "$STATE_DIR/secrets/ci/runner-secret")" --labels docker >/dev/null
+i=0
+until docker compose exec -T ci-docker docker info >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 60 ] || { echo "The CI engine didn't start; see: docker compose logs ci-docker" >&2; exit 1; }
+  sleep 2
+done
+want="$(docker image inspect -f '{{.Id}}' inkproof-ci:1)"
+have="$(docker compose exec -T ci-docker docker image inspect -f '{{.Id}}' inkproof-ci:1 2>/dev/null || true)"
+if [ "$want" != "$have" ]; then
+  echo "Loading the CI image into the CI engine..."
+  docker save inkproof-ci:1 | docker compose exec -T ci-docker docker load >/dev/null
+fi
+docker compose up -d ci-runner
+
+docker compose ps
+echo "Forgejo: http://localhost:${FORGE_PORT:-3000}/"

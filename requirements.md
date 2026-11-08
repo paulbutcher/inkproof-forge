@@ -123,7 +123,7 @@ From `watch-work`, now driven by webhooks. Only trusted authors count; an agent'
 - **`conformance`:** a pull request's Actions run succeeding on a head commit it hasn't reviewed, once no new commit has arrived for a settling period (default 10 minutes). Pull requests whose title marks them as work in progress are skipped.
 - **`architecture`, `process` and `lasm`:** `milestone-review` added to a milestone issue on `inkproof-coordination`.
 - **`lasm`, also:** `blocking` added to an `upstream:lasm` issue.
-- **Reconciliation.** On start, and every 15 minutes, the dispatcher checks Forgejo for untriaged requests, failed and unreviewed runs, and pull requests behind `main`, so a missed delivery delays work rather than losing it. If Forgejo sends no event for a finished Actions run, this check is how runs are found, at a shorter interval.
+- **Reconciliation.** On start, and every 15 minutes, the dispatcher checks Forgejo for untriaged requests, failed and unreviewed runs, and pull requests behind `main`, so a missed delivery delays work rather than losing it. Finished Actions runs arrive as `action_run_success` and `action_run_failure` events.
 
 ## Reviews
 
@@ -205,7 +205,7 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 - `scripts/up.sh` starts Forgejo on `127.0.0.1:3000` with registration disabled, and `scripts/bootstrap.sh` creates the organisation, teams, the kit's accounts and their tokens, and the dispatcher's organisation webhook. Re-running it changes nothing.
 - A test repository's workflow in `.forgejo/workflows/` runs `lake build` in `ci-docker`, reusing Lean from a named volume, with no route out except `proxy`.
 - From an agent container, an allowed domain is reachable through `proxy`, `api.github.com` and an unlisted domain are refused, and Forgejo is reachable directly.
-- Whether Forgejo 17 sends a webhook for a finished Actions run, failed or successful, is answered.
+- Forgejo 17 sends a webhook for a finished Actions run, failed or successful (verified 2026-11-08).
 
 **Stage 2: migration and mirrors.**
 
@@ -274,9 +274,6 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 
 Each is verified in the stage that first needs it, then removed from this list.
 
-- [ ] Forgejo team unit permissions allow Releases read with Code write, and that blocks release creation by API (stage 1).
-- [ ] Creating a release through the API with a new tag is subject to tag protection (stage 1).
-- [ ] Forgejo sends webhooks for finished Actions runs (stage 1).
 - [ ] A push mirror sends branches and tags but not `refs/pull/*`, which GitHub rejects (stage 2).
 - [ ] Forgejo's `[proxy]` setting covers push mirrors and leaves webhooks to the dispatcher direct (stage 2).
 - [ ] Migrated issues and comments carry an original author the dispatcher can see (stage 2).

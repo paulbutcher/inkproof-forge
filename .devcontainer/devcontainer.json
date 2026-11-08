@@ -2,6 +2,13 @@
 	"name": "Agents",
 	"build": { "dockerfile": "Dockerfile" },
 
+  // A Docker engine of this container's own, for building and testing the kit. It runs
+  // privileged but is separate from Docker Desktop's engine. Moby has no packages for
+  // Ubuntu resolute, so this installs Docker CE from Docker's own repository.
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false }
+  },
+
   // Runs on the host before the container exists, so that the bind mount below has
   // a directory to attach to. Without it Docker invents one owned by root, and the
   // container's `vscode` user cannot then write its own configuration.
@@ -18,6 +25,9 @@
 
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    // The kit's settings for this container, not your Mac's .env, for docker compose
+    // run by hand here. The kit's scripts choose the same file themselves.
+    "COMPOSE_ENV_FILES": ".env.devcontainer",
     "GIT_CONFIG_COUNT": "1",
     "GIT_CONFIG_KEY_0": "safe.directory",
     "GIT_CONFIG_VALUE_0": "${containerWorkspaceFolder}"

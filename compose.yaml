@@ -1,0 +1,207 @@
+# The Inkproof forge: Forgejo, CI, egress proxies and the dispatcher.
+# Agents and the gatekeeper are added in later stages.
+#
+# Networks keep each part to what it needs:
+#   agents     internal: agents, Forgejo, the dispatcher, the agents' proxy
+#   ci         internal: Forgejo, the CI runner and its Docker engine, the CI proxy
+#   forge-out  internal: Forgejo and its proxy, its only way out (mirror pushes)
+#   forge-web  internal: Forgejo, the port forwarder and the admin tools
+#   publish    the port forwarder only, so the host can reach Forgejo on 127.0.0.1
+#   egress     the three proxies, the only containers with a route out
+# Forgejo is on internal networks only: whatever it sends out goes through
+# forge-proxy, whose log is the record of it.
+
+name: inkproof-forge
+
+x-proxy: &proxy
+  image: ubuntu/squid:6.6-24.04_edge
+  restart: unless-stopped
+
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:17.0.1-rootless
+    restart: unless-stopped
+    networks: [agents, ci, forge-out, forge-web]
+    environment:
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__server__ROOT_URL: http://localhost:${FORGE_PORT:-3000}/
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__server__START_SSH_SERVER: "false"
+      FORGEJO__server__OFFLINE_MODE: "true"
+      FORGEJO__server__LANDING_PAGE: login
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__service__REQUIRE_SIGNIN_VIEW: "true"
+      FORGEJO__service__DEFAULT_KEEP_EMAIL_PRIVATE: "true"
+      FORGEJO__repository__DEFAULT_PRIVATE: private
+      FORGEJO__repository__FORCE_PRIVATE: "true"
+      FORGEJO__mailer__ENABLED: "false"
+      FORGEJO__picture__DISABLE_GRAVATAR: "true"
+      FORGEJO__packages__ENABLED: "false"
+      FORGEJO__cron_0x2E_update_checker__ENABLED: "false"
+      FORGEJO__actions__ENABLED: "true"
+      # Workflows use no `uses:` actions, so nothing is fetched from outside.
+      FORGEJO__actions__DEFAULT_ACTIONS_URL: self
+      # Webhooks go to the dispatcher and nowhere else.
+      FORGEJO__webhook__ALLOWED_HOST_LIST: dispatcher
+      # Mirror pushes and the one-off migration go through forge-proxy.
+      FORGEJO__proxy__PROXY_ENABLED: "true"
+      FORGEJO__proxy__PROXY_URL: http://forge-proxy:3128
+      FORGEJO__proxy__PROXY_HOSTS: "github.com,*.github.com"
+      FORGEJO__migrations__ALLOWED_DOMAINS: "github.com,*.github.com"
+    volumes:
+      - forgejo-data:/var/lib/gitea
+      - forgejo-config:/etc/gitea
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Forwards 127.0.0.1:FORGE_PORT on the host to Forgejo, so Forgejo itself
+  # needs no network with a route out.
+  ports:
+    build: ./docker/ports
+    restart: unless-stopped
+    command: ["socat", "TCP-LISTEN:3000,fork,reuseaddr", "TCP:forgejo:3000"]
+    networks: [publish, forge-web]
+    ports:
+      - "127.0.0.1:${FORGE_PORT:-3000}:3000"
+
+  # Egress for agents.
+  proxy:
+    <<: *proxy
+    networks: [agents, egress]
+    volumes:
+      - ./docker/proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./docker/proxy/allow-agents.txt:/etc/squid/allowed-domains.txt:ro
+      - proxy-logs:/var/log/squid
+
+  # Egress for CI jobs.
+  ci-proxy:
+    <<: *proxy
+    networks: [ci, egress]
+    volumes:
+      - ./docker/proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./docker/proxy/allow-ci.txt:/etc/squid/allowed-domains.txt:ro
+      - ci-proxy-logs:/var/log/squid
+
+  # Egress for Forgejo: mirror pushes to GitHub, nothing else.
+  forge-proxy:
+    <<: *proxy
+    networks: [forge-out, egress]
+    volumes:
+      - ./docker/proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./docker/proxy/allow-forge.txt:/etc/squid/allowed-domains.txt:ro
+      - forge-proxy-logs:/var/log/squid
+
+  # CI jobs run in this engine, never in the host's. It is privileged, so
+  # jobs must not reach its API: it listens only with TLS, and only the
+  # runner holds the client certificate.
+  ci-docker:
+    image: docker:29.9.3-dind
+    restart: unless-stopped
+    privileged: true
+    hostname: ci-docker
+    networks: [ci]
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+      HTTP_PROXY: http://ci-proxy:3128
+      HTTPS_PROXY: http://ci-proxy:3128
+      NO_PROXY: forgejo,localhost,127.0.0.1
+    volumes:
+      - ci-docker-data:/var/lib/docker
+      - ci-certs:/certs/client
+
+  ci-runner:
+    image: code.forgejo.org/forgejo/runner:13.2.1
+    restart: unless-stopped
+    depends_on: [ci-docker, forgejo]
+    networks: [ci]
+    working_dir: /data
+    entrypoint: ["sh", "/etc/runner/entry.sh"]
+    environment:
+      DOCKER_HOST: tcp://ci-docker:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+    volumes:
+      - ./docker/ci/config.yml:/etc/runner/config.yml:ro
+      - ./docker/ci/entry.sh:/etc/runner/entry.sh:ro
+      - ${STATE_DIR:-.}/secrets/ci:/run/ci:ro
+      - ci-certs:/certs/client:ro
+      - ci-runner-data:/data
+
+  # Receives Forgejo's webhooks. From stage 4 it also queues work for agents.
+  dispatcher:
+    build: ./docker/dispatcher
+    restart: unless-stopped
+    networks: [agents]
+    environment:
+      FORGE_URL: http://forgejo:3000
+    volumes:
+      - ${STATE_DIR:-.}/secrets/dispatcher/webhook-secret:/run/secrets/webhook_secret:ro
+      - dispatcher-state:/state
+
+  # The image CI jobs run in. Built here and loaded into ci-docker by
+  # scripts/up.sh, so the CI engine never pulls from a registry.
+  ci-image:
+    build: ./docker/ci/image
+    image: inkproof-ci:1
+    profiles: [build]
+
+  # Admin tasks against Forgejo's API (bootstrap, tests), with known bash and
+  # jq versions rather than the host's. Writes secrets/ as the host user.
+  tools:
+    build: ./docker/tools
+    profiles: [tools]
+    user: "${HOST_UID:-501}:${HOST_GID:-20}"
+    networks: [forge-web]
+    environment:
+      FORGE_URL: http://forgejo:3000
+      GH_OWNER: ${GH_OWNER:?set GH_OWNER in .env}
+      REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
+      HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
+    volumes:
+      - ${STATE_DIR:-.}/secrets:/secrets
+      - ./agents.conf:/etc/kit/agents.conf:ro
+      - ./templates:/etc/kit/templates:ro
+      - ./tests:/etc/kit/tests:ro
+
+  # Stands in for an agent container in network tests: same network and
+  # proxy settings, nothing else.
+  probe:
+    build: ./docker/tools
+    profiles: [tools]
+    networks: [agents]
+    entrypoint: ["sleep", "infinity"]
+    environment:
+      HTTPS_PROXY: http://proxy:3128
+      HTTP_PROXY: http://proxy:3128
+      https_proxy: http://proxy:3128
+      http_proxy: http://proxy:3128
+      NO_PROXY: forgejo,dispatcher,localhost,127.0.0.1
+      no_proxy: forgejo,dispatcher,localhost,127.0.0.1
+
+networks:
+  agents:
+    internal: true
+  ci:
+    internal: true
+  forge-out:
+    internal: true
+  forge-web:
+    internal: true
+  publish: {}
+  egress: {}
+
+volumes:
+  forgejo-data:
+  forgejo-config:
+  proxy-logs:
+  ci-proxy-logs:
+  forge-proxy-logs:
+  ci-docker-data:
+  ci-certs:
+  ci-runner-data:
+  dispatcher-state:

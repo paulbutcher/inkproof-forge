@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Admin tasks against Forgejo, run in the tools container by the host scripts.
+#   kit init-secrets   generate the runner and webhook secrets, if missing
+#   kit check-human    succeed if secrets/human/token is a working admin token
+#   kit bootstrap      converge accounts, tokens, teams and the webhook
+#   kit test-stage1    stage 1 checks against the API
+set -euo pipefail
+. /usr/local/lib/kit/forge.sh
+for f in /usr/local/lib/kit/*.sh; do [ "$f" = /usr/local/lib/kit/forge.sh ] || . "$f"; done
+
+secret_file() {
+  local f="/secrets/$1" bytes="$2"
+  [ -s "$f" ] && return
+  mkdir -p "$(dirname "$f")"
+  ( umask 077; random_hex "$bytes" > "$f" )
+  log "created secrets/$1"
+}
+
+cmd_init_secrets() {
+  secret_file ci/runner-secret 20        # forgejo-cli wants 40 hex digits
+  secret_file dispatcher/webhook-secret 32
+}
+
+# Exits 0 if the token works as HUMAN_USER with admin rights, 3 if Forgejo
+# wants the account's password changed first, 1 otherwise.
+cmd_check_human() {
+  [ -s /secrets/human/token ] || exit 1
+  TOKEN="$(token_of human)"
+  local s
+  s="$(api GET /user)"
+  if [ "$s" = 403 ] && grep -q 'must change your password' "$RESP"; then exit 3; fi
+  [ "$s" = 200 ] && [ "$(jq -r '.login + " " + (.is_admin | tostring)' "$RESP")" = "$HUMAN_USER true" ]
+}
+
+case "${1:-}" in
+  init-secrets) cmd_init_secrets ;;
+  check-human) cmd_check_human ;;
+  bootstrap) cmd_bootstrap ;;
+  test-stage1) cmd_test_stage1 ;;
+  *) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
+esac

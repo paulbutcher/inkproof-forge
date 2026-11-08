@@ -1,0 +1,2 @@
+# Forgejo's allowlist: git pushes to the GitHub mirrors, nothing else.
+github.com

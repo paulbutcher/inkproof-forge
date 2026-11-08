@@ -1,0 +1,10 @@
+name = "stage1"
+defaultTargets = ["Stage1"]
+testDriver = "tests"
+
+[[lean_lib]]
+name = "Stage1"
+
+[[lean_exe]]
+name = "tests"
+root = "Tests"

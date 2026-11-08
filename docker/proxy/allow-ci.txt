@@ -1,0 +1,7 @@
+# CI jobs' allowlist: Lean toolchains, third-party packages, npm.
+github.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+raw.githubusercontent.com
+.lean-lang.org
+registry.npmjs.org

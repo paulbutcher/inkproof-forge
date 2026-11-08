@@ -1,0 +1,35 @@
+# Forgejo runner configuration.
+log:
+  level: info
+
+runner:
+  file: /data/.runner
+  capacity: 1
+  timeout: 3h
+  # Every job reaches the outside only through ci-proxy, and Forgejo directly.
+  envs:
+    HTTP_PROXY: http://ci-proxy:3128
+    HTTPS_PROXY: http://ci-proxy:3128
+    http_proxy: http://ci-proxy:3128
+    https_proxy: http://ci-proxy:3128
+    NO_PROXY: forgejo,localhost,127.0.0.1
+    no_proxy: forgejo,localhost,127.0.0.1
+    FORGE_URL: http://forgejo:3000
+  labels:
+    - "docker:docker://inkproof-ci:1"
+
+cache:
+  enabled: false
+
+container:
+  # Jobs share ci-docker's network namespace, so they resolve and reach
+  # forgejo and ci-proxy, and have no other route.
+  network: host
+  privileged: false
+  # Never give jobs a Docker socket.
+  docker_host: "-"
+  # inkproof-ci:1 is loaded into ci-docker by scripts/up.sh, never pulled.
+  force_pull: false
+  # Lean toolchains, kept between jobs.
+  valid_volumes:
+    - inkproof-elan

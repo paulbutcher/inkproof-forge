@@ -1,0 +1,62 @@
+# Required checks for every library and consumer repository. .forgejo/ is
+# code-owned by the human, so agents can't change this file without them.
+# No `uses:` actions: everything here is plain shell, so CI fetches no code
+# from outside. FORGE_URL and the proxy settings come from the runner.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+defaults:
+  run:
+    shell: bash   # bash with -eo pipefail
+
+jobs:
+  build:
+    runs-on: docker
+    container:
+      image: inkproof-ci:1
+      volumes:
+        - inkproof-elan:/opt/elan/toolchains
+    env:
+      ELAN_HOME: /opt/elan
+      TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          echo /opt/elan/bin >> "$GITHUB_PATH"
+          auth="Authorization: Basic $(printf 'ci:%s' "$TOKEN" | base64 -w0)"
+          git config --global "http.${FORGE_URL}/.extraHeader" "$auth"
+          # Dependencies keep their GitHub URLs; fetch this project's from Forgejo.
+          git config --global "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
+            "https://github.com/${GITHUB_REPOSITORY_OWNER}/inkproof-"
+          git init -q .
+          git remote add origin "${FORGE_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --tags origin "+${GITHUB_REF}:refs/ci/head" '+refs/heads/main:refs/remotes/origin/main'
+          git checkout -q --detach "$GITHUB_SHA"
+          git log -1 --format='Checked out %H: %s'
+
+      - name: Internal dependencies pinned to release tags
+        run: GH_OWNER="$GITHUB_REPOSITORY_OWNER" bash scripts/check-pins.sh
+
+      - name: Build, failing on sorry
+        run: |
+          lake build 2>&1 | tee build.log
+          if grep -qE 'declaration uses .sorry.' build.log; then
+            echo "::error::A declaration uses sorry"
+            exit 1
+          fi
+
+      - name: Tests
+        run: lake test
+
+      - name: API lock is up to date
+        run: |
+          if [ -f scripts/api-lock.sh ]; then
+            bash scripts/api-lock.sh > API.lock.generated
+            diff -u API.lock API.lock.generated
+          else
+            echo "::warning::scripts/api-lock.sh not implemented yet; skipping"
+          fi

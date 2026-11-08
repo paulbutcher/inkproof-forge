@@ -1,0 +1,25 @@
+# Agents' allowlist. One domain per line; a leading dot also allows subdomains.
+# GitHub is listed by exact host: api.github.com is deliberately absent, so
+# nothing behind this proxy can call GitHub's API.
+
+# Claude Code
+.anthropic.com
+.claude.ai
+.claude.com
+
+# Lean toolchains and release downloads, and git reads of third-party packages
+github.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+raw.githubusercontent.com
+.lean-lang.org
+
+# npm (Lasm and its dependencies)
+registry.npmjs.org
+
+# VS Code server and extensions, for attaching to agent containers
+update.code.visualstudio.com
+vscode.download.prss.microsoft.com
+marketplace.visualstudio.com
+.gallerycdn.vsassets.io
+.vscode-cdn.net

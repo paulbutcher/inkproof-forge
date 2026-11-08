@@ -1,0 +1,11 @@
+# Local configuration, credentials and state: never commit these.
+.env
+.env.devcontainer
+.devcontainer-state/
+secrets/
+control/
+backups/
+
+# Editor and OS clutter
+.DS_Store
+*.swp
