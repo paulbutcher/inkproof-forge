@@ -39,7 +39,7 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 
 ## Accounts and permissions
 
-- **Accounts.** The human (Forgejo admin, `HUMAN_USER`); the coordinator and one per library (`coordinator`, `core`, `scale`, `consumer-metrics`); one per review (`conformance`, `architecture`, `process`, `lasm`); `gatekeeper`; `dispatcher`. Registration is disabled, and `scripts/bootstrap.sh` creates the kit's accounts and tokens. The suspended GitHub account `inkproof-tentenths` is never used or recreated.
+- **Accounts.** The human (Forgejo admin, `HUMAN_USER`); the coordinator and one per library (`coordinator`, `core`, `scale`, `consumer-metrics`); one per review (`conformance`, `architecture`, `process`, `lasm`); `gatekeeper`; `dispatcher`; `ci-reader`, which reads every repository in the organisation and writes nothing, so CI can fetch dependencies (a job's own token reads only its own repository). Registration is disabled, and `scripts/bootstrap.sh` creates the kit's accounts and tokens. The suspended GitHub account `inkproof-tentenths` is never used or recreated.
 - **Organisation and teams.** Repositories stay under `tentenths` with their GitHub names. Each library agent and the coordinator get two teams with per-unit access:
   - its own repository: Code, Issues and Pull requests write; Releases, Actions and Wiki read; Packages none;
   - its dependencies (all libraries, for the coordinator): Code read, Issues write, Pull requests read. The coordinator's has Pull requests write, so it can review and approve.
@@ -64,7 +64,7 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 | Agents can't weaken CI | Workflows in `.forgejo/workflows/` are code-owned by the human; CI jobs run in `ci-docker`, never the host's Docker |
 | Every API change still reaches the human once | `scripts/milestone-diff.sh`, against Forgejo |
 | Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination`; none can push, and policy files are read-only to every agent |
-| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship; trigger descriptions carry only numbers and names, never issue text |
+| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers and names, never issue text |
 | No internet except essentials | Internal networks; `proxy` allowlist is the only exit for agents and CI, `forge-proxy` for Forgejo |
 | Nothing in the kit calls GitHub's API | No GitHub credential in any container; `api.github.com` is on no allowlist |
 | Agents can't loosen their own rules | Managed settings, managed `CLAUDE.md`, git config and hooks are root-owned in the image or mounted read-only |
@@ -168,7 +168,8 @@ Forgejo has no email without SMTP. The dispatcher records a notice for every `ne
 ## GitHub mirror and migration
 
 - **Migration.** `scripts/migrate.sh` uses Forgejo's migration to import each repository from GitHub with history, issues, labels and pull requests, using a GitHub token of the human's own, once. Content written by the suspended account doesn't import and isn't recreated.
-- **Mirrors.** After import, each repository push-mirrors to GitHub on every commit, with a credential of the human's own (contents write on the `inkproof-` repositories). No machine user. Mirrors carry code and tags; issues and pull requests live only in Forgejo, which is why Forgejo itself is backed up.
+- **Mirrors.** After import, each repository push-mirrors to GitHub on every commit, with a credential of the human's own (contents write on the `inkproof-` repositories). No machine user. Mirrors carry `main` (`MIRROR_BRANCHES`) and every tag; issues and pull requests live only in Forgejo, which is why Forgejo itself is backed up. Forgejo pushes with `git push --mirror`, so branches and tags on GitHub outside that set are deleted at the first sync; `refs/pull/*` is never pushed. Git ignores Forgejo's `[proxy]` setting, so Forgejo's container sets the standard proxy variables for it.
+- **What the import found (2026-11-08).** Every issue, pull request and release on GitHub was written by the suspended account and is hidden, so the import brings history, branches, tags and labels only.
 - **Dependencies.** Agents and CI fetch `inkproof-` dependencies from Forgejo with `url."http://forgejo:3000/tentenths/inkproof-".insteadOf "https://github.com/tentenths/inkproof-"`, set in the root-owned system git config and in CI, while `lakefile` and `lake-manifest.json` keep their GitHub URLs. Third-party packages are unaffected and still come from GitHub.
 
 ## Backups
@@ -274,9 +275,6 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 
 Each is verified in the stage that first needs it, then removed from this list.
 
-- [ ] A push mirror sends branches and tags but not `refs/pull/*`, which GitHub rejects (stage 2).
-- [ ] Forgejo's `[proxy]` setting covers push mirrors and leaves webhooks to the dispatcher direct (stage 2).
-- [ ] Migrated issues and comments carry an original author the dispatcher can see (stage 2).
 - [ ] Setting `hasTrustDialogAccepted` for a folder in `.claude.json` is enough for headless runs and the extension (stage 3).
 - [ ] VS Code can attach to a running compose container with a kit-provided attach config, without Dev Containers building anything (stage 3).
 - [ ] `cleanupPeriodDays` in managed settings governs transcript deletion for every session in the container (stage 3).

@@ -22,12 +22,14 @@ jobs:
         - inkproof-elan:/opt/elan/toolchains
     env:
       ELAN_HOME: /opt/elan
-      TOKEN: ${{ github.token }}
+      # ci-reader's token: reads every repository of this project, writes
+      # nothing. The job's own token reads only this repository.
+      TOKEN: ${{ secrets.DEPS_READ_TOKEN }}
     steps:
       - name: Check out
         run: |
           echo /opt/elan/bin >> "$GITHUB_PATH"
-          auth="Authorization: Basic $(printf 'ci:%s' "$TOKEN" | base64 -w0)"
+          auth="Authorization: Basic $(printf 'ci-reader:%s' "$TOKEN" | base64 -w0)"
           git config --global "http.${FORGE_URL}/.extraHeader" "$auth"
           # Dependencies keep their GitHub URLs; fetch this project's from Forgejo.
           git config --global "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \

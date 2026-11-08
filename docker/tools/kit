@@ -3,7 +3,12 @@
 #   kit init-secrets   generate the runner and webhook secrets, if missing
 #   kit check-human    succeed if secrets/human/token is a working admin token
 #   kit bootstrap      converge accounts, tokens, teams and the webhook
+#   kit migrate        import the repositories in agents.conf from GitHub
+#   kit mirrors [--rotate]  push-mirror them to GitHub
+#   kit mirror-status  each push mirror's last sync and error
+#   kit api METHOD PATH [JSON]  call the API as the human, print the reply
 #   kit test-stage1    stage 1 checks against the API
+#   kit test-stage2    stage 2 checks against the API
 set -euo pipefail
 . /usr/local/lib/kit/forge.sh
 for f in /usr/local/lib/kit/*.sh; do [ "$f" = /usr/local/lib/kit/forge.sh ] || . "$f"; done
@@ -36,6 +41,11 @@ case "${1:-}" in
   init-secrets) cmd_init_secrets ;;
   check-human) cmd_check_human ;;
   bootstrap) cmd_bootstrap ;;
+  migrate) cmd_migrate ;;
+  mirrors) shift; cmd_mirrors "$@" ;;
+  mirror-status) cmd_mirror_status ;;
+  api) shift; TOKEN="$(token_of human)"; call 200,201,204 "$@" | jq . ;;
   test-stage1) cmd_test_stage1 ;;
+  test-stage2) shift; cmd_test_stage2 "$@" ;;
   *) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
 esac

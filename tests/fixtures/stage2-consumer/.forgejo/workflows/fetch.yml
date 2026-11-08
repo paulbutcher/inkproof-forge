@@ -1,0 +1,50 @@
+# Stage 2 test: resolve dependencies the way CI and agents do.
+name: fetch
+
+on:
+  push:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fetch:
+    runs-on: docker
+    container:
+      image: inkproof-ci:1
+      volumes:
+        - inkproof-elan:/opt/elan/toolchains
+    env:
+      ELAN_HOME: /opt/elan
+      # ci-reader's token: reads every repository of this project, writes
+      # nothing. The job's own token reads only this repository.
+      TOKEN: ${{ secrets.DEPS_READ_TOKEN }}
+    steps:
+      - name: Check out
+        run: |
+          echo /opt/elan/bin >> "$GITHUB_PATH"
+          auth="Authorization: Basic $(printf 'ci-reader:%s' "$TOKEN" | base64 -w0)"
+          git config --global "http.${FORGE_URL}/.extraHeader" "$auth"
+          git config --global "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
+            "https://github.com/${GITHUB_REPOSITORY_OWNER}/inkproof-"
+          git init -q .
+          git remote add origin "${FORGE_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin "+${GITHUB_REF}:refs/ci/head"
+          git checkout -q --detach "$GITHUB_SHA"
+
+      - name: Resolve dependencies
+        run: |
+          echo "inkproof-core resolves to: $(git ls-remote --get-url https://github.com/tentenths/inkproof-core)"
+          lake update 2>&1 | tail -20
+          jq -r '.packages[] | "manifest: \(.name) \(.url) \(.rev)"' lake-manifest.json
+          jq -e '.packages[] | select(.name | ltrimstr("«") | rtrimstr("»") == "inkproof-core") | .url == "https://github.com/tentenths/inkproof-core"' lake-manifest.json
+          jq -e '.packages[] | select(.name == "plausible") | .url | startswith("https://github.com/leanprover-community/plausible")' lake-manifest.json
+          # Where each was actually fetched from: git prints the rewritten URL.
+          core_from="$(git -C .lake/packages/inkproof-core fetch -v --dry-run 2>&1 | grep '^From ')"
+          plausible_from="$(git -C .lake/packages/plausible fetch -v --dry-run 2>&1 | grep '^From ')"
+          echo "inkproof-core: $core_from"
+          echo "plausible: $plausible_from"
+          [ "$core_from" = "From ${FORGE_URL}/tentenths/inkproof-core" ]
+          [ "$plausible_from" = "From https://github.com/leanprover-community/plausible" ]
+          echo "Fetched inkproof-core from Forgejo and plausible from GitHub."

@@ -45,11 +45,18 @@ services:
       FORGEJO__actions__DEFAULT_ACTIONS_URL: self
       # Webhooks go to the dispatcher and nowhere else.
       FORGEJO__webhook__ALLOWED_HOST_LIST: dispatcher
-      # Mirror pushes and the one-off migration go through forge-proxy.
+      # The one-off migration goes through forge-proxy by Forgejo's own setting.
       FORGEJO__proxy__PROXY_ENABLED: "true"
       FORGEJO__proxy__PROXY_URL: http://forge-proxy:3128
-      FORGEJO__proxy__PROXY_HOSTS: "github.com,*.github.com"
-      FORGEJO__migrations__ALLOWED_DOMAINS: "github.com,*.github.com"
+      FORGEJO__proxy__PROXY_HOSTS: "github.com,*.github.com,*.githubusercontent.com"
+      FORGEJO__migrations__ALLOWED_DOMAINS: "github.com,*.github.com,*.githubusercontent.com"
+      # Push mirrors run git, which ignores that setting and reads these instead.
+      HTTPS_PROXY: http://forge-proxy:3128
+      https_proxy: http://forge-proxy:3128
+      HTTP_PROXY: http://forge-proxy:3128
+      http_proxy: http://forge-proxy:3128
+      NO_PROXY: dispatcher,forgejo,localhost,127.0.0.1
+      no_proxy: dispatcher,forgejo,localhost,127.0.0.1
     volumes:
       - forgejo-data:/var/lib/gitea
       - forgejo-config:/etc/gitea
@@ -92,7 +99,8 @@ services:
     <<: *proxy
     networks: [forge-out, egress]
     volumes:
-      - ./docker/proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./docker/proxy/squid-forge.conf:/etc/squid/squid.conf:ro
+      - ${STATE_DIR:-.}/proxy:/etc/squid/extra:ro
       - ./docker/proxy/allow-forge.txt:/etc/squid/allowed-domains.txt:ro
       - forge-proxy-logs:/var/log/squid
 
@@ -162,6 +170,8 @@ services:
       GH_OWNER: ${GH_OWNER:?set GH_OWNER in .env}
       REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
       HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
+      MIRROR_BRANCHES: ${MIRROR_BRANCHES-main}
+      KEEP: ${KEEP:-}
     volumes:
       - ${STATE_DIR:-.}/secrets:/secrets
       - ./agents.conf:/etc/kit/agents.conf:ro

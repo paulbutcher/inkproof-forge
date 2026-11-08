@@ -59,6 +59,7 @@ ensure_token() {
   mkdir -p "/secrets/$u"
   ( umask 077; printf '%s\n' "$tok" > "$f" )
   changed "created a token for $u in secrets/$u/token"
+  FRESH_TOKEN=1
 }
 
 team_id() {
@@ -66,20 +67,24 @@ team_id() {
 }
 
 # ensure_team NAME UNITS MEMBER REPO...: the team exists with these unit
-# permissions, MEMBER as its only member, and exactly those of REPO... that exist.
+# permissions, MEMBER as its only member, and exactly those of REPO... that
+# exist; REPO "*" alone means every repository in the organisation, present
+# and future.
 ensure_team() {
-  local name="$1" units="$2" member="$3" id r current
+  local name="$1" units="$2" member="$3" id r current all=false
   shift 3
+  [ "${1:-}" = "*" ] && all=true
   id="$(team_id "$name")"
   local body
-  body="$(jq -nc --arg n "$name" --argjson u "$units" \
+  body="$(jq -nc --arg n "$name" --argjson u "$units" --argjson all "$all" \
     '{name: $n, description: "Kit-managed; edit agents.conf instead", permission: "read",
-      includes_all_repositories: false, can_create_org_repo: false, units_map: $u}')"
+      includes_all_repositories: $all, can_create_org_repo: false, units_map: $u}')"
   if [ -z "$id" ]; then
     id="$(call 201 POST "/orgs/$ORG/teams" "$body" | jq -r .id)"
     changed "created team $name"
   else
     current="$(call 200 GET "/teams/$id" | jq -c --argjson u "$units" '.units_map | with_entries(select(.key | in($u)))')"
+    [ "$(jq -r .includes_all_repositories "$RESP")" = "$all" ] || current='"stale"'
     if [ "$(jq -cS . <<<"$current")" != "$(jq -cS . <<<"$units")" ]; then
       call 200 PATCH "/teams/$id" "$body" >/dev/null
       changed "updated team $name's permissions"
@@ -93,6 +98,7 @@ ensure_team() {
     [ "$r" = "$member" ] || { call 204 DELETE "/teams/$id/members/$r" >/dev/null; changed "removed $r from $name"; }
   done
 
+  $all && return 0
   local have want=""
   have="$(call 200 GET "/teams/$id/repos?limit=50" | jq -r '.[].name')"
   for r in "$@"; do
@@ -148,7 +154,7 @@ cmd_bootstrap() {
   ensure_org
 
   local name kind own reads
-  local accounts=(gatekeeper dispatcher)
+  local accounts=(gatekeeper dispatcher ci-reader)
   while read -r name kind own reads; do
     accounts+=("$name")
   done < <(grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf)
@@ -184,7 +190,24 @@ cmd_bootstrap() {
 
   ensure_token gatekeeper "$SCOPES_WRITE"
   ensure_token dispatcher "$SCOPES_ISSUES"
+  # CI reads this project's repositories to fetch dependencies; the job's own
+  # token reads only the repository it runs for.
+  FRESH_TOKEN=0
+  ensure_token ci-reader '["read:repository","read:user"]'
+  ensure_team ci-read "$(units read none none)" ci-reader "*"
+  ensure_ci_secret "$FRESH_TOKEN"
   ensure_webhook
   log "Bootstrap made $CHANGES change(s)."
   echo "$CHANGES"
+}
+
+# CI fetches dependencies with ci-reader's token, from the organisation's
+# DEPS_READ_TOKEN Actions secret. Forgejo never shows a secret's value, so it
+# is set whenever the token is new or the secret is missing.
+ensure_ci_secret() {
+  if [ "$1" = 1 ] || ! call 200 GET "/orgs/$ORG/actions/secrets" | jq -e '.[] | select(.name == "DEPS_READ_TOKEN")' >/dev/null; then
+    call 201,204 PUT "/orgs/$ORG/actions/secrets/DEPS_READ_TOKEN" \
+      "$(jq -nc --arg d "$(token_of ci-reader)" '{data: $d}')" >/dev/null
+    changed "stored ci-reader's token as the organisation's DEPS_READ_TOKEN Actions secret"
+  fi
 }
