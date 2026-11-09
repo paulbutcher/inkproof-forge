@@ -35,7 +35,7 @@ You need Docker Desktop. The scripts are bash 3.2-compatible and run from the ki
 
 ### Bringing the repositories over from GitHub
 
-Forgejo imports each repository in `agents.conf` once, with its history, issues, labels, milestones, pull requests and releases, then pushes `main` and every tag back to GitHub on each commit. Both use GitHub tokens of your own; nothing uses a machine user, and content the suspended account wrote is hidden on GitHub, so it doesn't import.
+Forgejo imports each repository in `agents.conf` once, with its history, issues, labels, milestones, pull requests and releases, then pushes `main` and every tag back to GitHub on each commit. Both use GitHub tokens of your own; nothing uses a machine user, Imported issues, pull requests and comments are posted by Ghost. Forgejo keeps each one's GitHub author, but its API doesn't return it, and agents never trust them.
 
 On GitHub the repositories are under `GH_OWNER` (`paulbutcher`); in Forgejo they're in the organisation `FORGE_ORG` (`tentenths`). They used to be under `tentenths` on GitHub, and old tags' lakefiles still say so, so `GH_FORMER_OWNERS` lists that owner too. CI and agents fetch `inkproof-` repositories under every one of those owners from Forgejo.
 

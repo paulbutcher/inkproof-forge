@@ -176,6 +176,9 @@ services:
       KEEP: ${KEEP:-}
     volumes:
       - ${STATE_DIR:-.}/secrets:/secrets
+      # Tests read a copy of Forgejo's database for what its API leaves out,
+      # such as the GitHub author of migrated content.
+      - forgejo-data:/forgejo:ro
       - ./agents.conf:/etc/kit/agents.conf:ro
       - ./templates:/etc/kit/templates:ro
       - ./tests:/etc/kit/tests:ro

@@ -37,6 +37,16 @@ s2_mirror_sync() {
   call 200 GET "/repos/$ORG/$repo/push_mirrors" | jq -r '.[0].last_error // ""'
 }
 
+# s2_db SQL: runs a query on a copy of Forgejo's database, with its write-ahead
+# log, so the live one is never opened. Rows are |-separated.
+s2_db() {
+  local d
+  d="$(mktemp -d)"
+  cp /forgejo/data/gitea.db* "$d/" || die "can't read Forgejo's database"
+  sqlite3 "$d/gitea.db" "$1"
+  rm -rf "$d"
+}
+
 s2_scratch_repo() {
   api DELETE "/repos/$ORG/$1" >/dev/null
   call 201 POST "/orgs/$ORG/repos" "$(jq -nc --arg n "$1" '{name: $n, private: true, default_branch: "main"}')" >/dev/null
@@ -61,18 +71,29 @@ cmd_test_stage2() {
     branches="$(call 200 GET "/repos/$ORG/$r/branches?limit=50" | jq length)"
     s2_info "$r: $issues issues, $pulls pull requests, $labels labels, $releases releases, $milestones milestones, $branches branches (first page of 50 each)"
 
-    # Migrated content is attributed to its GitHub author, never a Forgejo account.
-    local all_items unattributed
-    all_items="$( { call 200 GET "/repos/$ORG/$r/issues?state=all&type=all&limit=50"; \
-                    call 200 GET "/repos/$ORG/$r/issues/comments?limit=50"; } | jq -s 'add')"
-    n="$(jq length <<<"$all_items")"
-    unattributed="$(jq -r '[.[] | select((.original_author // "") == "")] | map("\(.user.login)") | unique | join(", ")' <<<"$all_items")"
-    if [ "$n" = 0 ]; then
+    # Migrated content keeps its GitHub author and is posted by Ghost, never
+    # by a Forgejo account. Forgejo 17's API doesn't report original authors,
+    # so this reads the database.
+    local rows lost owned
+    rows="$(s2_db "select i.is_pull, i.poster_id, i.original_author, count(*) from issue i
+                     join repository r on r.id = i.repo_id
+                     where r.lower_name = lower('$r') and lower(r.owner_name) = lower('$ORG') group by 1, 2, 3
+                   union all
+                   select 'comment', c.poster_id, c.original_author, count(*) from comment c
+                     join issue i on i.id = c.issue_id join repository r on r.id = i.repo_id
+                     where r.lower_name = lower('$r') and lower(r.owner_name) = lower('$ORG') and c.type = 0 group by 2, 3")"
+    if [ -z "$rows" ]; then
       s2_info "$r has no issues, pull requests or comments to check for attribution"
-    elif [ -z "$unattributed" ]; then
-      s2_pass "$r: all $n migrated issues, pull requests and comments carry an original author ($(jq -r '[.[].original_author] | unique | join(", ")' <<<"$all_items")); Forgejo shows them as $(jq -r '[.[].user.login] | unique | join(", ")' <<<"$all_items")"
+      continue
+    fi
+    # Content posted by Ghost with no original author has lost its author;
+    # content with an original author posted by an account would be trusted.
+    lost="$(awk -F'|' '$2 == -1 && $3 == "" { n += $4 } END { print n + 0 }' <<<"$rows")"
+    owned="$(awk -F'|' '$3 != "" && $2 != -1 { n += $4 } END { print n + 0 }' <<<"$rows")"
+    if [ "$lost" = 0 ] && [ "$owned" = 0 ]; then
+      s2_pass "$r: $(awk -F'|' '{ n += $4 } END { print n }' <<<"$rows") migrated issues, pull requests and comments, posted by Ghost, with their GitHub authors: $(awk -F'|' '{ a[$3] += $4 } END { for (k in a) { printf "%s%s %d", s, k, a[k]; s = ", " } }' <<<"$rows")"
     else
-      s2_fail "$r: some migrated content has no original author, posted as: $unattributed"
+      s2_fail "$r: $lost migrated item(s) lost their GitHub author; $owned are posted by a Forgejo account"
     fi
   done
 
