@@ -73,7 +73,7 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 
 ## Autonomy levels in Forgejo
 
-`scripts/setup-repo.sh <repo> <level>` applies these, using the human's token, and re-running it with a lower level falls back. `CODEOWNERS` lives in the repository, so the script checks it and says what to change.
+`scripts/setup-repo.sh <repo> <level>` applies these, using the human's token, and re-running it with a lower level falls back. `CODEOWNERS` and the other files a level needs live in the repository and are code-owned by the human, so the script opens a pull request in the human's name that makes them right, and updates it on later runs; the human reviews and merges it.
 
 | Setting on `main` | Level 1 | Level 2 | Level 3 |
 | --- | --- | --- | --- |
@@ -279,8 +279,6 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 
 Each is verified in the stage that first needs it, then removed from this list.
 
-- [ ] Setting `hasTrustDialogAccepted` for a folder in `.claude.json` is enough for the extension (stage 3, on the Mac). Headless runs in a fresh volume meet no prompt (verified 2026-11-09).
-- [ ] VS Code can attach to a running compose container with a kit-provided attach config, without Dev Containers building anything (stage 3).
 - [ ] `cleanupPeriodDays` in managed settings governs transcript deletion for every session in the container (stage 3).
 - [ ] An approval from an approvals-list member satisfies the review count and their own official review request (stage 3).
 - [ ] Every pending official review request blocks the merge, not only the first (stage 3).

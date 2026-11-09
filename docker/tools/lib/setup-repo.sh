@@ -1,6 +1,9 @@
 # kit setup-repo REPO LEVEL: apply an autonomy level's Forgejo settings to one
 # of the project's repositories, then check the files the level depends on
-# and say what to change. Safe to re-run; a lower level falls back.
+# and, if they differ, open a pull request (as the human) that makes them
+# right, for the human to review and merge. Safe to re-run: a later run
+# updates that pull request rather than opening another. A lower level falls
+# back. Exits 3 while the files still need that pull request merged.
 #
 # Settings it applies:
 #   - labels the protocol uses;
@@ -10,10 +13,11 @@
 #     and an outdated branch, stale approvals dismissed, `checks*` required;
 #   - protected tags: every tag, by the human only (and the gatekeeper at
 #     level 3).
-# Files it checks on main (they are code-owned by the human, so the kit
-# never commits them): .forgejo/workflows/checks.yml, .forgejo/CODEOWNERS,
-# .forgejo/issue_template/request.md and scripts/check-pins.sh, against
-# templates/repo/; and that no .github/workflows/ is left from GitHub.
+# Files it checks on main (they are code-owned by the human, so they change
+# only through the human's pull request): .forgejo/workflows/checks.yml,
+# .forgejo/CODEOWNERS, .forgejo/issue_template/request.md and
+# scripts/check-pins.sh, against templates/repo/; and that nothing is left in
+# .github/ from GitHub.
 
 # The reviewers that exist so far. conformance joins at stage 5.
 CONFORMANCE_REVIEW="${CONFORMANCE_REVIEW:-false}"
@@ -136,42 +140,72 @@ REQUIREMENTS\.md @$HUMAN_USER
 EOF
 }
 
-# file_on_main REPO PATH: its contents on main, or nothing.
-file_on_main() {
-  [ "$(api GET "/repos/$ORG/$1/contents/$2?ref=main")" = 200 ] || return 1
-  jq -r '.content // ""' "$RESP" | base64 -d 2>/dev/null
+# file_ops REPO REF LEVEL: the file operations, as a JSON array for Forgejo's
+# multi-file commit, that make REF's files right for LEVEL.
+file_ops() {
+  local repo="$1" ref="$2" level="$3" ops='[]' f want have op commit
+  for f in .forgejo/workflows/checks.yml .forgejo/issue_template/request.md scripts/check-pins.sh .forgejo/CODEOWNERS; do
+    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
+    if [ "$(api GET "/repos/$ORG/$repo/contents/$f?ref=$ref")" = 200 ]; then
+      have="$(jq -r '.content // ""' "$RESP" | base64 -d)"
+      FILE_SHA="$(jq -r .sha "$RESP")"
+      [ "$have" = "$want" ] && continue
+      op=update
+    else
+      op=create FILE_SHA=""
+    fi
+    ops="$(jq -c --arg o "$op" --arg p "$f" --arg s "$FILE_SHA" --arg c "$(printf '%s\n' "$want" | base64 -w0)" \
+      '. + [{operation: $o, path: $p, content: $c} + (if $s == "" then {} else {sha: $s} end)]' <<<"$ops")"
+  done
+  # Everything left in .github/: Forgejo ignores its CODEOWNERS, and would run
+  # its workflow if .forgejo/workflows/ were missing.
+  commit="$(call 200 GET "/repos/$ORG/$repo/branches/$ref" | jq -r .commit.id)"
+  call 200 GET "/repos/$ORG/$repo/git/trees/$commit?recursive=true&per_page=10000" \
+    | jq -c --argjson ops "$ops" '$ops + [.tree[] | select(.type == "blob" and (.path | startswith(".github/")))
+                                           | {operation: "delete", path: .path, sha: .sha}]'
 }
 
+# The human's pull request that makes the files right: opened if there's none,
+# brought up to date if one from an earlier run is still open.
 check_files() {
-  local repo="$1" level="$2" todo=() f want have
-  for f in .forgejo/workflows/checks.yml .forgejo/issue_template/request.md scripts/check-pins.sh; do
-    want="$(cat "/etc/kit/templates/repo/$f")"
-    if ! have="$(file_on_main "$repo" "$f")"; then
-      todo+=("add $f from templates/repo/$f")
-    elif [ "$have" != "$want" ]; then
-      todo+=("replace $f with templates/repo/$f")
-    fi
-  done
-  want="$(codeowners "$level")"
-  if ! have="$(file_on_main "$repo" .forgejo/CODEOWNERS)"; then
-    todo+=("add .forgejo/CODEOWNERS, as below")
-  elif [ "$have" != "$want" ]; then
-    todo+=("replace .forgejo/CODEOWNERS with the version below")
-  fi
-  if [ "$(api GET "/repos/$ORG/$repo/contents/.github?ref=main")" = 200 ]; then
-    todo+=("delete .github/ (GitHub's workflow, CODEOWNERS and issue template; Forgejo uses .forgejo/)")
-  fi
-  if [ "${#todo[@]}" = 0 ]; then
+  local repo="$1" level="$2" branch="kit/setup-level-$2" ops pr n url body
+  ops="$(file_ops "$repo" main "$level")"
+  if [ "$(jq length <<<"$ops")" = 0 ]; then
     log "$repo: its files are right for level $level."
     return 0
   fi
+  log "$repo's files need changing for level $level:"
+  jq -r '.[] | "  \(.operation) \(.path)"' <<<"$ops" >&2
+  pr="$(call 200 GET "/repos/$ORG/$repo/pulls?state=open&limit=50" \
+    | jq -c --arg b "$branch" '[.[] | select(.head.ref == $b)][0] // empty')"
+  if [ -n "$pr" ]; then
+    n="$(jq -r .number <<<"$pr")"
+    url="$(jq -r .html_url <<<"$pr")"
+    ops="$(file_ops "$repo" "$branch" "$level")"
+    if [ "$(jq length <<<"$ops")" != 0 ]; then
+      call 201 POST "/repos/$ORG/$repo/contents" "$(jq -nc --argjson f "$ops" --arg b "$branch" \
+        '{branch: $b, files: $f, message: "Bring the files up to date (scripts/setup-repo.sh)"}')" >/dev/null
+      changed "$repo: updated pull request #$n"
+    fi
+  else
+    # A branch left from a pull request that was closed without merging.
+    api DELETE "/repos/$ORG/$repo/branches/$branch" >/dev/null
+    call 201 POST "/repos/$ORG/$repo/contents" "$(jq -nc --argjson f "$ops" --arg b "$branch" --arg l "$level" \
+      '{branch: "main", new_branch: $b, files: $f,
+        message: "Set up for autonomy level \($l) (scripts/setup-repo.sh)"}')" >/dev/null
+    body="$(printf '%s\n' \
+      "(no reply needed)" "" \
+      "Made by \`scripts/setup-repo.sh $repo $level\`: the files autonomy level $level needs, from the kit's \`templates/repo/\`." "" \
+      "$(jq -r '.[] | "- \(.operation) `\(.path)`"' <<<"$ops")" "" \
+      "These files are code-owned by you, so the kit proposes them rather than committing them. Review and merge; as an admin you can merge without an approval. Re-running the script updates this pull request.")"
+    pr="$(call 201 POST "/repos/$ORG/$repo/pulls" "$(jq -nc --arg b "$branch" --arg l "$level" --arg body "$body" \
+      '{head: $b, base: "main", title: "Set up for autonomy level \($l)", body: $body}')")"
+    n="$(jq -r .number <<<"$pr")"
+    url="$(jq -r .html_url <<<"$pr")"
+    changed "$repo: opened pull request #$n"
+  fi
   log ""
-  log "$repo needs a pull request from you (these files are yours, so the kit doesn't commit them):"
-  local i=1 t
-  for t in "${todo[@]}"; do log "  $i. $t"; i=$((i + 1)); done
-  log ""
-  log ".forgejo/CODEOWNERS for level $level:"
-  codeowners "$level" | sed 's/^/    /' >&2
+  log "Review and merge it, then run this again: $url"
   return 3
 }
 

@@ -55,12 +55,12 @@ Each agent runs in its own container, `core` first. Its runner claims work from 
 
 1. In a terminal on your Mac, run `claude setup-token` and sign in with the Claude account the agents should use. Save the token it prints as `secrets/claude/oauth-token`, then `chmod 600 secrets/claude/oauth-token`. The token lasts a year; repeat this step when it expires.
 2. `bash scripts/up.sh` builds the agent image and starts `core`. It also writes `secrets/claude/agent.env`, which passes the token to agent containers and nowhere else.
-3. `bash scripts/setup-repo.sh inkproof-core 1` sets labels, merge settings, `main`'s protection and tag protection for level 1, then checks the repository's own files. Those files are yours, so it lists the changes for you to make rather than committing them:
+3. `bash scripts/setup-repo.sh inkproof-core 1` sets labels, merge settings, `main`'s protection and tag protection for level 1, then checks the repository's own files against `templates/repo/`. Those files are code-owned by you, so where they differ it opens a pull request in your name rather than committing them, and prints its link:
    - `.github/` goes, because Forgejo ignores GitHub's `CODEOWNERS` and would try to run GitHub's workflow;
    - `.forgejo/workflows/checks.yml`, `.forgejo/issue_template/request.md` and `scripts/check-pins.sh` come from `templates/repo/`;
-   - `.forgejo/CODEOWNERS` is the version it prints. Forgejo reads each of its lines as a regular expression.
+   - `.forgejo/CODEOWNERS` is generated for the level. Forgejo reads each of its lines as a regular expression.
 
-   Make the change as a pull request from your own account on Forgejo, merge it, and run the script again until it reports no changes needed.
+   Review the pull request and merge it once CI passes; as an admin you can merge without an approval. Then run the script again: it reports the files right and exits 0. Until then it exits 3, which Docker Desktop reports with a hint about a "Compose error"; there is none.
 4. In VS Code on your Mac, open **Settings**, and turn off **Dev › Containers: Copy Git Config**, then set **Dev › Containers: Git Credential Helper Config Location** to `none`. Otherwise VS Code copies your own git identity and credentials into agent containers.
 5. `bash scripts/open.sh core` opens VS Code attached to `core`'s container, at `/workspace/inkproof-core`. The first time, VS Code installs its server and the Claude and Lean extensions there. Open `.inkproof/current.md` to follow the current run live.
 6. Optionally, `bash scripts/test-stage3.sh` checks the agent end to end. It costs a few dollars of Claude usage, takes about half an hour, and leaves closed test issues and pull requests on `inkproof-core` and `inkproof-coordination`.

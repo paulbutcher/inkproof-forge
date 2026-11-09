@@ -22,3 +22,8 @@ STATE_DIR="${STATE_DIR:-.}"
 # docker compose reads the same file, for these scripts and anything they run.
 COMPOSE_ENV_FILES="$KIT_ENV"
 export KIT_ENV STATE_DIR COMPOSE_ENV_FILES
+
+# The admin tools run from their image, so rebuild it whenever the kit's
+# copy of them changes; Docker's cache makes this quick when nothing has.
+docker compose --profile tools build --quiet tools >/dev/null \
+  || { echo "Couldn't build the tools image; see: docker compose --profile tools build tools" >&2; exit 1; }
