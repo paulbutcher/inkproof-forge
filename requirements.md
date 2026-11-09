@@ -40,7 +40,7 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 ## Accounts and permissions
 
 - **Accounts.** The human (Forgejo admin, `HUMAN_USER`); the coordinator and one per library (`coordinator`, `core`, `scale`, `consumer-metrics`); one per review (`conformance`, `architecture`, `process`, `lasm`); `gatekeeper`; `dispatcher`; `ci-reader`, which reads every repository in the organisation and writes nothing, so CI can fetch dependencies (a job's own token reads only its own repository). Registration is disabled, and `scripts/bootstrap.sh` creates the kit's accounts and tokens. The suspended GitHub account `inkproof-tentenths` is never used or recreated.
-- **Organisation and teams.** Repositories stay under `tentenths` with their GitHub names. Each library agent and the coordinator get two teams with per-unit access:
+- **Organisation and teams.** On GitHub the repositories moved from the `tentenths` organisation to the `paulbutcher` account on 2026-11-09; GitHub redirects the old URLs. In Forgejo they stay in the `tentenths` organisation (`FORGE_ORG`, which can't be the human's username: Forgejo users and organisations share one namespace) with their GitHub names. Each library agent and the coordinator get two teams with per-unit access:
   - its own repository: Code, Issues and Pull requests write; Releases, Actions and Wiki read; Packages none;
   - its dependencies (all libraries, for the coordinator): Code read, Issues write, Pull requests read. The coordinator's has Pull requests write, so it can review and approve.
 - **Reviewers own no repository.** `conformance` has Code read and Pull requests write on every `inkproof-` repository, so it can review. `architecture`, `process` and `lasm` have Code read everywhere and Issues write on `inkproof-coordination` only. No reviewer can push.
@@ -170,7 +170,7 @@ Forgejo has no email without SMTP. The dispatcher records a notice for every `ne
 - **Migration.** `scripts/migrate.sh` uses Forgejo's migration to import each repository from GitHub with history, issues, labels and pull requests, using a GitHub token of the human's own, once. Content written by the suspended account doesn't import and isn't recreated.
 - **Mirrors.** After import, each repository push-mirrors to GitHub on every commit, with a credential of the human's own (contents write on the `inkproof-` repositories). No machine user. Mirrors carry `main` (`MIRROR_BRANCHES`) and every tag; issues and pull requests live only in Forgejo, which is why Forgejo itself is backed up. Forgejo pushes with `git push --mirror`, so branches and tags on GitHub outside that set are deleted at the first sync; `refs/pull/*` is never pushed. Git ignores Forgejo's `[proxy]` setting, so Forgejo's container sets the standard proxy variables for it.
 - **What the import found (2026-11-08).** Every issue, pull request and release on GitHub was written by the suspended account and is hidden, so the import brings history, branches, tags and labels only.
-- **Dependencies.** Agents and CI fetch `inkproof-` dependencies from Forgejo with `url."http://forgejo:3000/tentenths/inkproof-".insteadOf "https://github.com/tentenths/inkproof-"`, set in the root-owned system git config and in CI, while `lakefile` and `lake-manifest.json` keep their GitHub URLs. Third-party packages are unaffected and still come from GitHub.
+- **Dependencies.** Agents and CI fetch `inkproof-` dependencies from Forgejo with one `url."http://forgejo:3000/tentenths/inkproof-".insteadOf` value for each GitHub owner the repositories have lived under (`https://github.com/paulbutcher/inkproof-` and `https://github.com/tentenths/inkproof-`, from `GH_OWNER` and `GH_FORMER_OWNERS`), because old tags' lakefiles name the former owner. They are set in the root-owned system git config and in CI, which reads the owners from the organisation's `DEPS_GITHUB_OWNERS` Actions variable, while `lakefile` and `lake-manifest.json` keep their GitHub URLs. Third-party packages are unaffected and still come from GitHub.
 
 ## Backups
 
@@ -287,7 +287,7 @@ Each is verified in the stage that first needs it, then removed from this list.
 ## Decided in review (2026-11-08)
 
 - **Autonomy levels stay**, set per repository, so the human can raise one library at a time and fall back.
-- **`insteadOf` is scoped** to `https://github.com/tentenths/inkproof-`. A rule for all of `https://github.com/` would send Mathlib, Batteries, Plausible and Lasm to Forgejo, where they don't exist.
+- **`insteadOf` is scoped** to `https://github.com/<owner>/inkproof-`, for the current and each former GitHub owner. A rule for all of `https://github.com/` would send Mathlib, Batteries, Plausible and Lasm to Forgejo, where they don't exist.
 - **`gatekeeper` approves on CI from level 2**, so no Claude run is spent per pull request on checking CI. It arrives with level 2 (stage 6); level 3 (stage 7) adds releases to it.
 - **`From:` lines are dropped.** Authorship identifies the writer; comments that need no reply start with `(no reply needed)`.
 - **Notifications** are Forgejo mentions plus a macOS notifier on the host, with SMTP optional.

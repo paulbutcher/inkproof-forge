@@ -98,7 +98,7 @@ cmd_test_stage2() {
     # A real round trip, to a scratch GitHub repository the human created.
     [ -s "$GITHUB_MIRROR_TOKEN" ] || die "a mirror test needs secrets/github/mirror-token"
     s2_scratch_repo "$mirror_test"
-    call 200,201 POST "/repos/$ORG/$mirror_test/push_mirrors" "$(jq -nc --arg u "https://github.com/$ORG/$mirror_test.git" \
+    call 200,201 POST "/repos/$ORG/$mirror_test/push_mirrors" "$(jq -nc --arg u "https://github.com/$GH_OWNER/$mirror_test.git" \
       --arg h "$HUMAN_USER" --arg p "$(tr -d '[:space:]' < "$GITHUB_MIRROR_TOKEN")" \
       '{remote_address: $u, remote_username: $h, remote_password: $p, sync_on_commit: true, interval: "24h", branch_filter: "main", use_ssh: false}')" >/dev/null
     ( cd "$work" && git_as push -q "$FORGE_URL/$ORG/$mirror_test.git" main not-mirrored v0.0.1 )
@@ -112,7 +112,7 @@ cmd_test_stage2() {
   # A mirror to a GitHub repository that doesn't exist, with no valid
   # credential: shows the push goes through forge-proxy, and changes nothing.
   s2_scratch_repo "$probe"
-  call 200,201 POST "/repos/$ORG/$probe/push_mirrors" "$(jq -nc --arg u "https://github.com/$ORG/inkproof-mirror-probe-does-not-exist.git" \
+  call 200,201 POST "/repos/$ORG/$probe/push_mirrors" "$(jq -nc --arg u "https://github.com/$GH_OWNER/inkproof-mirror-probe-does-not-exist.git" \
     '{remote_address: $u, remote_username: "nobody", remote_password: "not-a-token", sync_on_commit: false, interval: "24h", branch_filter: "main", use_ssh: false}')" >/dev/null
   ( cd "$work" && git_as push -q "$FORGE_URL/$ORG/$probe.git" main )
   local t0 err
@@ -131,12 +131,13 @@ cmd_test_stage2() {
   local consumer=stage2-consumer sha s
   s2_scratch_repo "$consumer"
   cp -r /etc/kit/tests/fixtures/stage2-consumer/. "$work/consumer"
+  sed -i "s/@GH_OWNER@/$GH_OWNER/g" "$work/consumer/lakefile.lean"
   ( cd "$work/consumer" && git init -q -b main && git add -A && git_as commit -qm "Stage 2 consumer" \
     && git_as push -q "$FORGE_URL/$ORG/$consumer.git" main )
   sha="$(git -C "$work/consumer" rev-parse HEAD)"
   s="$(s2_wait_run "$consumer" "$sha")"
   if [ "$s" = success ]; then
-    s2_pass "in CI, a consumer fetched inkproof-core from Forgejo and plausible from GitHub, and its manifest kept the GitHub URLs"
+    s2_pass "in CI, a consumer fetched inkproof-core and inkproof-scale from Forgejo, under current and former GitHub URLs, and plausible from GitHub; its manifest kept the GitHub URLs"
   else
     s2_fail "the consumer's CI run ended: $s (see $ORG/$consumer's Actions; rerun with KEEP=1 to keep it)"
   fi

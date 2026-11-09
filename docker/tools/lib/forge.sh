@@ -1,7 +1,10 @@
 # Helpers for Forgejo's API, sourced by kit.
 
 FORGE_URL="${FORGE_URL:-http://forgejo:3000}"
-ORG="${GH_OWNER:?}"
+ORG="${FORGE_ORG:?}"
+# Every GitHub owner whose inkproof- URLs mean this project's repositories:
+# where they are now, then where they used to be.
+GH_OWNERS="$(echo ${GH_OWNER:?} ${GH_FORMER_OWNERS:-})"
 COORDINATION="${REPO_PREFIX:-inkproof-}coordination"
 RESP="$(mktemp)"
 CHANGES=0

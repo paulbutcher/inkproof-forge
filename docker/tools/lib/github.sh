@@ -19,11 +19,11 @@ cmd_migrate() {
       log "$ORG/$r is already in Forgejo; skipping."
       continue
     fi
-    log "Importing $ORG/$r from GitHub..."
+    log "Importing $GH_OWNER/$r from GitHub into $ORG/$r..."
     s="$(curl -sS -m 7200 -X POST -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
           -o "$RESP" -w '%{http_code}' "$FORGE_URL/api/v1/repos/migrate" \
-          --data-binary "$(jq -nc --arg o "$ORG" --arg r "$r" --arg t "$auth" '{
-            clone_addr: "https://github.com/\($o)/\($r).git", service: "github",
+          --data-binary "$(jq -nc --arg g "$GH_OWNER" --arg o "$ORG" --arg r "$r" --arg t "$auth" '{
+            clone_addr: "https://github.com/\($g)/\($r).git", service: "github",
             repo_owner: $o, repo_name: $r, private: true, mirror: false,
             issues: true, labels: true, milestones: true, pull_requests: true,
             releases: true, wiki: false, lfs: false}
@@ -47,7 +47,7 @@ cmd_mirrors() {
   pw="$(tr -d '[:space:]' < "$GITHUB_MIRROR_TOKEN")"
   for r in $(all_repos); do
     [ "$(api GET "/repos/$ORG/$r")" = 200 ] || { log "$ORG/$r isn't in Forgejo; skipping."; continue; }
-    url="https://github.com/$ORG/$r.git"
+    url="https://github.com/$GH_OWNER/$r.git"
     existing="$(call 200 GET "/repos/$ORG/$r/push_mirrors" \
       | jq -c --arg u "$url" '[.[] | select(.remote_address == $u)][0] // empty')"
     if [ -n "$existing" ]; then

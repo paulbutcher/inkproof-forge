@@ -168,6 +168,8 @@ services:
     environment:
       FORGE_URL: http://forgejo:3000
       GH_OWNER: ${GH_OWNER:?set GH_OWNER in .env}
+      GH_FORMER_OWNERS: ${GH_FORMER_OWNERS:-}
+      FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
       REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
       HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
       MIRROR_BRANCHES: ${MIRROR_BRANCHES-main}

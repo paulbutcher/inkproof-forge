@@ -20,14 +20,18 @@ jobs:
       # ci-reader's token: reads every repository of this project, writes
       # nothing. The job's own token reads only this repository.
       TOKEN: ${{ secrets.DEPS_READ_TOKEN }}
+      GH_OWNERS: ${{ vars.DEPS_GITHUB_OWNERS }}
     steps:
       - name: Check out
         run: |
           echo /opt/elan/bin >> "$GITHUB_PATH"
           auth="Authorization: Basic $(printf 'ci-reader:%s' "$TOKEN" | base64 -w0)"
           git config --global "http.${FORGE_URL}/.extraHeader" "$auth"
-          git config --global "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
-            "https://github.com/${GITHUB_REPOSITORY_OWNER}/inkproof-"
+          [ -n "$GH_OWNERS" ] || { echo "::error::The DEPS_GITHUB_OWNERS variable is not set"; exit 1; }
+          for owner in $GH_OWNERS; do
+            git config --global --add "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
+              "https://github.com/${owner}/inkproof-"
+          done
           git init -q .
           git remote add origin "${FORGE_URL}/${GITHUB_REPOSITORY}.git"
           git fetch -q origin "+${GITHUB_REF}:refs/ci/head"
@@ -35,16 +39,26 @@ jobs:
 
       - name: Resolve dependencies
         run: |
-          echo "inkproof-core resolves to: $(git ls-remote --get-url https://github.com/tentenths/inkproof-core)"
+          forge="${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-core"
+          for owner in $GH_OWNERS; do
+            url="$(git ls-remote --get-url "https://github.com/$owner/inkproof-core")"
+            echo "github.com/$owner/inkproof-core resolves to: $url"
+            [ "$url" = "$forge" ]
+          done
+          current="${GH_OWNERS%% *}"
           lake update 2>&1 | tail -20
           jq -r '.packages[] | "manifest: \(.name) \(.url) \(.rev)"' lake-manifest.json
-          jq -e '.packages[] | select(.name | ltrimstr("«") | rtrimstr("»") == "inkproof-core") | .url == "https://github.com/tentenths/inkproof-core"' lake-manifest.json
-          jq -e '.packages[] | select(.name == "plausible") | .url | startswith("https://github.com/leanprover-community/plausible")' lake-manifest.json
+          url_of() { jq -r --arg n "$1" '.packages[] | select(.name | ltrimstr("«") | rtrimstr("»") == $n) | .url' lake-manifest.json; }
+          [ "$(url_of inkproof-core)" = "https://github.com/$current/inkproof-core" ]
+          [ "$(url_of inkproof-scale)" = "https://github.com/$current/inkproof-scale" ]
+          [ "$(url_of plausible)" = "https://github.com/leanprover-community/plausible" ]
           # Where each was actually fetched from: git prints the rewritten URL.
-          core_from="$(git -C .lake/packages/inkproof-core fetch -v --dry-run 2>&1 | grep '^From ')"
-          plausible_from="$(git -C .lake/packages/plausible fetch -v --dry-run 2>&1 | grep '^From ')"
+          from() { git -C ".lake/packages/$1" fetch -v --dry-run 2>&1 | grep '^From '; }
+          core_from="$(from inkproof-core)"; scale_from="$(from inkproof-scale)"; plausible_from="$(from plausible)"
           echo "inkproof-core: $core_from"
+          echo "inkproof-scale: $scale_from"
           echo "plausible: $plausible_from"
-          [ "$core_from" = "From ${FORGE_URL}/tentenths/inkproof-core" ]
+          [ "$core_from" = "From $forge" ]
+          [ "$scale_from" = "From ${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-scale" ]
           [ "$plausible_from" = "From https://github.com/leanprover-community/plausible" ]
-          echo "Fetched inkproof-core from Forgejo and plausible from GitHub."
+          echo "Fetched this project's packages from Forgejo and plausible from GitHub."

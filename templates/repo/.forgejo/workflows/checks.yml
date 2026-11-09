@@ -25,6 +25,9 @@ jobs:
       # ci-reader's token: reads every repository of this project, writes
       # nothing. The job's own token reads only this repository.
       TOKEN: ${{ secrets.DEPS_READ_TOKEN }}
+      # Every GitHub owner this project's repositories have lived under,
+      # current first; set by the kit's bootstrap.
+      GH_OWNERS: ${{ vars.DEPS_GITHUB_OWNERS }}
     steps:
       - name: Check out
         run: |
@@ -32,8 +35,11 @@ jobs:
           auth="Authorization: Basic $(printf 'ci-reader:%s' "$TOKEN" | base64 -w0)"
           git config --global "http.${FORGE_URL}/.extraHeader" "$auth"
           # Dependencies keep their GitHub URLs; fetch this project's from Forgejo.
-          git config --global "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
-            "https://github.com/${GITHUB_REPOSITORY_OWNER}/inkproof-"
+          [ -n "$GH_OWNERS" ] || { echo "::error::The DEPS_GITHUB_OWNERS variable is not set; run the kit's bootstrap"; exit 1; }
+          for owner in $GH_OWNERS; do
+            git config --global --add "url.${FORGE_URL}/${GITHUB_REPOSITORY_OWNER}/inkproof-.insteadOf" \
+              "https://github.com/${owner}/inkproof-"
+          done
           git init -q .
           git remote add origin "${FORGE_URL}/${GITHUB_REPOSITORY}.git"
           git fetch -q --tags origin "+${GITHUB_REF}:refs/ci/head" '+refs/heads/main:refs/remotes/origin/main'
@@ -41,7 +47,7 @@ jobs:
           git log -1 --format='Checked out %H: %s'
 
       - name: Internal dependencies pinned to release tags
-        run: GH_OWNER="$GITHUB_REPOSITORY_OWNER" bash scripts/check-pins.sh
+        run: bash scripts/check-pins.sh
 
       - name: Build, failing on sorry
         run: |

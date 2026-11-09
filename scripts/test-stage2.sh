@@ -27,7 +27,7 @@ gh_refs() {
 
 echo "== Imported main and tags match GitHub"
 for r in $(grep -v '^[[:space:]]*\(#\|$\)' agents.conf | awk '$3 != "-" { print $3 }' | sort -u); do
-  fj="$(docker compose exec -T forgejo git --git-dir="/var/lib/gitea/git/repositories/${GH_OWNER}/$r.git" \
+  fj="$(docker compose exec -T forgejo git --git-dir="/var/lib/gitea/git/repositories/$(printf %s "$FORGE_ORG" | tr '[:upper:]' '[:lower:]')/$r.git" \
     for-each-ref --format='%(objectname)%09%(refname)' refs/heads/main refs/tags 2>/dev/null | sort)"
   gh="$(gh_refs "$r")"
   if [ -n "$fj" ] && [ "$fj" = "$gh" ]; then

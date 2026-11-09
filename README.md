@@ -37,12 +37,14 @@ You need Docker Desktop. The scripts are bash 3.2-compatible and run from the ki
 
 Forgejo imports each repository in `agents.conf` once, with its history, issues, labels, milestones, pull requests and releases, then pushes `main` and every tag back to GitHub on each commit. Both use GitHub tokens of your own; nothing uses a machine user, and content the suspended account wrote is hidden on GitHub, so it doesn't import.
 
-1. On GitHub, create a fine-grained token with resource owner `tentenths`, the four `inkproof-` repositories, and read-only Contents, Issues, Pull requests and Metadata. Save it as `secrets/github/import-token` (`chmod 600`).
+On GitHub the repositories are under `GH_OWNER` (`paulbutcher`); in Forgejo they're in the organisation `FORGE_ORG` (`tentenths`). They used to be under `tentenths` on GitHub, and old tags' lakefiles still say so, so `GH_FORMER_OWNERS` lists that owner too. CI and agents fetch `inkproof-` repositories under every one of those owners from Forgejo.
+
+1. On GitHub, create a fine-grained token with resource owner `paulbutcher`, the four `inkproof-` repositories, and read-only Contents, Issues, Pull requests and Metadata. Save it as `secrets/github/import-token` (`chmod 600`).
 2. Create a second fine-grained token on the same repositories with Contents read and write and nothing else. Save it as `secrets/github/mirror-token` (`chmod 600`).
 3. `bash scripts/migrate.sh` imports whatever Forgejo doesn't have yet, then gives the agents' teams their repositories. Forgejo's proxy allows GitHub's API only while it runs. You can delete the import token afterwards.
 4. Decide what the mirrors carry. Forgejo mirrors exactly: with `MIRROR_BRANCHES=main`, the default, the first sync deletes every other branch on GitHub (the old `agent/*` branches; tags, `main` and closed pull requests' diffs are untouched). With `MIRROR_BRANCHES=` (empty), every Forgejo branch is mirrored, including agents' future work branches.
 5. `bash scripts/mirrors.sh` adds the push mirrors and shows each one's last sync and error. To rotate the mirror token, replace the file and run `bash scripts/mirrors.sh --rotate`.
-6. `bash scripts/test-stage2.sh` checks the import against GitHub, the mirrors, and that Forgejo's proxy is closed to GitHub's API again. To check a full round trip without touching the project's repositories, create an empty private repository `tentenths/inkproof-mirror-test` on GitHub, add it to the mirror token, and run `MIRROR_TEST_REPO=inkproof-mirror-test bash scripts/test-stage2.sh`; delete the repository afterwards.
+6. `bash scripts/test-stage2.sh` checks the import against GitHub, the mirrors, and that Forgejo's proxy is closed to GitHub's API again. To check a full round trip without touching the project's repositories, create an empty private repository `paulbutcher/inkproof-mirror-test` on GitHub, add it to the mirror token, and run `MIRROR_TEST_REPO=inkproof-mirror-test bash scripts/test-stage2.sh`; delete the repository afterwards.
 
 ### The same checkout in the dev container
 

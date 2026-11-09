@@ -196,6 +196,7 @@ cmd_bootstrap() {
   ensure_token ci-reader '["read:repository","read:user"]'
   ensure_team ci-read "$(units read none none)" ci-reader "*"
   ensure_ci_secret "$FRESH_TOKEN"
+  ensure_ci_variable DEPS_GITHUB_OWNERS "$GH_OWNERS"
   ensure_webhook
   log "Bootstrap made $CHANGES change(s)."
   echo "$CHANGES"
@@ -210,4 +211,18 @@ ensure_ci_secret() {
       "$(jq -nc --arg d "$(token_of ci-reader)" '{data: $d}')" >/dev/null
     changed "stored ci-reader's token as the organisation's DEPS_READ_TOKEN Actions secret"
   fi
+}
+
+# ensure_ci_variable NAME VALUE: an organisation Actions variable, which
+# workflows read as vars.NAME.
+ensure_ci_variable() {
+  local body
+  body="$(jq -nc --arg v "$2" '{value: $v}')"
+  case "$(api GET "/orgs/$ORG/actions/variables/$1")" in
+    200) [ "$(jq -r .data "$RESP")" = "$2" ] && return
+         call 201,204 PUT "/orgs/$ORG/actions/variables/$1" "$body" >/dev/null ;;
+    404) call 201,204 POST "/orgs/$ORG/actions/variables/$1" "$body" >/dev/null ;;
+    *) die "reading the $1 Actions variable: $(head -c 300 "$RESP")" ;;
+  esac
+  changed "set the organisation's $1 Actions variable to \"$2\""
 }
