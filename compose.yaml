@@ -203,6 +203,9 @@ services:
       MAX_RUNS_PER_DAY: ${MAX_RUNS_PER_DAY:-20}
       DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-60}
       MAX_DELAY_SECONDS: ${MAX_DELAY_SECONDS:-900}
+      MAX_SPEND_PER_DAY: ${MAX_SPEND_PER_DAY:-0}
+      RECONCILE_SECONDS: ${RECONCILE_SECONDS:-900}
+      REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
     volumes:
       # webhook-secret, and token once scripts/bootstrap.sh has made it.
       - ${STATE_DIR:-.}/secrets/dispatcher:/run/secrets/dispatcher:ro
@@ -216,7 +219,7 @@ services:
   archive-init:
     image: alpine:3.24
     network_mode: none
-    entrypoint: ["sh", "-c", "for a in core; do mkdir -p /archive/$$a; chown ${HOST_UID:-501}:${HOST_GID:-20} /archive/$$a; done"]
+    entrypoint: ["sh", "-c", "for a in coordinator core scale consumer-metrics; do mkdir -p /archive/$$a; chown ${HOST_UID:-501}:${HOST_GID:-20} /archive/$$a; done"]
     volumes:
       - run-archive:/archive
 
@@ -224,6 +227,37 @@ services:
   # One service per agent, from the x-agent template below. Each sees only its
   # own Forgejo token and runner key, its own workspace and Claude
   # configuration, and its own folder in the run archive.
+  coordinator:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: coordinator
+        AGENT_REPO: inkproof-coordination
+    image: inkproof-agent-coordinator:1
+    hostname: coordinator
+    environment:
+      <<: *agent-env
+      AGENT_NAME: coordinator
+      AGENT_REPO: inkproof-coordination
+      AGENT_READS: inkproof-core,inkproof-scale,inkproof-consumer-metrics
+      GIT_AUTHOR_NAME: coordinator
+      GIT_AUTHOR_EMAIL: coordinator@noreply.localhost
+      GIT_COMMITTER_NAME: coordinator
+      GIT_COMMITTER_EMAIL: coordinator@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/coordinator/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/coordinator:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-coordinator:/workspace
+      - claude-coordinator:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: coordinator }
+
   core:
     <<: *agent
     build:
@@ -238,6 +272,7 @@ services:
       <<: *agent-env
       AGENT_NAME: core
       AGENT_REPO: inkproof-core
+      AGENT_READS: inkproof-coordination
       GIT_AUTHOR_NAME: core
       GIT_AUTHOR_EMAIL: core@noreply.localhost
       GIT_COMMITTER_NAME: core
@@ -253,6 +288,68 @@ services:
         source: run-archive
         target: /var/lib/inkproof/archive
         volume: { subpath: core }
+
+  scale:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: scale
+        AGENT_REPO: inkproof-scale
+    image: inkproof-agent-scale:1
+    hostname: scale
+    environment:
+      <<: *agent-env
+      AGENT_NAME: scale
+      AGENT_REPO: inkproof-scale
+      AGENT_READS: inkproof-coordination,inkproof-core
+      GIT_AUTHOR_NAME: scale
+      GIT_AUTHOR_EMAIL: scale@noreply.localhost
+      GIT_COMMITTER_NAME: scale
+      GIT_COMMITTER_EMAIL: scale@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/scale/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/scale:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-scale:/workspace
+      - claude-scale:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: scale }
+
+  consumer-metrics:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: consumer-metrics
+        AGENT_REPO: inkproof-consumer-metrics
+    image: inkproof-agent-consumer-metrics:1
+    hostname: consumer-metrics
+    environment:
+      <<: *agent-env
+      AGENT_NAME: consumer-metrics
+      AGENT_REPO: inkproof-consumer-metrics
+      AGENT_READS: inkproof-coordination,inkproof-core,inkproof-scale
+      GIT_AUTHOR_NAME: consumer-metrics
+      GIT_AUTHOR_EMAIL: consumer-metrics@noreply.localhost
+      GIT_COMMITTER_NAME: consumer-metrics
+      GIT_COMMITTER_EMAIL: consumer-metrics@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/consumer-metrics/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/consumer-metrics:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-consumer-metrics:/workspace
+      - claude-consumer-metrics:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: consumer-metrics }
 
   # The image CI jobs run in. Built here and loaded into ci-docker by
   # scripts/up.sh, so the CI engine never pulls from a registry.
@@ -279,6 +376,7 @@ services:
       KEEP: ${KEEP:-}
     volumes:
       - ${STATE_DIR:-.}/secrets:/secrets
+      - ${STATE_DIR:-.}/control:/control
       # Tests read a copy of Forgejo's database for what its API leaves out,
       # such as the GitHub author of migrated content.
       - forgejo-data:/forgejo:ro
@@ -325,7 +423,13 @@ volumes:
   dispatcher-state:
   # Agents: each one's workspace and Claude configuration; elan and Lean
   # toolchains, shared; every run's and session's log and transcript.
+  work-coordinator:
+  claude-coordinator:
   work-core:
   claude-core:
+  work-scale:
+  claude-scale:
+  work-consumer-metrics:
+  claude-consumer-metrics:
   agent-elan:
   run-archive:

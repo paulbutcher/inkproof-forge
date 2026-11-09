@@ -282,8 +282,6 @@ Each is verified in the stage that first needs it, then removed from this list.
 - [ ] `cleanupPeriodDays` in managed settings governs transcript deletion for every session in the container (stage 3).
 - [ ] An approval from an approvals-list member satisfies the review count and their own official review request (stage 3).
 - [ ] Every pending official review request blocks the merge, not only the first (stage 3).
-- [ ] Narrowing a branch's merge list cancels nothing silently, and scheduled merges can be cancelled and rescheduled by API (stage 4).
-- [ ] `PreToolUse` hooks fire in `-p` runs and a deny there ends the run's work promptly (stage 4).
 
 ## Decided in review (2026-11-08)
 

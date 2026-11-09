@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Container entry point. Prepares the agent's workspace and Claude's
 # configuration, then runs agent-runner for the life of the container.
-#   - clones the agent's own repository (and inkproof-coordination, read-only
-#     background) from Forgejo, retrying while Forgejo starts;
+#   - clones the agent's own repository, and the ones it reads (read-only
+#     background), from Forgejo, retrying while Forgejo starts;
 #   - gives tea a login with the agent's token;
 #   - marks the workspace folders as trusted and onboarding as done, so no
 #     run or session meets a first-run prompt;
@@ -10,7 +10,6 @@
 #     toolchain into the shared elan volume, one agent at a time.
 set -uo pipefail
 own="/workspace/${AGENT_REPO}"
-coord="/workspace/inkproof-coordination"
 mkdir -p /workspace/.inkproof
 
 clone() {
@@ -25,7 +24,10 @@ clone() {
   return 1
 }
 clone "$AGENT_REPO" "$own"
-[ "$AGENT_REPO" = inkproof-coordination ] || clone inkproof-coordination "$coord"
+# The repositories it reads (agents.conf), read-only background.
+for r in $(echo "${AGENT_READS:-}" | tr "," " "); do
+  [ "$r" = "$AGENT_REPO" ] || clone "$r" "/workspace/$r"
+done
 
 # The run logs live in the workspace but never in git.
 if [ -d "$own/.git" ] && ! grep -qx '/.inkproof/' "$own/.git/info/exclude" 2>/dev/null; then

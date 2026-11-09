@@ -14,7 +14,7 @@
 # Before it: scripts/setup-repo.sh inkproof-core 1 reports no changes needed,
 # and core is running (scripts/up.sh). It takes the grace period
 # (HUMAN_GRACE_SECONDS, 10 minutes by default) plus a few runs.
-#   bash scripts/test-stage3.sh        KEEP=1 keeps the test's issues open
+#   scripts/test-stage3.sh        KEEP=1 keeps the test's issues open
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 fails=0

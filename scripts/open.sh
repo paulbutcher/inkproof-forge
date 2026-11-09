@@ -2,10 +2,10 @@
 # Open VS Code attached to an agent's running container, at its workspace,
 # with its live run log (.inkproof/current.md) in a tab. Dev Containers
 # builds nothing: the container is already running from scripts/up.sh.
-#   bash scripts/open.sh core
+#   scripts/open.sh core
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
-[ $# = 1 ] || { echo "usage: bash scripts/open.sh <agent>" >&2; exit 2; }
+[ $# = 1 ] || { echo "usage: scripts/open.sh <agent>" >&2; exit 2; }
 agent="$1"
 repo="$(awk -v a="$agent" '$1 == a { print $3 }' agents.conf)"
 [ -n "$repo" ] && [ "$repo" != - ] || { echo "$agent has no repository in agents.conf" >&2; exit 1; }

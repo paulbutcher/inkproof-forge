@@ -61,16 +61,54 @@
   },
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook session-start" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/inkproof-hook session-start"
+          }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook prompt" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/inkproof-hook prompt"
+          }
+        ]
+      }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook stop" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/inkproof-hook stop"
+          }
+        ]
+      }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook session-end" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/inkproof-hook session-end"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/inkproof-hook pre-tool"
+          }
+        ]
+      }
     ]
   }
 }

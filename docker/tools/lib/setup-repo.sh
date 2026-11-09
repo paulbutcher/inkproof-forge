@@ -64,6 +64,12 @@ ensure_repo_settings() {
   fi
 }
 
+# has_ci REPO: whether the repository is a Lean package with CI. The
+# coordination repository holds documents only.
+has_ci() {
+  [ "$1" != "$COORDINATION" ]
+}
+
 # approvals list for a level, as a JSON array
 approvers() {
   local level="$1" list
@@ -85,6 +91,14 @@ ensure_branch_protection() {
     block_on_outdated_branch: true, dismiss_stale_approvals: true, ignore_stale_approvals: false,
     enable_status_check: true, status_check_contexts: ["checks*"],
     require_signed_commits: false, apply_to_admins: false}')"
+  # The coordination repository has no CI: nothing to require.
+  if ! has_ci "$repo"; then
+    body="$(jq -c '.enable_status_check = false | .status_check_contexts = []' <<<"$body")"
+  fi
+  # While paused, only the human may merge (scripts/pause.sh); keep it so.
+  if [ -e /control/paused ]; then
+    body="$(jq -c --arg h "$HUMAN_USER" '.enable_merge_whitelist = true | .merge_whitelist_usernames = [$h]' <<<"$body")"
+  fi
   keys="$(jq -c 'keys' <<<"$body")"
   if [ "$(api GET "/repos/$ORG/$repo/branch_protections/main")" = 404 ]; then
     call 201 POST "/repos/$ORG/$repo/branch_protections" "$body" >/dev/null
@@ -144,7 +158,9 @@ EOF
 # multi-file commit, that make REF's files right for LEVEL.
 file_ops() {
   local repo="$1" ref="$2" level="$3" ops='[]' f want have op commit
-  for f in .forgejo/workflows/checks.yml .forgejo/issue_template/request.md scripts/check-pins.sh .forgejo/CODEOWNERS; do
+  local files=".forgejo/issue_template/request.md .forgejo/CODEOWNERS"
+  has_ci "$repo" && files=".forgejo/workflows/checks.yml scripts/check-pins.sh $files"
+  for f in $files; do
     if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
     if [ "$(api GET "/repos/$ORG/$repo/contents/$f?ref=$ref")" = 200 ]; then
       have="$(jq -r '.content // ""' "$RESP" | base64 -d)"

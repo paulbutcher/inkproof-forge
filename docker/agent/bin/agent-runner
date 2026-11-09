@@ -318,7 +318,9 @@ def loop():
     while True:
         try:
             sync_sessions()
-            if not human_active():
+            if human_active():
+                call("POST", "/heartbeat", {"human_active": True})
+            else:
                 s, claim = call("POST", "/claim", {})
                 if s == 200 and claim:
                     run(claim)

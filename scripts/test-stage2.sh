@@ -3,8 +3,8 @@
 # and pull requests; migrated content keeps its GitHub authors; push mirrors
 # work and go through forge-proxy; GitHub's API is closed again; and a consumer
 # fetches this project's dependencies from Forgejo and others from GitHub.
-#   bash scripts/test-stage2.sh                  checks, with no pushes to GitHub
-#   MIRROR_TEST_REPO=inkproof-mirror-test bash scripts/test-stage2.sh
+#   scripts/test-stage2.sh                  checks, with no pushes to GitHub
+#   MIRROR_TEST_REPO=inkproof-mirror-test scripts/test-stage2.sh
 #       also pushes a commit, a tag and a branch to that scratch GitHub
 #       repository through a push mirror, and checks what arrives there
 set -euo pipefail

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """The dispatcher: turns Forgejo's webhooks into work for agents, hands that
-work to each agent's runner, and keeps the run ledger.
+work to each agent's runner, keeps the run ledger, and tells the human what
+needs them.
 
   POST /hook                 Forgejo's webhooks, signed with the webhook secret
   POST /claim                a runner asks for work (Bearer: its runner key)
+  POST /heartbeat            a runner reports the human active in its container
   POST /runs/<id>/start      the runner started the claimed run
   POST /runs/<id>/end        the run ended: outcome, cost, turns, denials...
   POST /runs/abandon         the runner restarted; unfinished runs are closed
   POST /sessions             the human's session in an agent's container
+  POST /admin/drop           drop an agent's pending triggers (Bearer: admin key)
+  POST /admin/reconcile      reconcile now (Bearer: admin key)
   GET  /status               agents, queues, recent runs, sessions, notices
+  GET  /notices.txt?after=N  notices after id N, one per line, for notify.sh
   GET  /healthz
 
 Only trusted authors (the human and the kit's accounts) start work, never an
@@ -16,40 +21,49 @@ agent's own actions, and never a comment whose first line is
 `(no reply needed)`. Trigger descriptions carry only numbers and names, never
 issue text, because they become a run's prompt.
 
-A claim is granted only when the agent has no run, is under its daily cap,
+A claim is granted only when the agent has no run, is under its daily caps,
 the kit isn't paused, and its newest trigger has settled for the debounce
 period (or its oldest has waited the maximum delay), so a burst of events
 becomes one run.
+
+Every RECONCILE_SECONDS, and on start, it checks Forgejo for work a missed
+webhook would have lost: untriaged requests, failed Actions runs on agents'
+pull requests, and agents' pull requests behind main.
 """
 
 import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 STATE = Path(os.environ.get("STATE_DIR", "/state"))
-SECRET_FILE = Path(os.environ.get("WEBHOOK_SECRET_FILE", "/run/secrets/dispatcher/webhook-secret"))
-TOKEN_FILE = Path(os.environ.get("DISPATCHER_TOKEN_FILE", "/run/secrets/dispatcher/token"))
+SECRETS = Path(os.environ.get("DISPATCHER_SECRETS", "/run/secrets/dispatcher"))
 KEYS_DIR = Path(os.environ.get("RUNNER_KEYS_DIR", "/run/secrets/runner-keys"))
 AGENTS_CONF = Path(os.environ.get("AGENTS_CONF", "/etc/kit/agents.conf"))
 CONTROL = Path(os.environ.get("CONTROL_DIR", "/control"))
 FORGE = os.environ.get("FORGE_URL", "http://forgejo:3000").rstrip("/")
 ORG = os.environ.get("FORGE_ORG", "")
 HUMAN = os.environ.get("HUMAN_USER", "")
+PREFIX = os.environ.get("REPO_PREFIX", "inkproof-")
 CAP = int(os.environ.get("MAX_RUNS_PER_DAY", "20"))
+SPEND_CAP = float(os.environ.get("MAX_SPEND_PER_DAY", "0") or 0)  # dollars per agent; 0: none
 DEBOUNCE = int(os.environ.get("DEBOUNCE_SECONDS", "60"))
 MAX_DELAY = int(os.environ.get("MAX_DELAY_SECONDS", "900"))
+RECONCILE = int(os.environ.get("RECONCILE_SECONDS", "900"))
 KEEP_PAYLOADS = 500
 MAX_BODY = 25 * 1024 * 1024
 NO_REPLY = "(no reply needed)"
+BLOCKED_BY = re.compile(r"Blocked-by:[ \t]*([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([0-9]+)")
 
 
 def log(msg):
@@ -82,6 +96,12 @@ AGENTS = load_agents()
 TRUSTED = set(AGENTS) | {"gatekeeper", "dispatcher", HUMAN}
 OWNER_OF = {a["own"]: name for name, a in AGENTS.items()
             if a["own"] and a["kind"] in ("library", "coordinator")}
+COORDINATOR = next((n for n, a in AGENTS.items() if a["kind"] == "coordinator"), None)
+COORDINATION = AGENTS[COORDINATOR]["own"] if COORDINATOR else f"{PREFIX}coordination"
+
+
+def secret(name):
+    return (SECRETS / name).read_text().strip()
 
 
 def agent_for_key(key):
@@ -106,7 +126,7 @@ def paused():
 STATE.mkdir(parents=True, exist_ok=True)
 DB = sqlite3.connect(STATE / "ledger.db", check_same_thread=False, isolation_level=None)
 DB.row_factory = sqlite3.Row
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 DB.executescript("""
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS triggers (
@@ -128,7 +148,9 @@ CREATE TABLE IF NOT EXISTS labels (
 CREATE TABLE IF NOT EXISTS notices (
   id INTEGER PRIMARY KEY, at REAL, key TEXT UNIQUE, kind TEXT, repo TEXT,
   number INTEGER, text TEXT, posted INTEGER);
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS triggers_pending ON triggers (agent, run_id);
+CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
 """)
 
@@ -138,42 +160,111 @@ def q(sql, *args):
         return DB.execute(sql, args).fetchall()
 
 
-def add_trigger(agent, key, description):
+def kv_get(key, default=None):
+    row = q("SELECT value FROM kv WHERE key=?", key)
+    return row[0]["value"] if row else default
+
+
+def kv_set(key, value):
+    q("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)", key, str(value))
+
+
+def add_trigger(agent, key, description, once=False, recent=0):
+    """Queue work for an agent, unless the same key is already waiting; with
+    once, unless it was ever queued; with recent, unless it was queued in the
+    last `recent` seconds."""
+    if agent not in AGENTS:
+        return
     with LOCK:
-        if DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=? AND run_id IS NULL",
-                      (agent, key)).fetchone():
+        if once:
+            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=?", (agent, key)).fetchone()
+        elif recent:
+            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=? AND (run_id IS NULL OR created>?)",
+                             (agent, key, now() - recent)).fetchone()
+        else:
+            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=? AND run_id IS NULL",
+                             (agent, key)).fetchone()
+        if dup:
             return
         DB.execute("INSERT INTO triggers (agent, key, description, created) VALUES (?,?,?,?)",
                    (agent, key, description, now()))
     log(f"queued for {agent}: {description}")
 
 
+# --- Forgejo --------------------------------------------------------------------
+
+def forge(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(FORGE + "/api/v1" + path, method=method, data=data, headers={
+        "Authorization": f"token {secret('token')}", "Accept": "application/json",
+        **({"Content-Type": "application/json"} if data else {})})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
+        return json.loads(raw) if raw.strip() else None
+
+
+def forge_list(path, limit=50):
+    sep = "&" if "?" in path else "?"
+    return forge("GET", f"{path}{sep}limit={limit}") or []
+
+
 # --- Notices --------------------------------------------------------------------
 
-def forge_post(path, body):
-    req = urllib.request.Request(FORGE + "/api/v1" + path, method="POST",
-                                 data=json.dumps(body).encode(), headers={
-                                     "Authorization": f"token {TOKEN_FILE.read_text().strip()}",
-                                     "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.status
+def add_notice(key, kind, repo, number, text):
+    """Record a notice once per key; notify.sh shows each on the Mac."""
+    with LOCK:
+        if DB.execute("SELECT 1 FROM notices WHERE key=?", (key,)).fetchone():
+            return False
+        DB.execute("INSERT INTO notices (at, key, kind, repo, number, text, posted) VALUES (?,?,?,?,?,?,0)",
+                   (now(), key, kind, repo, number, text))
+    return True
+
+
+def comment(repo, number, text):
+    forge("POST", f"/repos/{ORG}/{repo}/issues/{number}/comments", {"body": f"{NO_REPLY}\n\n@{HUMAN} {text}"})
 
 
 def notify(key, kind, repo, number, text):
-    """Once per key: comment on the issue as dispatcher, mentioning the human,
-    so it shows in their Forgejo notifications."""
-    with LOCK:
-        if DB.execute("SELECT 1 FROM notices WHERE key=?", (key,)).fetchone():
-            return
-        DB.execute("INSERT INTO notices (at, key, kind, repo, number, text, posted) VALUES (?,?,?,?,?,?,0)",
-                   (now(), key, kind, repo, number, text))
+    """Once per key: a notice, and a comment on the issue as dispatcher that
+    mentions the human, so it shows in their Forgejo notifications."""
+    if not add_notice(key, kind, repo, number, text):
+        return
     try:
-        forge_post(f"/repos/{ORG}/{repo}/issues/{number}/comments",
-                   {"body": f"{NO_REPLY}\n\n@{HUMAN} {text}"})
+        comment(repo, number, text)
         q("UPDATE notices SET posted=1 WHERE key=?", key)
         log(f"notified {HUMAN}: {repo}#{number}: {kind}")
     except Exception as e:
         log(f"couldn't post the notice for {repo}#{number}: {e}")
+
+
+def notify_agent(agent, key, kind, text):
+    """A notice about an agent rather than an issue (caps, failed transcript
+    rewrites): on one needs-human issue per agent, reused until the human
+    closes it."""
+    repo = AGENTS[agent]["own"] or COORDINATION
+    if not add_notice(key, kind, repo, None, text):
+        return
+    try:
+        n = kv_get(f"notice-issue:{agent}")
+        if n:
+            issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+            if issue.get("state") != "open":
+                n = None
+        if not n:
+            labels = [l["id"] for l in forge_list(f"/repos/{ORG}/{repo}/labels", 100) if l["name"] == "needs-human"]
+            issue = forge("POST", f"/repos/{ORG}/{repo}/issues", {
+                "title": f"Kit notices: {agent}",
+                "body": f"{NO_REPLY}\n\nThe dispatcher posts notices about `{agent}` here: reached caps, and runs "
+                        "the extension doesn't list. Close this issue once you've dealt with them; the next "
+                        "notice opens a new one.",
+                "labels": labels})
+            n = issue["number"]
+            kv_set(f"notice-issue:{agent}", n)
+        comment(repo, n, text)
+        q("UPDATE notices SET posted=1, number=? WHERE key=?", n, key)
+        log(f"notified {HUMAN} about {agent}: {kind}")
+    except Exception as e:
+        log(f"couldn't post the notice about {agent}: {e}")
 
 
 # --- Webhooks -> triggers -------------------------------------------------------
@@ -187,50 +278,113 @@ def wants_reply(body):
 
 
 def labels_changed(repo, number, labels):
-    """Labels added since the last time this issue was seen."""
+    """Labels added and removed since this issue was last seen."""
     with LOCK:
         row = DB.execute("SELECT labels FROM labels WHERE repo=? AND number=?", (repo, number)).fetchone()
         DB.execute("INSERT OR REPLACE INTO labels (repo, number, labels) VALUES (?,?,?)",
                    (repo, number, json.dumps(sorted(labels))))
     before = set(json.loads(row["labels"])) if row else set()
-    return set(labels) - before
+    return set(labels) - before, before - set(labels)
+
+
+def project_repo(repo):
+    return repo.startswith(PREFIX)
+
+
+def pr_behind(repo, pr):
+    """Whether main has commits the pull request's branch lacks."""
+    cmp = forge("GET", f"/repos/{ORG}/{repo}/compare/{pr['head']['sha']}...main")
+    return (cmp or {}).get("total_commits", 0) > 0
+
+
+def check_behind(repo, main_sha=""):
+    owner = OWNER_OF.get(repo)
+    if not owner:
+        return
+    main_sha = main_sha or forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"]["id"]
+    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+        if pr["user"]["login"] == owner and pr_behind(repo, pr):
+            add_trigger(owner, f"behind:{repo}#{pr['number']}:{main_sha[:12]}",
+                        f"pull request {repo}#{pr['number']} is behind main", once=True)
+
+
+def wake_blocked(match, what):
+    """Wake every agent with an open `blocked` issue whose Blocked-by: line
+    matches (repo, number or None)."""
+    dep_repo, dep_n = match
+    for repo, owner in OWNER_OF.items():
+        try:
+            issues = forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=blocked")
+        except Exception as e:
+            log(f"couldn't read {repo}'s blocked issues: {e}")
+            continue
+        for issue in issues:
+            texts = [issue.get("body") or ""] if issue["user"]["login"] in TRUSTED else []
+            texts += [c.get("body") or "" for c in forge_list(f"/repos/{ORG}/{repo}/issues/{issue['number']}/comments", 100)
+                      if c["user"]["login"] in TRUSTED]
+            for org, r, n in BLOCKED_BY.findall("\n".join(texts)):
+                if org.lower() == ORG.lower() and r == dep_repo and (dep_n is None or int(n) == dep_n):
+                    add_trigger(owner, f"unblocked:{repo}#{issue['number']}:{what}",
+                                f"{what}; {repo}#{issue['number']} is blocked on it", once=True)
+                    break
 
 
 def handle(event, payload):
     repo = (payload.get("repository") or {}).get("name") or ""
     sender = (payload.get("sender") or {}).get("login") or ""
-    if (payload.get("repository") or {}).get("owner", {}).get("login", ORG).lower() != ORG.lower():
+    if ((payload.get("repository") or {}).get("owner") or {}).get("login", ORG).lower() != ORG.lower():
+        return
+    if not project_repo(repo):
         return
     owner = OWNER_OF.get(repo)
     trusted = sender in TRUSTED
+    action = payload.get("action")
+    coord = COORDINATOR if COORDINATOR and sender != COORDINATOR else None
 
     if event == "issues":
         issue = payload.get("issue") or {}
         n = issue.get("number")
         labels = {l["name"] for l in issue.get("labels") or []}
-        added = labels_changed(repo, n, labels)
+        added, removed = labels_changed(repo, n, labels)
         author = (issue.get("user") or {}).get("login")
         if not trusted:
             return
+        is_pr = bool(issue.get("pull_request"))
+        kind = "pull request" if is_pr else "issue"
         if "blocking" in added and "upstream" in labels:
             notify(f"blocking:{repo}#{n}", "blocking", repo, n,
                    "this upstream issue is marked `blocking`: an agent can't continue until it's resolved upstream. "
                    "Close it or comment on it once a fix is available.")
-        if "needs-human" in added:
+        if "needs-human" in added and sender != "dispatcher":
             notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
                    "this needs your decision (`needs-human`).")
-        if (owner and issue.get("state") == "open" and not issue.get("pull_request")
+        if (owner and issue.get("state") == "open" and not is_pr
                 and {"request", "new"} <= labels and author in TRUSTED and author != owner
-                and sender != owner and payload.get("action") in ("opened", "reopened", "label_updated")):
+                and sender != owner and action in ("opened", "reopened", "label_updated")):
             add_trigger(owner, f"request:{repo}#{n}", f"untriaged request {repo}#{n}")
+        if coord:
+            if action == "opened" and "request" in labels and not is_pr:
+                add_trigger(coord, f"filed:{repo}#{n}", f"request filed: {repo}#{n}", once=True)
+            if "ready-for-release" in added:
+                add_trigger(coord, f"rfr:{repo}#{n}:{int(now())}", f"ready-for-release added to {kind} {repo}#{n}")
+            if "needs-human" in added:
+                add_trigger(coord, f"nh+:{repo}#{n}:{int(now())}", f"needs-human added to {kind} {repo}#{n}")
+            if "needs-human" in removed:
+                add_trigger(coord, f"nh-:{repo}#{n}:{int(now())}", f"needs-human removed from {kind} {repo}#{n}")
+        if repo == COORDINATION and "upstream" in labels and action == "closed":
+            wake_blocked((repo, n), f"upstream issue {repo}#{n} was closed")
 
-    elif event == "issue_comment" and payload.get("action") == "created":
-        issue, comment = payload.get("issue") or {}, payload.get("comment") or {}
+    elif event == "issue_comment" and action == "created":
+        issue, c = payload.get("issue") or {}, payload.get("comment") or {}
         n = issue.get("number")
-        if (owner and trusted and sender != owner and issue.get("state") == "open"
-                and wants_reply(comment.get("body"))):
+        if not trusted:
+            return
+        if owner and sender != owner and issue.get("state") == "open" and wants_reply(c.get("body")):
             kind = "pull request" if payload.get("is_pull") or issue.get("pull_request") else "issue"
-            add_trigger(owner, f"comment:{comment.get('id')}", f"comment on {kind} {repo}#{n}")
+            add_trigger(owner, f"comment:{c.get('id')}", f"comment on {kind} {repo}#{n}")
+        labels = {l["name"] for l in issue.get("labels") or []}
+        if repo == COORDINATION and "upstream" in labels and sender == HUMAN:
+            wake_blocked((repo, n), f"{HUMAN} commented on upstream issue {repo}#{n}")
 
     elif event.startswith("pull_request_review") or event == "pull_request_comment":
         pr = payload.get("pull_request") or {}
@@ -241,6 +395,28 @@ def handle(event, payload):
                 and pr.get("state") == "open" and (rejected or wants_reply(review.get("content")))):
             what = "changes requested on" if rejected else "review on"
             add_trigger(owner, f"review:{repo}#{n}:{payload.get('_delivery')}", f"{what} pull request {repo}#{n}")
+
+    elif event == "pull_request":
+        pr = payload.get("pull_request") or {}
+        n = pr.get("number")
+        if not trusted or not coord:
+            return
+        if action == "opened":
+            add_trigger(coord, f"pr-opened:{repo}#{n}", f"pull request opened: {repo}#{n}", once=True)
+        elif action == "closed" and pr.get("merged"):
+            add_trigger(coord, f"pr-merged:{repo}#{n}", f"pull request merged: {repo}#{n}", once=True)
+        elif action == "review_requested" and (payload.get("requested_reviewer") or {}).get("login") == COORDINATOR:
+            add_trigger(coord, f"review-requested:{repo}#{n}:{pr.get('head', {}).get('sha', '')[:12]}",
+                        f"review requested from you on pull request {repo}#{n}", once=True)
+
+    elif event == "release" and action == "published":
+        tag = (payload.get("release") or {}).get("tag_name", "")
+        if coord and trusted:
+            add_trigger(coord, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
+        wake_blocked((repo, None), f"{repo} released {tag}")
+
+    elif event == "push" and payload.get("ref") == "refs/heads/main":
+        check_behind(repo, payload.get("after") or "")
 
     elif event == "action_run_failure":
         run = payload.get("run") or {}
@@ -253,18 +429,44 @@ def handle(event, payload):
         if (pr.get("user") or {}).get("login") == owner:
             n = pr.get("number")
             add_trigger(owner, f"ci-failed:{repo}#{n}:{run.get('commit_sha', '')[:12]}",
-                        f"CI failed on pull request {repo}#{n}")
+                        f"CI failed on pull request {repo}#{n}", once=True)
 
 
-def record(entry, delivery, body):
-    payloads = STATE / "payloads"
-    payloads.mkdir(exist_ok=True)
-    (payloads / f"{delivery}.json").write_bytes(body)
-    old = sorted(payloads.iterdir(), key=lambda p: p.stat().st_mtime)[:-KEEP_PAYLOADS]
-    for p in old:
-        p.unlink(missing_ok=True)
-    with open(STATE / "events.jsonl", "a") as f:
-        f.write(json.dumps(entry) + "\n")
+# --- Reconciliation -------------------------------------------------------------
+
+def reconcile():
+    """Catch what a missed webhook would have lost."""
+    for repo, owner in OWNER_OF.items():
+        try:
+            for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request,new"):
+                labels = {l["name"] for l in issue.get("labels") or []}
+                author = issue["user"]["login"]
+                if {"request", "new"} <= labels and author in TRUSTED and author != owner:
+                    add_trigger(owner, f"request:{repo}#{issue['number']}",
+                                f"untriaged request {repo}#{issue['number']}", recent=RECONCILE * 2)
+            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50") or {}
+            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
+            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+                if pr["user"]["login"] != owner:
+                    continue
+                sha = pr["head"]["sha"]
+                mine = [r for r in runs if (r.get("commit_sha") or r.get("head_sha")) == sha]
+                if mine and mine[0].get("status") == "failure":
+                    add_trigger(owner, f"ci-failed:{repo}#{pr['number']}:{sha[:12]}",
+                                f"CI failed on pull request {repo}#{pr['number']}", once=True)
+            check_behind(repo)
+        except Exception as e:
+            log(f"reconciling {repo} failed: {e!r}")
+    kv_set("reconciled", now())
+
+
+def reconciler():
+    while True:
+        try:
+            reconcile()
+        except Exception as e:
+            log(f"reconciliation failed: {e!r}")
+        time.sleep(RECONCILE)
 
 
 # --- Claims and runs ------------------------------------------------------------
@@ -278,13 +480,32 @@ def runs_today(agent):
     return q("SELECT COUNT(*) AS n FROM runs WHERE agent=? AND claimed>=?", agent, day_start())[0]["n"]
 
 
+def spend_today(agent):
+    return q("SELECT COALESCE(SUM(cost), 0) AS s FROM runs WHERE agent=? AND claimed>=?", agent, day_start())[0]["s"]
+
+
+def capped(agent):
+    """Why the agent can't start another run today, or None."""
+    if runs_today(agent) >= CAP:
+        return f"its daily cap of {CAP} runs"
+    if SPEND_CAP and spend_today(agent) >= SPEND_CAP:
+        return f"its daily spending cap of ${SPEND_CAP:.2f}"
+    return None
+
+
+def human_active(agent):
+    return now() - float(kv_get(f"human:{agent}", 0)) < 90
+
+
 def agent_state(agent):
     if q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent):
         return "running"
     if paused():
         return "paused"
-    if runs_today(agent) >= CAP:
+    if capped(agent):
         return "capped"
+    if human_active(agent):
+        return "human active"
     return "idle"
 
 
@@ -294,18 +515,22 @@ def claim(agent):
             return None
         if paused():
             return None
-        n = DB.execute("SELECT COUNT(*) FROM runs WHERE agent=? AND claimed>=?",
-                       (agent, day_start())).fetchone()[0]
-        if n >= CAP:
-            return None
         rows = DB.execute("SELECT id, description, created FROM triggers WHERE agent=? AND run_id IS NULL "
                           "ORDER BY created", (agent,)).fetchall()
         if not rows:
             return None
+        why = capped(agent)
+        if why:
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            notify_agent(agent, f"cap:{agent}:{day}", "cap",
+                         f"`{agent}` reached {why} at {iso(now())}, with {len(rows)} trigger(s) waiting. "
+                         "They start after midnight UTC, or sooner if you raise the cap in `.env` and rerun "
+                         "`scripts/up.sh`.")
+            return None
         t = now()
         if t - rows[-1]["created"] < DEBOUNCE and t - rows[0]["created"] < MAX_DELAY:
             return None
-        descs = [r["description"] for r in rows]
+        descs = list(dict.fromkeys(r["description"] for r in rows))
         cur = DB.execute("INSERT INTO runs (agent, triggers, claimed) VALUES (?,?,?)",
                          (agent, json.dumps(descs), t))
         run_id = cur.lastrowid
@@ -334,13 +559,10 @@ def end_run(agent, run_id, r):
       changes, r.get("archived_log"), r.get("archived_transcript"), run_id)
     if (r.get("outcome") or "").startswith("exited"):
         requeue(run_id)  # Claude never finished a reply: none of the work was done
-    if not r.get("in_extension"):
-        notice_key = f"not-listed:{agent}:{run_id}"
-        with LOCK:
-            DB.execute("INSERT OR IGNORE INTO notices (at, key, kind, repo, number, text, posted) "
-                       "VALUES (?,?,?,?,?,?,0)", (t, notice_key, "transcript-rewrite", AGENTS[agent]["own"], None,
-                                                  f"run {run_id} of {agent} isn't listed in the extension; "
-                                                  f"resume it by session ID {r.get('session_id')}"))
+    if not r.get("in_extension") and r.get("session_id"):
+        notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",
+                     f"run {run_id} of `{agent}` isn't listed in the Claude extension, because its transcript "
+                     f"couldn't be rewritten. Resume it by its session ID, `{r.get('session_id')}`.")
     log(f"{agent} run {run_id} ended: {r.get('outcome')}")
     return True
 
@@ -350,6 +572,7 @@ def status():
     for name in AGENTS:
         pending = q("SELECT description, created FROM triggers WHERE agent=? AND run_id IS NULL ORDER BY created", name)
         agents[name] = {"state": agent_state(name), "runs_today": runs_today(name), "cap": CAP,
+                        "spend_today": round(spend_today(name), 2), "spend_cap": SPEND_CAP or None,
                         "pending": [{"trigger": p["description"], "since": iso(p["created"])} for p in pending]}
     runs = [dict(r, claimed=iso(r["claimed"]), started=iso(r["started"]), ended=iso(r["ended"]),
                  triggers=json.loads(r["triggers"] or "[]"), denied=json.loads(r["denied"] or "[]"))
@@ -357,7 +580,19 @@ def status():
     sessions = [dict(s, started=iso(s["started"]), ended=iso(s["ended"]))
                 for s in q("SELECT * FROM sessions ORDER BY id DESC LIMIT 20")]
     notices = [dict(n, at=iso(n["at"])) for n in q("SELECT * FROM notices ORDER BY id DESC LIMIT 50")]
-    return {"paused": paused(), "agents": agents, "runs": runs, "sessions": sessions, "notices": notices}
+    reconciled = kv_get("reconciled")
+    return {"paused": paused(), "reconciled": iso(float(reconciled)) if reconciled else None,
+            "agents": agents, "runs": runs, "sessions": sessions, "notices": notices}
+
+
+def notices_text(after):
+    """One notice per line: id, kind, where, text; tabs and newlines removed."""
+    out = []
+    for n in q("SELECT * FROM notices WHERE id>? ORDER BY id", after):
+        where = f"{n['repo']}#{n['number']}" if n["number"] else (n["repo"] or "")
+        clean = lambda s: " ".join(str(s or "").split())
+        out.append(f"{n['id']}\t{n['kind']}\t{where}\t{clean(n['text'])}")
+    return "\n".join(out) + ("\n" if out else "")
 
 
 # --- HTTP -----------------------------------------------------------------------
@@ -373,15 +608,17 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.body()
         return json.loads(raw) if raw.strip() else {}
 
-    def agent(self):
+    def bearer(self):
         auth = self.headers.get("Authorization") or ""
-        return agent_for_key(auth[7:].strip() if auth.startswith("Bearer ") else "")
+        return auth[7:].strip() if auth.startswith("Bearer ") else ""
 
     def do_POST(self):
         try:
             if self.path == "/hook":
                 return self.hook()
-            agent = self.agent()
+            if self.path.startswith("/admin/"):
+                return self.admin()
+            agent = agent_for_key(self.bearer())
             if not agent or agent not in AGENTS:
                 return self.reply(403, {"error": "unknown runner key"})
             data = self.json_body()
@@ -389,6 +626,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/claim":
                 c = claim(agent)
                 return self.reply(200, c) if c else self.reply(204, None)
+            if self.path == "/heartbeat":
+                if data.get("human_active"):
+                    kv_set(f"human:{agent}", now())
+                return self.reply(200, {})
             if self.path == "/runs/abandon":
                 for r in q("SELECT id FROM runs WHERE agent=? AND ended IS NULL", agent):
                     q("UPDATE runs SET ended=?, outcome=? WHERE id=?", now(),
@@ -420,10 +661,29 @@ class Handler(BaseHTTPRequestHandler):
             log(f"error handling {self.path}: {e!r}")
             self.reply(500, {"error": "internal error"})
 
+    def admin(self):
+        try:
+            key = secret("admin-key")
+        except OSError:
+            return self.reply(403, {"error": "no admin key"})
+        if not hmac.compare_digest(self.bearer(), key):
+            return self.reply(403, {"error": "bad admin key"})
+        data = self.json_body()
+        if self.path == "/admin/drop":
+            agent = data.get("agent")
+            n = q("SELECT COUNT(*) AS n FROM triggers WHERE agent=? AND run_id IS NULL", agent)[0]["n"]
+            q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL", agent)
+            log(f"dropped {n} pending trigger(s) for {agent}")
+            return self.reply(200, {"dropped": n})
+        if self.path == "/admin/reconcile":
+            reconcile()
+            return self.reply(200, {})
+        self.reply(404, {"error": "not found"})
+
     def hook(self):
         body = self.body()
         given = self.headers.get("X-Forgejo-Signature") or ""
-        expected = hmac.new(SECRET_FILE.read_text().strip().encode(), body, hashlib.sha256).hexdigest()
+        expected = hmac.new(secret("webhook-secret").encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(given, expected):
             log("refused a delivery with a bad signature")
             return self.reply(403, {"error": "bad signature"})
@@ -441,20 +701,37 @@ class Handler(BaseHTTPRequestHandler):
         t = now()
         q("INSERT INTO events (at, event, type, action, repo, sender, number, delivery) VALUES (?,?,?,?,?,?,?,?)",
           t, event, event_type, payload.get("action"), repo, sender, number, delivery)
-        record({"at": iso(t), "event": event, "type": event_type, "delivery": delivery, "repo": repo,
-                "action": payload.get("action"), "sender": sender, "number": number}, delivery, body)
+        self.save(delivery, body, {"at": iso(t), "event": event, "type": event_type, "delivery": delivery,
+                                   "repo": repo, "action": payload.get("action"), "sender": sender, "number": number})
         payload["_delivery"] = delivery
+        # Answer at once; handling may call Forgejo, which is waiting on us.
+        self.reply(200, {})
         try:
-            handle(event_type if event_type.startswith("pull_request_review") else event, payload)
+            # Reviews arrive as pull_request events typed by verdict; a review
+            # request is a pull_request event of its own.
+            review = event_type.startswith("pull_request_review") and event_type != "pull_request_review_request"
+            handle(event_type if review else event, payload)
         except Exception as e:
             log(f"error handling a {event_type} event: {e!r}")
-        self.reply(200, {})
+
+    def save(self, delivery, body, entry):
+        payloads = STATE / "payloads"
+        payloads.mkdir(exist_ok=True)
+        (payloads / f"{delivery}.json").write_bytes(body)
+        for p in sorted(payloads.iterdir(), key=lambda p: p.stat().st_mtime)[:-KEEP_PAYLOADS]:
+            p.unlink(missing_ok=True)
+        with open(STATE / "events.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
     def do_GET(self):
-        if self.path == "/healthz":
+        url = urllib.parse.urlparse(self.path)
+        if url.path == "/healthz":
             return self.reply(200, {"ok": True})
-        if self.path == "/status":
+        if url.path == "/status":
             return self.reply(200, status())
+        if url.path == "/notices.txt":
+            after = int((urllib.parse.parse_qs(url.query).get("after") or ["0"])[0] or 0)
+            return self.reply_text(200, notices_text(after))
         self.reply(404, {"error": "not found"})
 
     def reply(self, code, obj):
@@ -465,6 +742,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        self.wfile.flush()
+
+    def reply_text(self, code, text):
+        data = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def log_message(self, fmt, *args):
         pass
@@ -472,4 +758,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     log(f"listening on :8080; agents: {', '.join(AGENTS)}")
+    threading.Thread(target=reconciler, daemon=True).start()
     ThreadingHTTPServer(("", 8080), Handler).serve_forever()
