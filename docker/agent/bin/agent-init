@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Container entry point. Prepares the agent's workspace and Claude's
+# configuration, then runs agent-runner for the life of the container.
+#   - clones the agent's own repository (and inkproof-coordination, read-only
+#     background) from Forgejo, retrying while Forgejo starts;
+#   - gives tea a login with the agent's token;
+#   - marks the workspace folders as trusted and onboarding as done, so no
+#     run or session meets a first-run prompt;
+#   - registers lean-lsp-mcp and installs elan and the repository's Lean
+#     toolchain into the shared elan volume, one agent at a time.
+set -uo pipefail
+own="/workspace/${AGENT_REPO}"
+coord="/workspace/inkproof-coordination"
+mkdir -p /workspace/.inkproof
+
+clone() {
+  local repo="$1" dir="$2" i
+  [ -d "$dir/.git" ] && return 0
+  for i in $(seq 1 30); do
+    git clone -q "http://forgejo:3000/${FORGE_ORG}/${repo}.git" "$dir" && { echo "agent-init: cloned ${repo}"; return 0; }
+    echo "agent-init: cloning ${repo} failed (attempt ${i}); retrying in 10s" >&2
+    sleep 10
+  done
+  echo "agent-init: giving up on cloning ${repo}; check the token and Forgejo, then restart this container" >&2
+  return 1
+}
+clone "$AGENT_REPO" "$own"
+[ "$AGENT_REPO" = inkproof-coordination ] || clone inkproof-coordination "$coord"
+
+# The run logs live in the workspace but never in git.
+if [ -d "$own/.git" ] && ! grep -qx '/.inkproof/' "$own/.git/info/exclude" 2>/dev/null; then
+  echo '/.inkproof/' >> "$own/.git/info/exclude"
+fi
+
+# tea, logged in as the agent. `tea login` itself is denied to agents.
+umask 077
+cat > "$HOME/.config/tea/config.yml" <<EOF
+logins:
+  - name: forgejo
+    url: http://forgejo:3000
+    token: $(tr -d '[:space:]' < /run/secrets/forgejo_token)
+    default: true
+    user: ${AGENT_NAME}
+preferences:
+  editor: false
+EOF
+umask 022
+
+# Claude's own configuration: trust the workspace folders and skip
+# onboarding, so neither a run nor the human meets a first-run prompt.
+cfg="${CLAUDE_CONFIG_DIR}/.claude.json"
+[ -s "$cfg" ] || echo '{}' > "$cfg"
+tmp="$(mktemp)"
+jq --arg own "$own" --arg ws /workspace '
+  .hasCompletedOnboarding = true
+  | .projects[$own].hasTrustDialogAccepted = true
+  | .projects[$own].hasCompletedProjectOnboarding = true
+  | .projects[$ws].hasTrustDialogAccepted = true' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+rm -f "$tmp"
+
+# elan and the toolchains, in the volume every agent shares: one at a time.
+(
+  flock 9
+  if [ ! -x "$HOME/.elan/bin/elan" ]; then
+    curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+      | sh -s -- -y --default-toolchain none --no-modify-path >/dev/null \
+      || echo "agent-init: couldn't install elan; check the proxy, then restart this container" >&2
+  fi
+  if [ -f "$own/lean-toolchain" ]; then
+    elan toolchain install "$(cat "$own/lean-toolchain")" >/dev/null 2>&1 \
+      || echo "agent-init: couldn't install $(cat "$own/lean-toolchain"); check the proxy" >&2
+  fi
+) 9>"$HOME/.elan/.agent-init.lock"
+
+claude mcp list 2>/dev/null | grep -q '^lean-lsp' \
+  || claude mcp add --scope user lean-lsp -- lean-lsp-mcp >/dev/null 2>&1 || true
+
+exec /usr/local/bin/agent-runner

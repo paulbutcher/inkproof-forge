@@ -57,8 +57,20 @@ jobs:
             exit 1
           fi
 
+      # Lasm tests run where the test subproject pins Lasm in test/package-lock.json.
+      - name: Install Lasm
+        run: |
+          if [ -f test/package-lock.json ]; then
+            (cd test && npm ci --no-fund --no-audit)
+          else
+            echo "No test/package-lock.json; Lasm tests are skipped."
+          fi
+
       - name: Tests
-        run: lake test
+        run: |
+          # Fail, rather than skip with a warning, if Lasm is pinned but missing.
+          if [ -f test/package-lock.json ]; then export INKPROOF_REQUIRE_LASM=1; fi
+          lake test
 
       - name: API lock is up to date
         run: |

@@ -190,6 +190,8 @@ cmd_bootstrap() {
 
   ensure_token gatekeeper "$SCOPES_WRITE"
   ensure_token dispatcher "$SCOPES_ISSUES"
+  # The dispatcher comments on issues to notify the human, on any repository.
+  ensure_team dispatcher-notify "$(units read write read)" dispatcher "*"
   # CI reads this project's repositories to fetch dependencies; the job's own
   # token reads only the repository it runs for.
   FRESH_TOKEN=0
@@ -198,6 +200,13 @@ cmd_bootstrap() {
   ensure_ci_secret "$FRESH_TOKEN"
   ensure_ci_variable DEPS_GITHUB_OWNERS "$GH_OWNERS"
   ensure_webhook
+  # The protocol's labels, on every repository that exists (setup-repo also
+  # makes them, but upstream issues go on inkproof-coordination whatever its
+  # level).
+  local r
+  for r in $(all_repos); do
+    [ "$(api GET "/repos/$ORG/$r")" = 200 ] && ensure_labels "$r"
+  done
   log "Bootstrap made $CHANGES change(s)."
   echo "$CHANGES"
 }

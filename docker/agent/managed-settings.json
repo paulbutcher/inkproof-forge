@@ -1,0 +1,76 @@
+{
+  "cleanupPeriodDays": 365,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1"
+  },
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Task",
+      "TodoWrite",
+      "mcp__lean-lsp"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push --force-if-includes:*)",
+      "Bash(git push --mirror:*)",
+      "Bash(git push --tags:*)",
+      "Bash(git tag:*)",
+      "Bash(git config:*)",
+      "Bash(tea api:*)",
+      "Bash(tea login:*)",
+      "Bash(tea logins:*)",
+      "Bash(tea logout:*)",
+      "Bash(tea release:*)",
+      "Bash(tea releases:*)",
+      "Bash(tea r:*)",
+      "Bash(tea pr approve:*)",
+      "Bash(tea pr lgtm:*)",
+      "Bash(tea pr a:*)",
+      "Bash(tea pr reject:*)",
+      "Bash(tea pr review:*)",
+      "Bash(tea pr merge:*)",
+      "Bash(tea pr m:*)",
+      "Bash(tea pull approve:*)",
+      "Bash(tea pull lgtm:*)",
+      "Bash(tea pull a:*)",
+      "Bash(tea pull reject:*)",
+      "Bash(tea pull review:*)",
+      "Bash(tea pull merge:*)",
+      "Bash(tea pull m:*)",
+      "Bash(tea pulls approve:*)",
+      "Bash(tea pulls lgtm:*)",
+      "Bash(tea pulls a:*)",
+      "Bash(tea pulls reject:*)",
+      "Bash(tea pulls review:*)",
+      "Bash(tea pulls merge:*)",
+      "Bash(tea pulls m:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook session-start" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook prompt" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook stop" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/inkproof-hook session-end" } ] }
+    ]
+  }
+}

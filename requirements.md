@@ -89,6 +89,10 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 
 Every code owner's review request blocks the merge until that owner approves, so the single required approval is a floor, not the gate. Agents schedule "merge when checks succeed" on their own pull requests at every level; it waits for the approvals the level requires. Protected files are not used: in the trial they blocked every merge.
 
+`conformance` joins the approvals list and `CODEOWNERS` in stage 5, when it starts reviewing; until then a level-1 pull request waits for the human alone.
+
+Forgejo 17 reads `CODEOWNERS` from the default branch, from the first of `CODEOWNERS`, `docs/CODEOWNERS`, `.gitea/CODEOWNERS` and `.forgejo/CODEOWNERS` that exists, never `.github/`. Each line is a Go regular expression anchored to a whole path without a leading slash (`API\.lock`, `\.forgejo/.*`), and every matching line adds its owners, so the catch-all and the `API.lock` line combine (read from Forgejo's source, 2026-11-09). Branch protection's "no pushes" applies to the human too, so the human's own changes, such as the `.forgejo/` files `setup-repo.sh` asks for, also go through pull requests; an admin can merge one without the approval.
+
 ## Runs
 
 - **Hand-off.** The dispatcher queues triggers per agent. Each container's `agent-runner` claims a batch over HTTP with its runner key; the dispatcher grants a claim only when the agent has no run, is under its caps, and the kit is not paused. The runner reports the run's start and end, and the dispatcher records it.
@@ -220,7 +224,7 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 - The live log updates in a VS Code tab; afterwards the run is listed in the extension and continues from its history. An interrupted run does too.
 - While the human is active in `core`'s container, no run starts; work waits and starts after the grace period.
 - An unattended run never waits on a prompt, and the deny rules hold in `dontAsk`.
-- A fresh `claude-agents` volume runs unattended without first-run prompts, or the README lists the step that makes it so.
+- A fresh `claude-<agent>` volume runs unattended without first-run prompts, or the README lists the step that makes it so.
 - The ledger records everything listed under The record, the run archive holds the run's and the human's transcripts, and `cleanupPeriodDays` is raised.
 - An agent's change to `CLAUDE.md` waits for the human. An upstream issue with `blocking` reaches the human.
 
@@ -275,11 +279,10 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 
 Each is verified in the stage that first needs it, then removed from this list.
 
-- [ ] Setting `hasTrustDialogAccepted` for a folder in `.claude.json` is enough for headless runs and the extension (stage 3).
+- [ ] Setting `hasTrustDialogAccepted` for a folder in `.claude.json` is enough for the extension (stage 3, on the Mac). Headless runs in a fresh volume meet no prompt (verified 2026-11-09).
 - [ ] VS Code can attach to a running compose container with a kit-provided attach config, without Dev Containers building anything (stage 3).
 - [ ] `cleanupPeriodDays` in managed settings governs transcript deletion for every session in the container (stage 3).
 - [ ] An approval from an approvals-list member satisfies the review count and their own official review request (stage 3).
-- [ ] Forgejo's `CODEOWNERS` syntax and location (`.forgejo/CODEOWNERS`), and that every matching line requests its owners, so the catch-all owners add to the `API.lock` owner rather than being replaced (stage 3).
 - [ ] Every pending official review request blocks the merge, not only the first (stage 3).
 - [ ] Narrowing a branch's merge list cancels nothing silently, and scheduled merges can be cancelled and rescheduled by API (stage 4).
 - [ ] `PreToolUse` hooks fire in `-p` runs and a deny there ends the run's work promptly (stage 4).

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""forge: the Forgejo operations agents need that tea lacks, or that must
+follow a rule tea can't enforce. Uses the agent's own token.
+
+  forge pr automerge <n>          schedule "merge when checks succeed" on your
+                                  pull request #n; it waits for the approvals
+                                  your repository's autonomy level requires
+  forge pr update <n>             bring your pull request #n up to date with main
+  forge ci <repo> <pr>            the Actions run for the pull request's head
+                                  commit: success, failure, running or none
+  forge pr approve <repo> <n> <message>
+                                  (coordinator, conformance) approve, only if
+                                  the Actions run for the head commit succeeded
+
+<repo> is a repository name such as inkproof-core; pull requests are numbers.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+FORGE = "http://forgejo:3000/api/v1"
+ORG = os.environ.get("FORGE_ORG", "")
+OWN = os.environ.get("AGENT_REPO", "")
+ME = os.environ.get("AGENT_NAME", "")
+
+
+def die(msg, code=1):
+    print(f"forge: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def usage():
+    print(__doc__.strip(), file=sys.stderr)
+    sys.exit(2)
+
+
+def api(method, path, body=None):
+    with open("/run/secrets/forgejo_token") as f:
+        token = f.read().strip()
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(FORGE + path, data=data, method=method, headers={
+        "Authorization": f"token {token}", "Accept": "application/json",
+        **({"Content-Type": "application/json"} if data else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw.strip() else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"message": raw.decode(errors="replace")[:500]}
+
+
+def number(s):
+    if not s.isdigit():
+        die(f"{s!r} isn't a pull request number")
+    return int(s)
+
+
+def repo_name(s):
+    s = s.split("/")[-1]
+    if not s.startswith("inkproof-"):
+        die(f"{s!r} isn't one of this project's repositories")
+    return s
+
+
+def ci_state(repo, pr):
+    s, p = api("GET", f"/repos/{ORG}/{repo}/pulls/{pr}")
+    if s != 200:
+        die(f"can't read {repo}#{pr}: {p.get('message', s)}")
+    sha = p["head"]["sha"]
+    s, runs = api("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50")
+    if s != 200:
+        die(f"can't read {repo}'s Actions runs: {(runs or {}).get('message', s)}")
+    runs = runs.get("workflow_runs", runs) if isinstance(runs, dict) else runs
+    mine = [r for r in runs or [] if (r.get("commit_sha") or r.get("head_sha")) == sha]
+    if not mine:
+        return sha, "none"
+    states = {r.get("status") for r in mine}
+    if states & {"failure", "cancelled", "skipped", "blocked"}:
+        return sha, "failure"
+    if states == {"success"}:
+        return sha, "success"
+    return sha, "running"
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[0] == "pr" and argv[1] == "automerge":
+        n = number(argv[2])
+        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge",
+                   {"Do": "squash", "merge_when_checks_succeed": True,
+                    "delete_branch_after_merge": True})
+        if s // 100 != 2:
+            die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
+        print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
+    elif len(argv) >= 3 and argv[0] == "pr" and argv[1] == "update":
+        n = number(argv[2])
+        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/update?style=merge")
+        if s // 100 != 2:
+            die(f"couldn't update #{n} ({s}): {(p or {}).get('message', '')}")
+        print(f"#{n} is up to date with main.")
+    elif len(argv) >= 3 and argv[0] == "ci":
+        sha, state = ci_state(repo_name(argv[1]), number(argv[2]))
+        print(f"{state} ({sha[:12]})")
+        sys.exit(0 if state == "success" else 1)
+    elif len(argv) >= 5 and argv[0] == "pr" and argv[1] == "approve":
+        if ME not in ("coordinator", "conformance"):
+            die("only the coordinator and conformance approve pull requests")
+        repo, n, msg = repo_name(argv[2]), number(argv[3]), " ".join(argv[4:])
+        sha, state = ci_state(repo, n)
+        if state != "success":
+            die(f"not approving {repo}#{n}: the Actions run for {sha[:12]} is {state}")
+        s, p = api("POST", f"/repos/{ORG}/{repo}/pulls/{n}/reviews",
+                   {"event": "APPROVED", "body": msg, "commit_id": sha})
+        if s // 100 != 2:
+            die(f"couldn't approve {repo}#{n} ({s}): {(p or {}).get('message', '')}")
+        print(f"Approved {repo}#{n} at {sha[:12]}.")
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

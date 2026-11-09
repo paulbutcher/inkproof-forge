@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Claude Code hooks for agent containers (managed settings call these).
+
+  inkproof-hook session-start   a human session opened: record it
+  inkproof-hook prompt          a human prompt: the human is busy
+  inkproof-hook stop            Claude stopped: a human is idle from now;
+                                a run may not stop with untriaged requests
+  inkproof-hook session-end     a human session closed: record it
+
+A session is the human's when CLAUDE_CODE_ENTRYPOINT is claude-vscode or
+cli and the runner didn't start it. The runner reads what these write in
+/workspace/.inkproof: `activity` decides whether a run may start, and
+`sessions.jsonl` goes into the dispatcher's ledger and the run archive.
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+STATE = "/workspace/.inkproof"
+
+
+def human():
+    return (os.environ.get("CLAUDE_CODE_ENTRYPOINT") in ("claude-vscode", "cli")
+            and not os.environ.get("INKPROOF_RUN"))
+
+
+def write_activity(state):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = f"{STATE}/activity.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"state": state, "at": int(time.time())}, f)
+    os.replace(tmp, f"{STATE}/activity")
+
+
+def record_session(event, data):
+    os.makedirs(STATE, exist_ok=True)
+    with open(f"{STATE}/sessions.jsonl", "a") as f:
+        f.write(json.dumps({"event": event, "session": data.get("session_id", ""),
+                            "transcript": data.get("transcript_path", ""),
+                            "at": int(time.time())}) + "\n")
+
+
+def untriaged_requests():
+    """Open issues labelled request and new on the agent's own repository,
+    by trusted authors. Never blocks on errors: an unreachable Forgejo must
+    not trap the agent."""
+    try:
+        with open("/run/secrets/forgejo_token") as f:
+            token = f.read().strip()
+        org, repo = os.environ["FORGE_ORG"], os.environ["AGENT_REPO"]
+        trusted = set(os.environ.get("TRUSTED_AUTHORS", "").split())
+        req = urllib.request.Request(
+            f"http://forgejo:3000/api/v1/repos/{org}/{repo}/issues"
+            "?state=open&type=issues&labels=request,new&limit=50",
+            headers={"Authorization": f"token {token}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            issues = json.load(r)
+    except Exception:
+        return []
+    return [i for i in issues
+            if i.get("user", {}).get("login") in trusted
+            and {"request", "new"} <= {l["name"] for l in i.get("labels") or []}]
+
+
+def main():
+    event = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+
+    if event == "session-start":
+        if human():
+            record_session("start", data)
+    elif event == "prompt":
+        if human():
+            write_activity("busy")
+    elif event == "session-end":
+        if human():
+            write_activity("idle")
+            record_session("end", data)
+    elif event == "stop":
+        if human():
+            write_activity("idle")
+            return 0
+        if data.get("stop_hook_active") or os.path.exists("/etc/inkproof/control/paused"):
+            return 0
+        pending = untriaged_requests()
+        if pending:
+            # Numbers only: issue text never goes into what steers a run.
+            lines = "\n".join(f"  - #{i['number']}" for i in pending)
+            print(f"Untriaged requests are waiting on {os.environ['AGENT_REPO']}:\n{lines}\n"
+                  "Triage each one as your protocol describes before stopping.", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
