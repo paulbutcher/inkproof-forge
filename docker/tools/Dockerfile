@@ -5,5 +5,6 @@ FROM alpine:3.24
 RUN apk add --no-cache bash curl jq git openssl coreutils sqlite
 COPY --chmod=0755 kit /usr/local/bin/kit
 COPY --chmod=0755 lib/ /usr/local/lib/kit/
+COPY --chmod=0755 restore-volumes /usr/local/bin/restore-volumes
 ENV HOME=/tmp
 ENTRYPOINT ["/usr/local/bin/kit"]

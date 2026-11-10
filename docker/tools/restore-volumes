@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# restore-volumes BACKUP: fill empty volumes from one of scripts/backup.sh's
+# backups, mounted at BACKUP. Run as root, with each volume to restore mounted:
+#   /restore/forgejo     Forgejo's data (forgejo-data)
+#   /restore/dispatcher  the dispatcher's state (dispatcher-state), optional
+#   /restore/archive     the run archive (run-archive), optional
+#
+# Forgejo's dump holds its working directory (data/), the repositories
+# (repos/) and the database as SQL (forgejo-db.sql). The dump also copies the
+# live SQLite file, which may be mid-write, so the database is rebuilt from
+# the SQL instead. Queues, indexes and temporary files aren't restored; Forgejo
+# rebuilds them.
+set -euo pipefail
+b="${1:?usage: restore-volumes BACKUP}"
+log() { printf '%s\n' "$*" >&2; }
+[ -s "$b/forgejo.tar.gz" ] || { log "no forgejo.tar.gz in the backup"; exit 1; }
+
+f=/restore/forgejo
+[ -d "$f" ] || { log "mount Forgejo's volume at $f"; exit 1; }
+[ -z "$(ls -A "$f")" ] || { log "$f isn't empty: restore only into a fresh volume"; exit 1; }
+t="$(mktemp -d)"
+tar -xzf "$b/forgejo.tar.gz" -C "$t"
+tar -C "$t/data" --exclude='./data/gitea.db*' --exclude=./queues --exclude=./indexers --exclude=./tmp -cf - . | tar -C "$f" -xf -
+mkdir -p "$f/git/repositories" "$f/custom/conf" "$f/data"
+cp -a "$t/repos/." "$f/git/repositories/"
+cp "$t/app.ini" "$f/custom/conf/app.ini"
+sqlite3 "$f/data/gitea.db" < "$t/forgejo-db.sql"
+chown -R 1000:1000 "$f"
+rm -rf "$t"
+log "restored Forgejo: $(ls "$f/git/repositories"/*/ | grep -c '\.git/\?$' || true) repositories, database rebuilt from SQL"
+
+if [ -d /restore/dispatcher ] && [ -s "$b/ledger.db" ]; then
+  cp "$b/ledger.db" /restore/dispatcher/ledger.db
+  chown -R 1000:1000 /restore/dispatcher
+  log "restored the dispatcher's ledger"
+fi
+if [ -d /restore/archive ] && [ -s "$b/run-archive.tar.gz" ]; then
+  tar -xzpf "$b/run-archive.tar.gz" --numeric-owner -C /restore/archive
+  log "restored the run archive"
+fi

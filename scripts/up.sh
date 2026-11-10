@@ -3,7 +3,7 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 # Mounted into containers; must exist before Docker creates them as root.
-mkdir -p "$STATE_DIR/secrets/ci" "$STATE_DIR/secrets/dispatcher" "$STATE_DIR/secrets/github" "$STATE_DIR/secrets/runner-keys" "$STATE_DIR/secrets/claude" "$STATE_DIR/control" "$STATE_DIR/backups" "$STATE_DIR/proxy"
+mkdir -p "$STATE_DIR/secrets/ci" "$STATE_DIR/secrets/dispatcher" "$STATE_DIR/secrets/gatekeeper" "$STATE_DIR/secrets/github" "$STATE_DIR/secrets/runner-keys" "$STATE_DIR/secrets/claude" "$STATE_DIR/control" "$STATE_DIR/backups" "$STATE_DIR/proxy"
 # Extra domains for Forgejo's proxy: empty except during scripts/migrate.sh.
 [ -e "$STATE_DIR/proxy/domains.txt" ] || : > "$STATE_DIR/proxy/domains.txt"
 

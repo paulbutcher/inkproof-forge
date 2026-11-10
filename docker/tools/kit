@@ -16,7 +16,8 @@
 #   kit test-stage1    stage 1 checks against the API
 #   kit test-stage2    stage 2 checks against the API
 #   kit test-stage3 PHASE  stage 3 checks against the API (scripts/test-stage3.sh)
-#   kit test-stage4..6 PHASE  later stages' checks (scripts/test-stageN.sh)
+#   kit snapshot       what a backup must preserve, as JSON (scripts/backup.sh)
+#   kit test-stage4..7 PHASE  later stages' checks (scripts/test-stageN.sh)
 set -euo pipefail
 . /usr/local/lib/kit/forge.sh
 for f in /usr/local/lib/kit/*.sh; do [ "$f" = /usr/local/lib/kit/forge.sh ] || . "$f"; done
@@ -34,6 +35,9 @@ cmd_init_secrets() {
   secret_file dispatcher/webhook-secret 32
   # Host scripts use it for the dispatcher's admin requests (drop work, reconcile).
   secret_file dispatcher/admin-key 32
+  # Only the coordinator's container holds it: the gatekeeper releases only on
+  # requests that carry it.
+  secret_file gatekeeper/coordinator-key 32
   # Each agent's runner proves who it is to the dispatcher with its own key.
   local name
   for name in $(grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf | awk '{ print $1 }'); do
@@ -66,6 +70,8 @@ case "${1:-}" in
   milestone) shift; cmd_milestone "$@" ;;
   milestone-diff) cmd_milestone_diff ;;
   mirror-status) cmd_mirror_status ;;
+  snapshot) cmd_snapshot ;;
+  snapshot-compare) shift; cmd_snapshot_compare "$@" ;;
   api) shift; TOKEN="$(token_of human)"; call 200,201,204 "$@" | jq . ;;
   test-stage1) cmd_test_stage1 ;;
   test-stage2) shift; cmd_test_stage2 "$@" ;;
@@ -73,5 +79,6 @@ case "${1:-}" in
   test-stage4) shift; cmd_test_stage4 "$@" ;;
   test-stage5) shift; cmd_test_stage5 "$@" ;;
   test-stage6) shift; cmd_test_stage6 "$@" ;;
+  test-stage7) shift; cmd_test_stage7 "$@" ;;
   *) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
 esac

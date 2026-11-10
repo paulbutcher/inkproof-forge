@@ -367,6 +367,39 @@ def queue_conformance(repo, n, sha=None):
                 once=True, not_before=now() + SETTLE)
 
 
+def ci_state(repo, sha):
+    """success, failure, running or none: the Actions runs for sha."""
+    runs = (forge("GET", f"/repos/{ORG}/{repo}/actions/runs?head_sha={sha}") or {}).get("workflow_runs") or []
+    states = {r.get("status") for r in runs if r.get("commit_sha") == sha}
+    if not states:
+        return "none"
+    if states == {"success"}:
+        return "success"
+    return "failure" if states & {"failure", "cancelled", "skipped", "blocked"} else "running"
+
+
+def queue_coordinator_review(repo, n, sha=None):
+    """Work for the coordinator: a pull request that requests its review (at
+    level 3, a change to API.lock), once CI has passed on the head and if it
+    hasn't approved that head. A new commit dismisses its approval, so the
+    next head that passes CI wakes it again."""
+    if not COORDINATOR:
+        return
+    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
+    head = pr["head"]["sha"]
+    if pr["state"] != "open" or (sha and sha != head):
+        return
+    if COORDINATOR not in {u["login"] for u in pr.get("requested_reviewers") or []}:
+        return
+    if any(r["user"]["login"] == COORDINATOR and r.get("state") == "APPROVED" and r.get("commit_id") == head
+           and not r.get("dismissed") for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
+        return
+    if has_ci(repo) and ci_state(repo, head) != "success":
+        return
+    add_trigger(COORDINATOR, f"review-requested:{repo}#{n}:{head[:12]}",
+                f"review requested from you on pull request {repo}#{n}, whose CI passed at {head[:12]}", once=True)
+
+
 def conformance_wants_changes(repo, n):
     mine = [r for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews") if r["user"]["login"] == REVIEWER]
     return bool(mine) and mine[-1].get("state") == "REQUEST_CHANGES"
@@ -473,12 +506,12 @@ def handle(event, payload):
         elif action == "closed" and pr.get("merged"):
             add_trigger(coord, f"pr-merged:{repo}#{n}", f"pull request merged: {repo}#{n}", once=True)
         elif action == "review_requested" and (payload.get("requested_reviewer") or {}).get("login") == COORDINATOR:
-            add_trigger(coord, f"review-requested:{repo}#{n}:{pr.get('head', {}).get('sha', '')[:12]}",
-                        f"review requested from you on pull request {repo}#{n}", once=True)
+            queue_coordinator_review(repo, n)  # once CI has passed on the head
 
     elif event == "release" and action == "published":
         tag = (payload.get("release") or {}).get("tag_name", "")
-        if coord and trusted:
+        # A release the coordinator asked the gatekeeper for wakes it no further.
+        if coord and trusted and sender != "gatekeeper":
             add_trigger(coord, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
         wake_blocked((repo, None), f"{repo} released {tag}")
 
@@ -495,6 +528,7 @@ def handle(event, payload):
             return
         if pr.get("number"):
             queue_conformance(repo, pr["number"], run.get("commit_sha"))
+            queue_coordinator_review(repo, pr["number"], run.get("commit_sha"))
 
     elif event == "action_run_failure":
         run = payload.get("run") or {}
@@ -536,7 +570,8 @@ def reconcile():
         except Exception as e:
             log(f"reconciling {repo} failed: {e!r}")
     # Pull requests whose head passed CI (or that have no CI) but which
-    # conformance hasn't reviewed.
+    # conformance hasn't reviewed, or the coordinator hasn't approved when
+    # its review is requested.
     for repo in OWNER_OF:
         try:
             runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50") or {}
@@ -546,6 +581,7 @@ def reconcile():
                 mine = [r for r in runs if (r.get("commit_sha") or r.get("head_sha")) == sha]
                 if not has_ci(repo) or (mine and mine[0].get("status") == "success"):
                     queue_conformance(repo, pr["number"], sha)
+                    queue_coordinator_review(repo, pr["number"], sha)
         except Exception as e:
             log(f"reconciling {repo}'s reviews failed: {e!r}")
     kv_set("reconciled", now())

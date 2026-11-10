@@ -24,6 +24,13 @@ follow a rule tea can't enforce. Uses the agent's own token.
   forge ledger [days]             (process) the run ledger for the last days
                                   (default 30): runs, the human's sessions,
                                   notices, as JSON
+  forge release <repo> <note> [<issue>...]
+                                  (coordinator, level 3) ask the gatekeeper to
+                                  release <repo>: it computes the version from
+                                  API.lock since the last tag, checks
+                                  CHANGELOG.md has its entry and CI passed on
+                                  main, tags main and publishes the release, and
+                                  comments on each ready-for-release issue
 
 <repo> is a repository name such as inkproof-core; pull requests are numbers.
 """
@@ -163,6 +170,31 @@ def review(repo, n, path):
     print(f"{'Requested changes on' if open_findings else 'Approved'} {repo}#{n} at {sha[:12]}.")
 
 
+def release(repo, note, issues):
+    if ME != "coordinator":
+        die("only the coordinator asks the gatekeeper for releases")
+    try:
+        with open("/run/secrets/gatekeeper_key") as f:
+            key = f.read().strip()
+    except OSError:
+        die("no gatekeeper key in this container")
+    body = json.dumps({"repo": repo, "note": note, "issues": issues}).encode()
+    req = urllib.request.Request("http://gatekeeper:8080/release", data=body, method="POST", headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            p = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except ValueError:
+            msg = ""
+        die(f"the gatekeeper didn't release {repo}: {msg or e.code}")
+    except urllib.error.URLError as e:
+        die(f"can't reach the gatekeeper: {e.reason}")
+    print(f"Released {repo} {p['version']} at {p['sha'][:12]}: {p['reason']}. {p.get('url', '')}")
+
+
 def ledger(days):
     if ME != "process":
         die("only the process review reads the ledger")
@@ -204,6 +236,8 @@ def main(argv):
         for r in reviews:
             print(f"--- {r['user']['login']}: {r.get('state')} at {(r.get('commit_id') or '')[:12]}, {r.get('submitted_at')}")
             print((r.get("body") or "").strip() + "\n")
+    elif len(argv) >= 3 and argv[0] == "release":
+        release(repo_name(argv[1]), argv[2], [number(n) for n in argv[3:]])
     elif len(argv) in (1, 2) and argv[0] == "ledger":
         ledger(int(argv[1]) if len(argv) == 2 and argv[1].isdigit() else 30)
     elif len(argv) >= 5 and argv[0] == "pr" and argv[1] == "approve":

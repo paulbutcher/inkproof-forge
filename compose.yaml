@@ -7,6 +7,7 @@
 #   forge-out  internal: Forgejo and its proxy, its only way out (mirror pushes)
 #   forge-web  internal: Forgejo, the port forwarder and the admin tools
 #   gate       internal: Forgejo and the gatekeeper, which no agent joins
+#   gate-coord internal: the gatekeeper and the coordinator, which asks it for releases
 #   publish    the port forwarder only, so the host can reach Forgejo on 127.0.0.1
 #   egress     the three proxies, the only containers with a route out
 # Forgejo is on internal networks only: whatever it sends out goes through
@@ -38,8 +39,8 @@ x-agent-env: &agent-env
   HTTP_PROXY: http://proxy:3128
   https_proxy: http://proxy:3128
   http_proxy: http://proxy:3128
-  NO_PROXY: forgejo,dispatcher,localhost,127.0.0.1
-  no_proxy: forgejo,dispatcher,localhost,127.0.0.1
+  NO_PROXY: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
+  no_proxy: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
   FORGE_ORG: ${FORGE_ORG}
   HUMAN_USER: ${HUMAN_USER}
   # Whose issues and comments count; everyone else's are ignored.
@@ -217,12 +218,13 @@ services:
       - dispatcher-state:/state
 
   # Approves a pull request once the Actions run for its head commit succeeded,
-  # in repositories at autonomy level 2 or 3 (docker/gatekeeper/gatekeeper.py).
-  # It shares a network with Forgejo only; its token is mounted nowhere else.
+  # at autonomy levels 2 and 3, and releases at level 3 when the coordinator
+  # asks (docker/gatekeeper/gatekeeper.py). It shares a network with Forgejo,
+  # and another with the coordinator only; its token is mounted nowhere else.
   gatekeeper:
     build: ./docker/gatekeeper
     restart: unless-stopped
-    networks: [gate]
+    networks: [gate, gate-coord]
     depends_on: [forgejo]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -257,6 +259,8 @@ services:
         AGENT_REPO: inkproof-coordination
     image: inkproof-agent-coordinator:1
     hostname: coordinator
+    # It alone shares a network with the gatekeeper, which it asks for releases.
+    networks: [agents, gate-coord]
     environment:
       <<: *agent-env
       AGENT_NAME: coordinator
@@ -269,6 +273,7 @@ services:
     volumes:
       - ${STATE_DIR:-.}/secrets/coordinator/token:/run/secrets/forgejo_token:ro
       - ${STATE_DIR:-.}/secrets/runner-keys/coordinator:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/secrets/gatekeeper/coordinator-key:/run/secrets/gatekeeper_key:ro
       - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
       - work-coordinator:/workspace
       - claude-coordinator:/home/agent/.claude
@@ -567,6 +572,8 @@ networks:
   forge-web:
     internal: true
   gate:
+    internal: true
+  gate-coord:
     internal: true
   publish: {}
   egress: {}
