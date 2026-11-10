@@ -87,7 +87,7 @@ def ci_state(repo, pr):
     if s != 200:
         die(f"can't read {repo}#{pr}: {p.get('message', s)}")
     sha = p["head"]["sha"]
-    s, runs = api("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50")
+    s, runs = api("GET", f"/repos/{ORG}/{repo}/actions/runs?head_sha={sha}")
     if s != 200:
         die(f"can't read {repo}'s Actions runs: {(runs or {}).get('message', s)}")
     runs = runs.get("workflow_runs", runs) if isinstance(runs, dict) else runs

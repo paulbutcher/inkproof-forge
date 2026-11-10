@@ -189,6 +189,9 @@ cmd_bootstrap() {
   done < <(grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf)
 
   ensure_token gatekeeper "$SCOPES_WRITE"
+  # The gatekeeper approves pull requests at levels 2 and 3: it reads code and
+  # Actions runs, and reviews; it writes nothing else.
+  ensure_team gatekeeper-review "$(units read read write)" gatekeeper "*"
   ensure_token dispatcher "$SCOPES_ISSUES"
   # The dispatcher comments on issues to notify the human, on any repository.
   ensure_team dispatcher-notify "$(units read write read)" dispatcher "*"

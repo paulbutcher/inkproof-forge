@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and start the forge, CI, proxies, dispatcher and agents. Safe to re-run.
+# Build and start the forge, CI, proxies, dispatcher, gatekeeper and agents. Safe to re-run.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 # Mounted into containers; must exist before Docker creates them as root.
@@ -38,6 +38,13 @@ if [ "$want" != "$have" ]; then
   docker save inkproof-ci:1 | docker compose exec -T ci-docker docker load >/dev/null
 fi
 docker compose up -d ci-runner
+
+# The gatekeeper approves on CI at levels 2 and 3, and does nothing at level 1.
+if [ -s "$STATE_DIR/secrets/gatekeeper/token" ]; then
+  docker compose up -d gatekeeper
+else
+  echo "Not starting the gatekeeper: run scripts/bootstrap.sh, then this script again."
+fi
 
 # Agents. Each needs its Forgejo token (scripts/bootstrap.sh), its runner key
 # (made above) and the Claude token; without them it isn't started, rather

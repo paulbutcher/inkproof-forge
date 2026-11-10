@@ -1,11 +1,12 @@
-# The Inkproof forge: Forgejo, CI, egress proxies and the dispatcher.
-# Agents run from stage 3 (core first); the gatekeeper arrives with level 2.
+# The Inkproof forge: Forgejo, CI, egress proxies the dispatcher and the gatekeeper.
+# Agents run from stage 3 (core first).
 #
 # Networks keep each part to what it needs:
 #   agents     internal: agents, Forgejo, the dispatcher, the agents' proxy
 #   ci         internal: Forgejo, the CI runner and its Docker engine, the CI proxy
 #   forge-out  internal: Forgejo and its proxy, its only way out (mirror pushes)
 #   forge-web  internal: Forgejo, the port forwarder and the admin tools
+#   gate       internal: Forgejo and the gatekeeper, which no agent joins
 #   publish    the port forwarder only, so the host can reach Forgejo on 127.0.0.1
 #   egress     the three proxies, the only containers with a route out
 # Forgejo is on internal networks only: whatever it sends out goes through
@@ -68,7 +69,7 @@ services:
   forgejo:
     image: codeberg.org/forgejo/forgejo:17.0.1-rootless
     restart: unless-stopped
-    networks: [agents, ci, forge-out, forge-web]
+    networks: [agents, ci, forge-out, forge-web, gate]
     environment:
       FORGEJO__database__DB_TYPE: sqlite3
       FORGEJO__server__ROOT_URL: http://localhost:${FORGE_PORT:-3000}/
@@ -214,6 +215,24 @@ services:
       - ${STATE_DIR:-.}/control:/control:ro
       - ./agents.conf:/etc/kit/agents.conf:ro
       - dispatcher-state:/state
+
+  # Approves a pull request once the Actions run for its head commit succeeded,
+  # in repositories at autonomy level 2 or 3 (docker/gatekeeper/gatekeeper.py).
+  # It shares a network with Forgejo only; its token is mounted nowhere else.
+  gatekeeper:
+    build: ./docker/gatekeeper
+    restart: unless-stopped
+    networks: [gate]
+    depends_on: [forgejo]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      FORGE_URL: http://forgejo:3000
+      FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
+      GATEKEEPER_POLL_SECONDS: ${GATEKEEPER_POLL_SECONDS:-30}
+    volumes:
+      - ${STATE_DIR:-.}/secrets/gatekeeper:/run/secrets/gatekeeper:ro
+      - ${STATE_DIR:-.}/control:/control:ro
 
   # Creates each agent's folder in the run archive, owned by the agent's user,
   # before any agent starts; each agent mounts only its own folder.
@@ -546,6 +565,8 @@ networks:
   forge-out:
     internal: true
   forge-web:
+    internal: true
+  gate:
     internal: true
   publish: {}
   egress: {}

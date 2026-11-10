@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # What each agent is doing, from the dispatcher (never GitHub): its state,
-# pending triggers, and recent runs; then notices for you.
+# pending triggers, and recent runs; then notices for you, and the
+# gatekeeper's latest approvals.
 # Then open requests, pull requests, recommendations and needs-human items
 # across the project's repositories, from Forgejo.
 set -euo pipefail
@@ -30,5 +31,12 @@ docker compose run --rm -T --no-deps --entrypoint jq tools -r '
   "Notices:",
   (.notices[:10][] | "  \(.at) \(.kind) \(.repo // "")#\(.number // "") \(if .posted == 1 then "(mentioned you in Forgejo)" else "" end)")
 ' <<<"$json"
+echo
+if [ -n "$(docker compose ps -q --status running gatekeeper 2>/dev/null)" ]; then
+  echo "Gatekeeper: running. Its latest approvals:"
+  docker compose logs --no-log-prefix gatekeeper 2>/dev/null | grep "approved " | tail -5 | sed "s/^/  /" || true
+else
+  echo "Gatekeeper: not running (levels 2 and 3 need it: scripts/up.sh)."
+fi
 echo
 docker compose run --rm -T tools project-status

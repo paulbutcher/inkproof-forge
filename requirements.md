@@ -30,7 +30,7 @@ This document fixes the components, the trust boundaries, how each autonomy leve
 | one container per agent: the coordinator, each library, each reviewer | compose service | that agent's Forgejo token and runner key | Forgejo, dispatcher, `proxy`; the coordinator also reaches `gatekeeper` |
 | `agent-runner` (inside each agent container) | the agent's user | nothing beyond the container's | dispatcher (claims work, reports runs); writes the run archive |
 | `run-archive` volume | | every agent's run logs and transcripts, the human's sessions included | read-only to the process reviewer |
-| `gatekeeper` (levels 2 and 3) | compose service | gatekeeper account token, which no agent can read | Forgejo; answers only the coordinator |
+| `gatekeeper` (levels 2 and 3) | compose service | gatekeeper account token, which no agent can read | Forgejo, by polling; from level 3 it also answers the coordinator |
 | host scripts | the human, on macOS | the human's Forgejo admin token (`secrets/human/token`) | Forgejo and dispatcher on `127.0.0.1` |
 
 Networks keep these apart: library agents share no network with `gatekeeper`; `gatekeeper` reaches Forgejo through a network no agent joins; `ci-docker` has no route out except `proxy`. The gatekeeper also checks a key that only the coordinator's container has.
@@ -90,6 +90,8 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 Every code owner's review request blocks the merge until that owner approves, so the single required approval is a floor, not the gate. Agents schedule "merge when checks succeed" on their own pull requests at every level; it waits for the approvals the level requires. Protected files are not used: in the trial they blocked every merge.
 
 Verified in stage 5 (2026-11-09): every pending code owner's review request blocks the merge, and an approver's official approval answers their own request, though Forgejo's API goes on listing them under `requested_reviewers`.
+
+The gatekeeper is a Python program, not a Claude agent. It polls Forgejo (`GATEKEEPER_POLL_SECONDS`, default 30) rather than taking webhooks, so nothing needs to reach it until level 3 and a lost delivery can't lose an approval. It acts only in repositories whose `CODEOWNERS` on `main` names `@gatekeeper`, which is how `setup-repo.sh` marks levels 2 and 3, and only on pull requests into `main`. It approves the head commit when Forgejo's Actions runs for that commit include `checks.yml` and all succeeded, and never reads commit statuses. Its approval starts with `(no reply needed)`, so it wakes no one, and while the kit is paused it approves nothing. Its account's team reads code and reviews pull requests on every repository, and can do nothing else. Branch protection dismisses its approval when a new commit arrives, a moment after the push, and it approves the new head once that head's run succeeds.
 
 Forgejo 17 reads `CODEOWNERS` from the default branch, from the first of `CODEOWNERS`, `docs/CODEOWNERS`, `.gitea/CODEOWNERS` and `.forgejo/CODEOWNERS` that exists, never `.github/`. Each line is a Go regular expression anchored to a whole path without a leading slash (`API\.lock`, `\.forgejo/.*`), and every matching line adds its owners, so the catch-all and the `API.lock` line combine (read from Forgejo's source, 2026-11-09). Branch protection's "no pushes" applies to the human too, so the human's own changes, such as the `.forgejo/` files `setup-repo.sh` asks for, also go through pull requests; an admin can merge one without the approval.
 

@@ -2,7 +2,7 @@
 
 A local forge for the Inkproof agents: Forgejo is canonical, GitHub is a push mirror that nothing polls, and each agent is a Claude Code agent with its own Forgejo account. [requirements.md](requirements.md) sets out what the kit does and how we'll know it works; this README covers running it.
 
-The kit is built in stages. In place so far: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4); and reviews: conformance on every pull request, and architecture, process and Lasm at each milestone's end (stage 5). Later stages add autonomy levels 2 and 3, and backups.
+The kit is built in stages. In place so far: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4); and reviews: conformance on every pull request, and architecture, process and Lasm at each milestone's end (stage 5); and autonomy level 2, where the gatekeeper approves on CI (stage 6). Later stages add level 3, with releases, and backups.
 
 ## Layout
 
@@ -102,6 +102,18 @@ Four reviewers run as agents of their own. They own no repository and never push
 
 Turning reviews on for a repository is part of `scripts/setup-repo.sh <repository> 1`: re-run it for each repository, and merge the pull request it opens, which adds `conformance` to `.forgejo/CODEOWNERS`.
 
+### Level 2: the gatekeeper approves on CI
+
+At level 2 an ordinary pull request merges without you: `gatekeeper` approves it once the Actions run for its head commit has succeeded, `conformance` approves it, and the merge the agent scheduled goes through. You still review what you own: `API.lock`, `CLAUDE.md`, `.forgejo/`, `lean-toolchain` and `REQUIREMENTS.md`. The gatekeeper is a small program, not a Claude agent, so it costs nothing per pull request.
+
+1. Run `scripts/bootstrap.sh` once, which gives the gatekeeper read access to every repository and lets it review, then `scripts/up.sh`, which starts it.
+2. For each repository you want at level 2, run `scripts/setup-repo.sh <repository> 2` and merge the pull request it opens. It adds the gatekeeper to `main`'s approvals list and makes it, with `conformance`, code owner of every path, while `API.lock` stays yours. Repositories can be at different levels; `scripts/setup-repo.sh <repository> 1` falls back. Keep `inkproof-coordination` at level 1: it has no CI, so the gatekeeper never approves there.
+
+- **What it checks.** Forgejo's own record of the Actions runs for the head commit: there must be a run of `checks.yml`, and every run for that commit must have succeeded. It never looks at commit statuses, which any account with write access can post under CI's name. A new commit dismisses its approval, and it approves the new head once that head's run succeeds.
+- **Where it acts.** Only in repositories whose `.forgejo/CODEOWNERS` on `main` names `@gatekeeper`, and only on pull requests into `main`. It polls Forgejo every 30 seconds (`GATEKEEPER_POLL_SECONDS`), so a lost webhook can't lose an approval.
+- **The brake.** While the kit is paused it approves nothing; after `scripts/resume.sh` it catches up on its next poll.
+- **Status.** `scripts/status.sh` shows whether it's running and its latest approvals; `docker compose logs gatekeeper` shows each pull request it looked at and what its run was.
+
 ### The same checkout in the dev container
 
 The kit's dev container mounts this checkout and has a Docker engine of its own, for developing and testing the kit. Inside a container the scripts read `.env.devcontainer` instead of `.env`. That file sets its own `STATE_DIR` (`./.devcontainer-state`) for `secrets/`, `control/` and `backups/`, and its own `FORGE_PORT` (3300), so neither environment overwrites the other's credentials or takes the other's port. `KIT_ENV` names a different file for either.
@@ -113,4 +125,5 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 - **Workflows** use no `uses:` actions, so CI fetches no code from outside; `templates/repo/.forgejo/workflows/checks.yml` checks out with plain git. They fetch this project's repositories with `ci-reader`'s token, the organisation's `DEPS_READ_TOKEN` Actions secret, because a job's own token reads only its own repository. A workflow an agent changes on its branch runs before review, so an agent could read that token and with it every repository in the organisation; it can't write anything with it.
 - **Agents** reach Forgejo and the dispatcher directly and the outside only through `proxy`. No allowlist includes `api.github.com`. Each container holds only that agent's Forgejo token and runner key, plus the Claude token. Its policy (managed settings, managed `CLAUDE.md`, git configuration and hooks) is root-owned in the image, so the agent can't change it. In unattended runs, anything the managed settings don't allow is refused rather than waiting for a prompt.
 - **Claude.** Unattended runs, and your own sessions in agent containers, use the token from `claude setup-token`, so they count against that Claude account's plan and usage limits. `claude setup-token` makes a long-lived token for non-interactive use such as this; check that running agents this way fits your plan's terms. The cost of each run is in `scripts/status.sh`, and the caps above bound it.
+- **The gatekeeper** shares a network with Forgejo and nothing else, so no agent can reach it. Its Forgejo token is mounted only into its own container, and its account can only read and review.
 - **The dispatcher** keeps the queues and the run ledger in its own volume. Its status is on `127.0.0.1:DISPATCHER_PORT` (3001); claiming work needs a runner key, which each agent's container holds for itself only.
