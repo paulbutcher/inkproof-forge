@@ -60,6 +60,9 @@ SPEND_CAP = float(os.environ.get("MAX_SPEND_PER_DAY", "0") or 0)  # dollars per 
 DEBOUNCE = int(os.environ.get("DEBOUNCE_SECONDS", "60"))
 MAX_DELAY = int(os.environ.get("MAX_DELAY_SECONDS", "900"))
 RECONCILE = int(os.environ.get("RECONCILE_SECONDS", "900"))
+SETTLE = int(os.environ.get("CONFORMANCE_SETTLE_SECONDS", "600"))
+REVIEWER = "conformance"
+MILESTONE_REVIEWERS = ("architecture", "process", "lasm")
 KEEP_PAYLOADS = 500
 MAX_BODY = 25 * 1024 * 1024
 NO_REPLY = "(no reply needed)"
@@ -153,6 +156,10 @@ CREATE INDEX IF NOT EXISTS triggers_pending ON triggers (agent, run_id);
 CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
 """)
+try:
+    DB.execute("ALTER TABLE triggers ADD COLUMN not_before REAL")  # ledgers from before stage 5
+except sqlite3.OperationalError:
+    pass
 
 
 def q(sql, *args):
@@ -169,10 +176,10 @@ def kv_set(key, value):
     q("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)", key, str(value))
 
 
-def add_trigger(agent, key, description, once=False, recent=0):
+def add_trigger(agent, key, description, once=False, recent=0, not_before=None):
     """Queue work for an agent, unless the same key is already waiting; with
     once, unless it was ever queued; with recent, unless it was queued in the
-    last `recent` seconds."""
+    last `recent` seconds. With not_before, it waits until then to be claimed."""
     if agent not in AGENTS:
         return
     with LOCK:
@@ -186,8 +193,8 @@ def add_trigger(agent, key, description, once=False, recent=0):
                              (agent, key)).fetchone()
         if dup:
             return
-        DB.execute("INSERT INTO triggers (agent, key, description, created) VALUES (?,?,?,?)",
-                   (agent, key, description, now()))
+        DB.execute("INSERT INTO triggers (agent, key, description, created, not_before) VALUES (?,?,?,?,?)",
+                   (agent, key, description, now(), not_before))
     log(f"queued for {agent}: {description}")
 
 
@@ -329,6 +336,42 @@ def wake_blocked(match, what):
                     break
 
 
+def wip(title):
+    t = (title or "").strip().lower()
+    return t.startswith(("wip", "[wip]", "draft"))
+
+
+def drop_pending(agent, prefix):
+    q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL AND key LIKE ?", agent, prefix + "%")
+
+
+def has_ci(repo):
+    return repo != COORDINATION
+
+
+def queue_conformance(repo, n, sha=None):
+    """Work for conformance: review pull request n at its head, once that head
+    has settled (no newer commit for SETTLE seconds) and if it hasn't already
+    reviewed it. Pull requests marked as work in progress are skipped."""
+    if REVIEWER not in AGENTS:
+        return
+    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
+    head = pr["head"]["sha"]
+    if pr["state"] != "open" or wip(pr.get("title")) or (sha and sha != head):
+        return
+    drop_pending(REVIEWER, f"conf:{repo}#{n}:")
+    if any(r["user"]["login"] == REVIEWER and r.get("commit_id") == head
+           for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
+        return
+    add_trigger(REVIEWER, f"conf:{repo}#{n}:{head[:12]}", f"review pull request {repo}#{n} at {head[:12]}",
+                once=True, not_before=now() + SETTLE)
+
+
+def conformance_wants_changes(repo, n):
+    mine = [r for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews") if r["user"]["login"] == REVIEWER]
+    return bool(mine) and mine[-1].get("state") == "REQUEST_CHANGES"
+
+
 def handle(event, payload):
     repo = (payload.get("repository") or {}).get("name") or ""
     sender = (payload.get("sender") or {}).get("login") or ""
@@ -355,9 +398,16 @@ def handle(event, payload):
             notify(f"blocking:{repo}#{n}", "blocking", repo, n,
                    "this upstream issue is marked `blocking`: an agent can't continue until it's resolved upstream. "
                    "Close it or comment on it once a fix is available.")
-        if "needs-human" in added and sender != "dispatcher":
+        # A recommendation's needs-human is grouped into its review's report notice.
+        if "needs-human" in added and sender != "dispatcher" and "recommendation" not in labels:
             notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
                    "this needs your decision (`needs-human`).")
+        if repo == COORDINATION and "milestone-review" in added:
+            for r in MILESTONE_REVIEWERS:
+                add_trigger(r, f"milestone:{repo}#{n}", f"milestone review requested on {repo}#{n}", once=True)
+        if (repo == COORDINATION and {"upstream", "upstream:lasm", "blocking"} <= labels
+                and added & {"upstream:lasm", "blocking"}):
+            add_trigger("lasm", f"lasm-blocking:{repo}#{n}", f"blocking Lasm issue {repo}#{n}", once=True)
         if (owner and issue.get("state") == "open" and not is_pr
                 and {"request", "new"} <= labels and author in TRUSTED and author != owner
                 and sender != owner and action in ("opened", "reopened", "label_updated")):
@@ -379,10 +429,21 @@ def handle(event, payload):
         n = issue.get("number")
         if not trusted:
             return
+        is_pr = bool(payload.get("is_pull") or issue.get("pull_request"))
         if owner and sender != owner and issue.get("state") == "open" and wants_reply(c.get("body")):
-            kind = "pull request" if payload.get("is_pull") or issue.get("pull_request") else "issue"
-            add_trigger(owner, f"comment:{c.get('id')}", f"comment on {kind} {repo}#{n}")
+            add_trigger(owner, f"comment:{c.get('id')}", f"comment on {'pull request' if is_pr else 'issue'} {repo}#{n}")
         labels = {l["name"] for l in issue.get("labels") or []}
+        # The author answers conformance's findings in a comment: conformance looks again.
+        if (is_pr and issue.get("state") == "open" and sender == (issue.get("user") or {}).get("login")
+                and sender != REVIEWER and wants_reply(c.get("body")) and conformance_wants_changes(repo, n)):
+            add_trigger(REVIEWER, f"conf-reply:{c.get('id')}",
+                        f"the author replied on pull request {repo}#{n}, which you asked to change")
+        # A milestone reviewer's report: one notice per report, not per recommendation.
+        if sender in MILESTONE_REVIEWERS and ({"milestone-review", "upstream:lasm"} & labels):
+            notify(f"report:{sender}:{repo}#{n}", "report", repo, n,
+                   f"the `{sender}` review has reported here. Its recommendations are issues labelled "
+                   f"`recommendation` and `review:{sender}`: close each as accepted, or label it `declined`, "
+                   "say why and close it.")
         if repo == COORDINATION and "upstream" in labels and sender == HUMAN:
             wake_blocked((repo, n), f"{HUMAN} commented on upstream issue {repo}#{n}")
 
@@ -399,7 +460,13 @@ def handle(event, payload):
     elif event == "pull_request":
         pr = payload.get("pull_request") or {}
         n = pr.get("number")
-        if not trusted or not coord:
+        if not trusted:
+            return
+        if action == "synchronized":
+            drop_pending(REVIEWER, f"conf:{repo}#{n}:")  # a newer head supersedes the waiting review
+        if not has_ci(repo) and action in ("opened", "reopened", "synchronized"):
+            queue_conformance(repo, n)  # nothing to wait for: no CI here
+        if not coord:
             return
         if action == "opened":
             add_trigger(coord, f"pr-opened:{repo}#{n}", f"pull request opened: {repo}#{n}", once=True)
@@ -417,6 +484,17 @@ def handle(event, payload):
 
     elif event == "push" and payload.get("ref") == "refs/heads/main":
         check_behind(repo, payload.get("after") or "")
+
+    elif event == "action_run_success":
+        run = payload.get("run") or {}
+        if run.get("event") != "pull_request":
+            return
+        try:
+            pr = json.loads(run.get("event_payload") or "{}").get("pull_request") or {}
+        except ValueError:
+            return
+        if pr.get("number"):
+            queue_conformance(repo, pr["number"], run.get("commit_sha"))
 
     elif event == "action_run_failure":
         run = payload.get("run") or {}
@@ -457,6 +535,19 @@ def reconcile():
             check_behind(repo)
         except Exception as e:
             log(f"reconciling {repo} failed: {e!r}")
+    # Pull requests whose head passed CI (or that have no CI) but which
+    # conformance hasn't reviewed.
+    for repo in OWNER_OF:
+        try:
+            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50") or {}
+            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
+            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+                sha = pr["head"]["sha"]
+                mine = [r for r in runs if (r.get("commit_sha") or r.get("head_sha")) == sha]
+                if not has_ci(repo) or (mine and mine[0].get("status") == "success"):
+                    queue_conformance(repo, pr["number"], sha)
+        except Exception as e:
+            log(f"reconciling {repo}'s reviews failed: {e!r}")
     kv_set("reconciled", now())
 
 
@@ -516,7 +607,7 @@ def claim(agent):
         if paused():
             return None
         rows = DB.execute("SELECT id, description, created FROM triggers WHERE agent=? AND run_id IS NULL "
-                          "ORDER BY created", (agent,)).fetchall()
+                          "AND (not_before IS NULL OR not_before<=?) ORDER BY created", (agent, now())).fetchall()
         if not rows:
             return None
         why = capped(agent)
@@ -570,10 +661,11 @@ def end_run(agent, run_id, r):
 def status():
     agents = {}
     for name in AGENTS:
-        pending = q("SELECT description, created FROM triggers WHERE agent=? AND run_id IS NULL ORDER BY created", name)
+        pending = q("SELECT description, created, not_before FROM triggers WHERE agent=? AND run_id IS NULL ORDER BY created", name)
         agents[name] = {"state": agent_state(name), "runs_today": runs_today(name), "cap": CAP,
                         "spend_today": round(spend_today(name), 2), "spend_cap": SPEND_CAP or None,
-                        "pending": [{"trigger": p["description"], "since": iso(p["created"])} for p in pending]}
+                        "pending": [{"trigger": p["description"], "since": iso(p["created"]),
+                                     "after": iso(p["not_before"])} for p in pending]}
     runs = [dict(r, claimed=iso(r["claimed"]), started=iso(r["started"]), ended=iso(r["ended"]),
                  triggers=json.loads(r["triggers"] or "[]"), denied=json.loads(r["denied"] or "[]"))
             for r in q("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
@@ -729,6 +821,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, {"ok": True})
         if url.path == "/status":
             return self.reply(200, status())
+        if url.path == "/ledger":
+            # The run ledger, for the process review only.
+            if agent_for_key(self.bearer()) != "process":
+                return self.reply(403, {"error": "only the process review reads the ledger"})
+            since = float((urllib.parse.parse_qs(url.query).get("since") or ["0"])[0] or 0)
+            runs = [dict(r, claimed=iso(r["claimed"]), started=iso(r["started"]), ended=iso(r["ended"]),
+                         triggers=json.loads(r["triggers"] or "[]"), denied=json.loads(r["denied"] or "[]"))
+                    for r in q("SELECT * FROM runs WHERE claimed>=? ORDER BY id", since)]
+            sessions = [dict(s, started=iso(s["started"]), ended=iso(s["ended"]))
+                        for s in q("SELECT * FROM sessions WHERE COALESCE(started, ended)>=? ORDER BY id", since)]
+            notices = [dict(n, at=iso(n["at"])) for n in q("SELECT * FROM notices WHERE at>=? ORDER BY id", since)]
+            return self.reply(200, {"runs": runs, "sessions": sessions, "notices": notices})
         if url.path == "/notices.txt":
             after = int((urllib.parse.parse_qs(url.query).get("after") or ["0"])[0] or 0)
             return self.reply_text(200, notices_text(after))

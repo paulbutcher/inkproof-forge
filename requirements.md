@@ -89,7 +89,7 @@ Host scripts are bash 3.2 and run on Docker Desktop. Services and the agent runn
 
 Every code owner's review request blocks the merge until that owner approves, so the single required approval is a floor, not the gate. Agents schedule "merge when checks succeed" on their own pull requests at every level; it waits for the approvals the level requires. Protected files are not used: in the trial they blocked every merge.
 
-`conformance` joins the approvals list and `CODEOWNERS` in stage 5, when it starts reviewing; until then a level-1 pull request waits for the human alone.
+Verified in stage 5 (2026-11-09): every pending code owner's review request blocks the merge, and an approver's official approval answers their own request, though Forgejo's API goes on listing them under `requested_reviewers`.
 
 Forgejo 17 reads `CODEOWNERS` from the default branch, from the first of `CODEOWNERS`, `docs/CODEOWNERS`, `.gitea/CODEOWNERS` and `.forgejo/CODEOWNERS` that exists, never `.github/`. Each line is a Go regular expression anchored to a whole path without a leading slash (`API\.lock`, `\.forgejo/.*`), and every matching line adds its owners, so the catch-all and the `API.lock` line combine (read from Forgejo's source, 2026-11-09). Branch protection's "no pushes" applies to the human too, so the human's own changes, such as the `.forgejo/` files `setup-repo.sh` asks for, also go through pull requests; an admin can merge one without the approval.
 
@@ -124,7 +124,7 @@ From `watch-work`, now driven by webhooks. Only trusted authors count; an agent'
 
 - **Every library agent and the coordinator, on its own repository:** a request opened, or labelled `request` and `new`; a comment or review on one of its open issues or pull requests; a failed Actions run on one of its pull requests; one of its pull requests falling behind `main`; a release of a repository named in a `Blocked-by: <owner>/<repo>#<n>` line on one of its `blocked` issues.
 - **The coordinator, across the `inkproof-` repositories:** a request filed; a pull request opened or merged; `ready-for-release` added; a release published; `needs-human` added or removed; a review requested from it.
-- **`conformance`:** a pull request's Actions run succeeding on a head commit it hasn't reviewed, once no new commit has arrived for a settling period (default 10 minutes). Pull requests whose title marks them as work in progress are skipped.
+- **`conformance`:** a pull request's Actions run succeeding on a head commit it hasn't reviewed, once no new commit has arrived for a settling period (default 10 minutes, `CONFORMANCE_SETTLE_SECONDS`); in `inkproof-coordination`, which has no CI, a pull request opened or updated; and the author's reply on a pull request whose changes it requested. Pull requests whose title marks them as work in progress are skipped.
 - **`architecture`, `process` and `lasm`:** `milestone-review` added to a milestone issue on `inkproof-coordination`.
 - **`lasm`, also:** `blocking` added to an `upstream:lasm` issue.
 - **Reconciliation.** On start, and every 15 minutes, the dispatcher checks Forgejo for untriaged requests, failed and unreviewed runs, and pull requests behind `main`, so a missed delivery delays work rather than losing it. Finished Actions runs arrive as `action_run_success` and `action_run_failure` events.
@@ -136,7 +136,7 @@ From `watch-work`, now driven by webhooks. Only trusted authors count; an agent'
 - **What.** `conformance` checks the pull request's diff against the base branch's `CLAUDE.md` and the protocol, and reports each deviation with the section it breaks. It reviews craft against stated rules only; scope stays with the coordinator.
 - **Outcome.** It approves, or requests changes with its findings. A request for changes wakes the author through the review trigger, and blocks the merge until `conformance` approves a later head.
 - **Answering findings.** The author fixes each finding or replies with its reason. `conformance` accepts a reason or keeps the finding. After a configurable number of rounds on one pull request (default 3), it labels the pull request `needs-human` instead of reviewing again, and the human decides.
-- **For the process review.** Each finding is recorded with its repository, pull request, section and whether it was fixed, disputed or escalated, so repeated deviations can be found.
+- **For the process review.** Each finding is recorded with its repository, pull request, section and whether it was fixed, disputed or escalated, so repeated deviations can be found: `forge review`, the only way `conformance` reviews, ends every review with a machine-readable `conformance-findings` record (section and status of each finding, the round, and whether it was escalated), and enforces the rounds limit and the CI check in code.
 
 ### At the end of each milestone
 
@@ -144,7 +144,7 @@ From `watch-work`, now driven by webhooks. Only trusted authors count; an agent'
 - **Architecture** (`architecture`). Are boundaries between libraries in the right place; is there too much coupling between libraries or too little cohesion within one; are libraries working around limitations in dependencies, including ones we don't control, and should those be fixed instead. It reads every repository, the milestone's `API.lock` diff, requests and how they were resolved, and the upstream tracker.
 - **Process** (`process`). How agents work: the protocol, roles, `CLAUDE.md` and prompts. It proposes changes that stop a mistake caught in review from happening again, or remove work that isn't needed, by agents or by the human. It reads the run ledger, the run archive (the human's own sessions included), conformance findings, review comments, failed CI runs, denied commands, caps reached, runs that changed nothing, and everything the human had to do.
 - **Lasm** (`lasm`). Lasm bugs and possible improvements found this milestone, each with a minimal reproduction, from the upstream tracker and from what the libraries had to do to work with Lasm. A `blocking` Lasm issue gets this review straight away, for that issue only.
-- **Recommendations.** Each review files one report on the milestone issue, and one issue per recommendation on `inkproof-coordination`, labelled `recommendation`, `review:<kind>` and `needs-human`. The human closes each as completed (accepted) or as not planned with a reason. Reviewers read earlier decisions and don't raise a rejected recommendation again without new evidence. An accepted architecture or Lasm recommendation becomes a brief through the coordinator, or upstream work for the human; an accepted process recommendation is a change the human makes to the kit or to `CLAUDE.md`. Reviewers propose text in the issue; they never edit policy.
+- **Recommendations.** Each review files one report on the milestone issue, and one issue per recommendation on `inkproof-coordination`, labelled `recommendation`, `review:<kind>` and `needs-human`. The human closes each one: accepted as it is, or rejected by adding `declined` and a comment saying why first (Forgejo records no reason for closing an issue). Reviewers read earlier decisions and don't raise a rejected recommendation again without new evidence. An accepted architecture or Lasm recommendation becomes a brief through the coordinator, or upstream work for the human; an accepted process recommendation is a change the human makes to the kit or to `CLAUDE.md`. Reviewers propose text in the issue; they never edit policy.
 - **Notification.** The human is notified once per report, not per recommendation.
 
 ## Dependencies we don't control
@@ -160,7 +160,10 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 - `forge pr automerge <n>`: schedule "merge when checks succeed";
 - `forge pr update <n>`: bring a pull request up to date with `main`;
 - `forge ci <repo> <pr>`: the Actions run's result for the pull request's head commit;
-- `forge pr approve <repo> <n>` (coordinator, `conformance`): approve only if the Actions run for the head commit succeeded;
+- `forge pr approve <repo> <n>` (coordinator): approve only if the Actions run for the head commit succeeded;
+- `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI passed, and after the rounds limit label the pull request `needs-human` instead;
+- `forge reviews <repo> <n>`: a pull request's reviews and their findings, which `tea` doesn't show;
+- `forge ledger [days]` (`process`): the run ledger;
 - `forge release <repo> '<note>' <issue>...` (coordinator, level 3): ask the gatekeeper to release.
 
 `tea api`, `tea login`, `tea` release commands and `tea` approval commands are denied in managed settings, with every alias, as are `curl`, `wget`, `git tag`, `git config` and force pushes. `tea api` is the agent's whole account, including posting a commit status with CI's name, which is the spoof the trial demonstrated. Denying it and offering `forge` keeps runs to reviewed operations, and puts the rule "approve only after checking the Actions run" in code instead of a prompt. The deny list can be got round with a script, as before; the boundary is the account's permissions and branch protection, and the list is defence in depth.
@@ -280,8 +283,6 @@ Each stage is shown working before the next starts. The brief's seven stages gai
 Each is verified in the stage that first needs it, then removed from this list.
 
 - [ ] `cleanupPeriodDays` in managed settings governs transcript deletion for every session in the container (stage 3).
-- [ ] An approval from an approvals-list member satisfies the review count and their own official review request (stage 3).
-- [ ] Every pending official review request blocks the merge, not only the first (stage 3).
 
 ## Decided in review (2026-11-08)
 

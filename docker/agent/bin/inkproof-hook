@@ -101,7 +101,8 @@ def main():
         if human():
             write_activity("idle")
             return 0
-        if data.get("stop_hook_active") or os.path.exists("/etc/inkproof/control/paused"):
+        if (data.get("stop_hook_active") or not os.environ.get("AGENT_REPO")
+                or os.path.exists("/etc/inkproof/control/paused")):
             return 0
         pending = untriaged_requests()
         if pending:

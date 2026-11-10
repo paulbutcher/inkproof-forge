@@ -10,6 +10,8 @@
 #   kit pause, kit resume  the human's brake (scripts/pause.sh, resume.sh)
 #   kit project-status  requests, pull requests and needs-human items
 #   kit dispatcher METHOD PATH [JSON]  the dispatcher's admin requests
+#   kit milestone NAME  open the milestone issue that starts the reviews
+#   kit milestone-diff  every API.lock change since the last milestone
 #   kit api METHOD PATH [JSON]  call the API as the human, print the reply
 #   kit test-stage1    stage 1 checks against the API
 #   kit test-stage2    stage 2 checks against the API
@@ -60,11 +62,14 @@ case "${1:-}" in
   resume) cmd_resume ;;
   project-status) cmd_project_status ;;
   dispatcher) shift; cmd_dispatcher "$@" ;;
+  milestone) shift; cmd_milestone "$@" ;;
+  milestone-diff) cmd_milestone_diff ;;
   mirror-status) cmd_mirror_status ;;
   api) shift; TOKEN="$(token_of human)"; call 200,201,204 "$@" | jq . ;;
   test-stage1) cmd_test_stage1 ;;
   test-stage2) shift; cmd_test_stage2 "$@" ;;
   test-stage3) shift; cmd_test_stage3 "$@" ;;
   test-stage4) shift; cmd_test_stage4 "$@" ;;
+  test-stage5) shift; cmd_test_stage5 "$@" ;;
   *) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
 esac

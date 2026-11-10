@@ -19,8 +19,9 @@
 # scripts/check-pins.sh, against templates/repo/; and that nothing is left in
 # .github/ from GitHub.
 
-# The reviewers that exist so far. conformance joins at stage 5.
-CONFORMANCE_REVIEW="${CONFORMANCE_REVIEW:-false}"
+# conformance reviews every pull request: it is on every approvals list and a
+# code owner of every path. CONFORMANCE_REVIEW=false leaves it out.
+CONFORMANCE_REVIEW="${CONFORMANCE_REVIEW:-true}"
 
 LABELS='[
   ["request", "0e8a16", "A capability another library or consumer needs"],
@@ -35,7 +36,14 @@ LABELS='[
 COORD_LABELS='[
   ["upstream", "bfdadc", "A bug or limitation in a dependency outside this project"],
   ["blocking", "b60205", "An upstream issue that stops an agent working"],
-  ["milestone-review", "1d76db", "Start the end-of-milestone reviews"]
+  ["milestone-review", "1d76db", "Start the end-of-milestone reviews"],
+  ["milestone", "1d76db", "A milestone issue (scripts/milestone.sh)"],
+  ["upstream:lasm", "bfdadc", "An upstream issue in Lasm"],
+  ["recommendation", "5319e7", "A recommendation from a review, for the human to decide"],
+  ["review:architecture", "c5def5", "From the architecture review"],
+  ["review:process", "c5def5", "From the process review"],
+  ["review:lasm", "c5def5", "From the Lasm review"],
+  ["declined", "cccccc", "A recommendation the human rejected; not raised again without new evidence"]
 ]'
 
 ensure_labels() {

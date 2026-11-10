@@ -28,8 +28,9 @@ import urllib.request
 import uuid
 
 AGENT = os.environ["AGENT_NAME"]
-REPO = os.environ["AGENT_REPO"]
-WORKSPACE = f"/workspace/{REPO}"
+REPO = os.environ.get("AGENT_REPO", "")
+# Reviewers own no repository; their workspace is a folder of their own.
+WORKSPACE = os.environ.get("AGENT_WORKSPACE") or f"/workspace/{REPO}"
 STATE = "/workspace/.inkproof"
 LOGS = f"{WORKSPACE}/.inkproof"
 ARCHIVE = "/var/lib/inkproof/archive"

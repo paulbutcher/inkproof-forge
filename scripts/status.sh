@@ -15,7 +15,7 @@ docker compose run --rm -T --no-deps --entrypoint jq tools -r '
   "Agents:",
   (.agents | to_entries[]
     | "  \(.key): \(.value.state), \(.value.runs_today)/\(.value.cap) runs today, $\(.value.spend_today) spent"
-      + (if (.value.pending | length) > 0 then "\n" + ([.value.pending[] | "    waiting since \(.since): \(.trigger)"] | join("\n")) else "" end)),
+      + (if (.value.pending | length) > 0 then "\n" + ([.value.pending[] | "    waiting since \(.since): \(.trigger)" + (if .after then " (not before \(.after))" else "" end)] | join("\n")) else "" end)),
   "",
   "Recent runs:",
   (.runs[:15][] | "  #\(.id) \(.agent) \(.started | t) -> \(.ended | t): \(.outcome // "running")"

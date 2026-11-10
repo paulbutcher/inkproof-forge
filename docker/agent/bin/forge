@@ -9,8 +9,21 @@ follow a rule tea can't enforce. Uses the agent's own token.
   forge ci <repo> <pr>            the Actions run for the pull request's head
                                   commit: success, failure, running or none
   forge pr approve <repo> <n> <message>
-                                  (coordinator, conformance) approve, only if
-                                  the Actions run for the head commit succeeded
+                                  (coordinator) approve, only if the Actions run
+                                  for the head commit succeeded
+  forge review <repo> <n> <findings.json>
+                                  (conformance) review the pull request's head:
+                                  approves if no finding is open, requests
+                                  changes otherwise, and after the rounds limit
+                                  labels it needs-human instead. The file is
+                                  {"summary": "...", "findings": [{"section":
+                                  "<CLAUDE.md or protocol section>", "finding":
+                                  "...", "status": "new|kept|fixed|withdrawn"}]}
+  forge reviews <repo> <n>        the pull request's reviews: who, verdict,
+                                  commit and text, oldest first
+  forge ledger [days]             (process) the run ledger for the last days
+                                  (default 30): runs, the human's sessions,
+                                  notices, as JSON
 
 <repo> is a repository name such as inkproof-core; pull requests are numbers.
 """
@@ -62,9 +75,10 @@ def number(s):
 
 
 def repo_name(s):
+    """A repository in the organisation; the account's permissions decide the rest."""
     s = s.split("/")[-1]
-    if not s.startswith("inkproof-"):
-        die(f"{s!r} isn't one of this project's repositories")
+    if not s or not all(c.isalnum() or c in "-_." for c in s):
+        die(f"{s!r} isn't a repository name")
     return s
 
 
@@ -88,6 +102,79 @@ def ci_state(repo, pr):
     return sha, "running"
 
 
+STATUSES = ("new", "kept", "fixed", "withdrawn")
+
+
+def render(summary, findings, round_no, rounds, escalated=False):
+    lines = [summary.strip(), ""]
+    if findings:
+        lines.append(f"**Findings** (round {round_no} of {rounds}):")
+        for i, f in enumerate(findings, 1):
+            lines.append(f"{i}. **{f['section']}**: {f['finding'].strip()} *({f['status']})*")
+    else:
+        lines.append("No findings: this follows `CLAUDE.md` and the protocol.")
+    record = {"round": round_no, "escalated": escalated,
+              "findings": [{"section": f["section"], "status": f["status"]} for f in findings]}
+    lines += ["", f"<!-- conformance-findings: {json.dumps(record)} -->"]
+    return "\n".join(lines)
+
+
+def review(repo, n, path):
+    """conformance's review of a pull request's head, with its rules in code:
+    approve only when CI succeeded and no finding is open; after the rounds
+    limit, hand the pull request to the human instead of reviewing again."""
+    if ME != "conformance":
+        die("only conformance reviews with forge review")
+    try:
+        with open(path) as f:
+            spec = json.load(f)
+        summary, findings = spec["summary"], spec.get("findings", [])
+        for f in findings:
+            if f.get("status") not in STATUSES or not f.get("section") or not f.get("finding"):
+                raise ValueError(f"each finding needs a section, a finding and a status in {STATUSES}")
+    except (OSError, ValueError, KeyError) as e:
+        die(f"{path}: {e}")
+    rounds = int(os.environ.get("CONFORMANCE_ROUNDS", "3"))
+    sha, state = ci_state(repo, n)
+    s, _ = api("GET", f"/repos/{ORG}/{repo}/contents/.forgejo/workflows?ref=main")
+    if s == 200 and state != "success":  # a repository without CI (coordination) has nothing to wait for
+        die(f"not reviewing {repo}#{n}: the Actions run for {sha[:12]} is {state}; you'll be woken when it succeeds")
+    s, reviews = api("GET", f"/repos/{ORG}/{repo}/pulls/{n}/reviews")
+    asked = sum(1 for r in reviews or [] if r["user"]["login"] == ME and r.get("state") == "REQUEST_CHANGES")
+    open_findings = [f for f in findings if f["status"] in ("new", "kept")]
+    if open_findings and asked >= rounds:
+        for f in open_findings:
+            f["status"] = "escalated"
+        s, labels = api("GET", f"/repos/{ORG}/{repo}/labels?limit=100")
+        ids = [l["id"] for l in labels or [] if l["name"] == "needs-human"]
+        api("POST", f"/repos/{ORG}/{repo}/issues/{n}/labels", {"labels": ids})
+        body = ("(no reply needed)\n\n" + render(summary, findings, asked + 1, rounds, escalated=True)
+                + f"\n\nAfter {rounds} rounds these findings are still open, so the human decides them.")
+        s, p = api("POST", f"/repos/{ORG}/{repo}/issues/{n}/comments", {"body": body})
+        if s // 100 != 2:
+            die(f"couldn't escalate {repo}#{n} ({s}): {(p or {}).get('message', '')}")
+        print(f"After {rounds} rounds, {repo}#{n} is labelled needs-human for the human to decide.")
+        return
+    event = "REQUEST_CHANGES" if open_findings else "APPROVED"
+    s, p = api("POST", f"/repos/{ORG}/{repo}/pulls/{n}/reviews",
+               {"event": event, "body": render(summary, findings, asked + 1, rounds), "commit_id": sha})
+    if s // 100 != 2:
+        die(f"couldn't review {repo}#{n} ({s}): {(p or {}).get('message', '')}")
+    print(f"{'Requested changes on' if open_findings else 'Approved'} {repo}#{n} at {sha[:12]}.")
+
+
+def ledger(days):
+    if ME != "process":
+        die("only the process review reads the ledger")
+    import time
+    with open("/run/secrets/runner_key") as f:
+        key = f.read().strip()
+    url = f"{os.environ.get('DISPATCHER_URL', 'http://dispatcher:8080')}/ledger?since={time.time() - days * 86400:.0f}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        sys.stdout.write(r.read().decode())
+
+
 def main(argv):
     if len(argv) >= 3 and argv[0] == "pr" and argv[1] == "automerge":
         n = number(argv[2])
@@ -107,9 +194,21 @@ def main(argv):
         sha, state = ci_state(repo_name(argv[1]), number(argv[2]))
         print(f"{state} ({sha[:12]})")
         sys.exit(0 if state == "success" else 1)
+    elif len(argv) == 4 and argv[0] == "review":
+        review(repo_name(argv[1]), number(argv[2]), argv[3])
+    elif len(argv) == 3 and argv[0] == "reviews":
+        repo, n = repo_name(argv[1]), number(argv[2])
+        s, reviews = api("GET", f"/repos/{ORG}/{repo}/pulls/{n}/reviews")
+        if s != 200:
+            die(f"can't read {repo}#{n}'s reviews ({s})")
+        for r in reviews:
+            print(f"--- {r['user']['login']}: {r.get('state')} at {(r.get('commit_id') or '')[:12]}, {r.get('submitted_at')}")
+            print((r.get("body") or "").strip() + "\n")
+    elif len(argv) in (1, 2) and argv[0] == "ledger":
+        ledger(int(argv[1]) if len(argv) == 2 and argv[1].isdigit() else 30)
     elif len(argv) >= 5 and argv[0] == "pr" and argv[1] == "approve":
-        if ME not in ("coordinator", "conformance"):
-            die("only the coordinator and conformance approve pull requests")
+        if ME != "coordinator":
+            die("only the coordinator approves pull requests this way; conformance uses forge review")
         repo, n, msg = repo_name(argv[2]), number(argv[3]), " ".join(argv[4:])
         sha, state = ci_state(repo, n)
         if state != "success":

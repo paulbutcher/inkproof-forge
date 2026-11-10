@@ -2,7 +2,7 @@
 
 A local forge for the Inkproof agents: Forgejo is canonical, GitHub is a push mirror that nothing polls, and each agent is a Claude Code agent with its own Forgejo account. [requirements.md](requirements.md) sets out what the kit does and how we'll know it works; this README covers running it.
 
-The kit is built in stages. In place so far: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4). Later stages add reviews, autonomy levels 2 and 3, and backups.
+The kit is built in stages. In place so far: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4); and reviews: conformance on every pull request, and architecture, process and Lasm at each milestone's end (stage 5). Later stages add autonomy levels 2 and 3, and backups.
 
 ## Layout
 
@@ -19,7 +19,8 @@ docker/tools/           admin tools (bootstrap, tests) run in a container, not o
 docker/ports/           forwards 127.0.0.1:FORGE_PORT to Forgejo, DISPATCHER_PORT to the dispatcher
 templates/repo/         what every repository needs: CI workflow, request template, pin check
 scripts/                up, down, bootstrap, migrate, mirrors, setup-repo, open, status,
-                        stop-run, pause, resume, notify, notify-install, kit, and each
+                        stop-run, pause, resume, notify, notify-install, milestone,
+                        milestone-diff, kit, and each
                         stage's test
 launchd/                the notifier's launchd job, installed by scripts/notify-install.sh
 tests/fixtures/         small Lean packages for the CI tests
@@ -87,6 +88,19 @@ Day to day:
 - **Pause.** `scripts/pause.sh` stops everything: no run starts, a run under way is refused its next tool call and ends, every scheduled merge is cancelled and recorded in `control/paused-merges.json`, and only you may merge. Your own sessions in agent containers still work. `scripts/resume.sh` restores the merge lists, reschedules those merges in your name, and lets agents start again.
 - **Notifications.** Forgejo shows the dispatcher's mentions in its notifications. For macOS notifications too, run `scripts/notify-install.sh` once: a launchd job then shows each new notice every minute (`needs-human`, a `blocking` upstream issue, a reached cap, a run the extension doesn't list), and nothing routine. `scripts/notify-install.sh --remove` takes it out.
 - **Status.** `scripts/status.sh` shows each agent's state (idle, running, human active, paused or capped), its waiting work and spend today, recent runs, your sessions and notices, then open requests, pull requests, recommendations and `needs-human` items across the project.
+
+### Reviews
+
+Four reviewers run as agents of their own. They own no repository and never push; each reads every repository.
+
+- **Conformance, on every pull request.** `conformance` is a code owner of every path and on every approvals list, so a pull request merges only once it approves (and, at level 1, you do). It reviews a pull request's head once CI has passed and no newer commit has come for 10 minutes (`CONFORMANCE_SETTLE_SECONDS`), against the base branch's `CLAUDE.md` and the protocol, and names the section each finding breaks. The author fixes each finding or replies with a reason, and `conformance` looks again. After 3 rounds (`CONFORMANCE_ROUNDS`) it labels the pull request `needs-human` instead, and you decide. Each review ends with a record of its findings, which the process review reads.
+- **At the end of a milestone,** run `scripts/milestone.sh "<name>"`. It opens a milestone issue on `inkproof-coordination` with every `API.lock` change since the last one (`scripts/milestone-diff.sh` shows the same without opening anything), labelled `milestone-review`, which starts three reviews:
+  - `architecture`: boundaries between libraries, coupling and cohesion, and workarounds for limitations that should be fixed instead;
+  - `process`: how the agents work, from the run ledger, the run archive (your own sessions included) and conformance's findings;
+  - `lasm`: Lasm bugs and improvements, each with a reproduction. It also reviews any upstream issue labelled `upstream:lasm` as soon as it's marked `blocking`.
+- **Recommendations** are issues on `inkproof-coordination` labelled `recommendation`, `review:<kind>` and `needs-human`; each review also posts one report on the milestone issue, and you get one notice per report rather than one per recommendation. Close each recommendation you accept. To reject one, add `declined`, say why in a comment, and close it: reviewers don't raise a declined recommendation again without new evidence. Reviewers propose; changing the kit, a role or `CLAUDE.md` is yours.
+
+Turning reviews on for a repository is part of `scripts/setup-repo.sh <repository> 1`: re-run it for each repository, and merge the pull request it opens, which adds `conformance` to `.forgejo/CODEOWNERS`.
 
 ### The same checkout in the dev container
 

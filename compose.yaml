@@ -205,6 +205,7 @@ services:
       MAX_DELAY_SECONDS: ${MAX_DELAY_SECONDS:-900}
       MAX_SPEND_PER_DAY: ${MAX_SPEND_PER_DAY:-0}
       RECONCILE_SECONDS: ${RECONCILE_SECONDS:-900}
+      CONFORMANCE_SETTLE_SECONDS: ${CONFORMANCE_SETTLE_SECONDS:-600}
       REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
     volumes:
       # webhook-secret, and token once scripts/bootstrap.sh has made it.
@@ -219,7 +220,7 @@ services:
   archive-init:
     image: alpine:3.24
     network_mode: none
-    entrypoint: ["sh", "-c", "for a in coordinator core scale consumer-metrics; do mkdir -p /archive/$$a; chown ${HOST_UID:-501}:${HOST_GID:-20} /archive/$$a; done"]
+    entrypoint: ["sh", "-c", "for a in coordinator core scale consumer-metrics conformance architecture process lasm; do mkdir -p /archive/$$a; chown ${HOST_UID:-501}:${HOST_GID:-20} /archive/$$a; done"]
     volumes:
       - run-archive:/archive
 
@@ -351,6 +352,144 @@ services:
         target: /var/lib/inkproof/archive
         volume: { subpath: consumer-metrics }
 
+  # Reviewers own no repository; each reads them all.
+  conformance:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: conformance
+        AGENT_REPO: "-"
+    image: inkproof-agent-conformance:1
+    hostname: conformance
+    environment:
+      <<: *agent-env
+      AGENT_NAME: conformance
+      AGENT_REPO: ""
+      AGENT_WORKSPACE: /workspace/conformance
+      AGENT_READS: inkproof-coordination,inkproof-core,inkproof-scale,inkproof-consumer-metrics
+      CONFORMANCE_ROUNDS: ${CONFORMANCE_ROUNDS:-3}
+      GIT_AUTHOR_NAME: conformance
+      GIT_AUTHOR_EMAIL: conformance@noreply.localhost
+      GIT_COMMITTER_NAME: conformance
+      GIT_COMMITTER_EMAIL: conformance@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/conformance/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/conformance:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-conformance:/workspace
+      - claude-conformance:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: conformance }
+
+  architecture:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: architecture
+        AGENT_REPO: "-"
+    image: inkproof-agent-architecture:1
+    hostname: architecture
+    environment:
+      <<: *agent-env
+      AGENT_NAME: architecture
+      AGENT_REPO: ""
+      AGENT_WORKSPACE: /workspace/architecture
+      AGENT_READS: inkproof-coordination,inkproof-core,inkproof-scale,inkproof-consumer-metrics
+      CONFORMANCE_ROUNDS: ${CONFORMANCE_ROUNDS:-3}
+      GIT_AUTHOR_NAME: architecture
+      GIT_AUTHOR_EMAIL: architecture@noreply.localhost
+      GIT_COMMITTER_NAME: architecture
+      GIT_COMMITTER_EMAIL: architecture@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/architecture/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/architecture:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-architecture:/workspace
+      - claude-architecture:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: architecture }
+
+  process:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: process
+        AGENT_REPO: "-"
+    image: inkproof-agent-process:1
+    hostname: process
+    environment:
+      <<: *agent-env
+      AGENT_NAME: process
+      AGENT_REPO: ""
+      AGENT_WORKSPACE: /workspace/process
+      AGENT_READS: inkproof-coordination,inkproof-core,inkproof-scale,inkproof-consumer-metrics
+      CONFORMANCE_ROUNDS: ${CONFORMANCE_ROUNDS:-3}
+      GIT_AUTHOR_NAME: process
+      GIT_AUTHOR_EMAIL: process@noreply.localhost
+      GIT_COMMITTER_NAME: process
+      GIT_COMMITTER_EMAIL: process@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/process/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/process:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-process:/workspace
+      - claude-process:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: process }
+      # Every agent's runs and the human's sessions, for the process review.
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive-all
+        read_only: true
+
+  lasm:
+    <<: *agent
+    build:
+      <<: *agent-build
+      args:
+        <<: *agent-args
+        AGENT: lasm
+        AGENT_REPO: "-"
+    image: inkproof-agent-lasm:1
+    hostname: lasm
+    environment:
+      <<: *agent-env
+      AGENT_NAME: lasm
+      AGENT_REPO: ""
+      AGENT_WORKSPACE: /workspace/lasm
+      AGENT_READS: inkproof-coordination,inkproof-core,inkproof-scale,inkproof-consumer-metrics
+      CONFORMANCE_ROUNDS: ${CONFORMANCE_ROUNDS:-3}
+      GIT_AUTHOR_NAME: lasm
+      GIT_AUTHOR_EMAIL: lasm@noreply.localhost
+      GIT_COMMITTER_NAME: lasm
+      GIT_COMMITTER_EMAIL: lasm@noreply.localhost
+    volumes:
+      - ${STATE_DIR:-.}/secrets/lasm/token:/run/secrets/forgejo_token:ro
+      - ${STATE_DIR:-.}/secrets/runner-keys/lasm:/run/secrets/runner_key:ro
+      - ${STATE_DIR:-.}/control:/etc/inkproof/control:ro
+      - work-lasm:/workspace
+      - claude-lasm:/home/agent/.claude
+      - agent-elan:/home/agent/.elan
+      - type: volume
+        source: run-archive
+        target: /var/lib/inkproof/archive
+        volume: { subpath: lasm }
+
   # The image CI jobs run in. Built here and loaded into ci-docker by
   # scripts/up.sh, so the CI engine never pulls from a registry.
   ci-image:
@@ -431,5 +570,13 @@ volumes:
   claude-scale:
   work-consumer-metrics:
   claude-consumer-metrics:
+  work-conformance:
+  claude-conformance:
+  work-architecture:
+  claude-architecture:
+  work-process:
+  claude-process:
+  work-lasm:
+  claude-lasm:
   agent-elan:
   run-archive:
