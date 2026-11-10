@@ -18,7 +18,8 @@ rt=(docker compose -p inkproof-restore-test -f docker/restore-test/compose.yaml)
 cleanup() { [ "${KEEP:-}" = 1 ] || "${rt[@]}" down -v --remove-orphans >/dev/null 2>&1 || true; }
 "${rt[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 trap cleanup EXIT
-docker volume create inkproof-restore-test_forgejo-data >/dev/null
+docker volume create --label com.docker.compose.project=inkproof-restore-test --label com.docker.compose.volume=forgejo-data \
+  inkproof-restore-test_forgejo-data >/dev/null
 
 # The same step as scripts/restore.sh, into the throwaway volume.
 docker run --rm --user 0 --network none --entrypoint restore-volumes \

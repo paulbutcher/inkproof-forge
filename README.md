@@ -2,7 +2,7 @@
 
 A local forge for the Inkproof agents: Forgejo is canonical, GitHub is a push mirror that nothing polls, and each agent is a Claude Code agent with its own Forgejo account. [requirements.md](requirements.md) sets out what the kit does and how we'll know it works; this README covers running it.
 
-The kit is built in stages. In place so far: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4); and reviews: conformance on every pull request, and architecture, process and Lasm at each milestone's end (stage 5); autonomy level 2, where the gatekeeper approves on CI (stage 6); and releases, and level 3, where the coordinator approves API changes and releases through the gatekeeper (stage 7). The last stage adds backups.
+The kit was built in stages: Forgejo, CI, the egress proxies and the bootstrap (stage 1); the migration from GitHub and the mirrors back (stage 2); and the first agent, `core`, at autonomy level 1, with its runner, the dispatcher's queue and run ledger, and VS Code (stage 3); every library agent and the coordinator, every trigger, caps, pause and resume, status and notifications (stage 4); and reviews: conformance on every pull request, and architecture, process and Lasm at each milestone's end (stage 5); autonomy level 2, where the gatekeeper approves on CI (stage 6); and releases, and level 3, where the coordinator approves API changes and releases through the gatekeeper (stage 7); and daily backups, whose history Time Machine keeps (stage 8).
 
 ## Layout
 
@@ -124,6 +124,21 @@ At level 2 an ordinary pull request merges without you: `gatekeeper` approves it
 - **Releases.** When an issue is labelled `ready-for-release`, the coordinator checks the work and runs `forge release <repository> "<note>" <issue>...`. That asks the gatekeeper, which computes and checks the version exactly as `scripts/release.sh` does, then tags and publishes as `gatekeeper`. Only the gatekeeper and you may create tags, and it releases only libraries at level 3, never while paused.
 - **Mixed levels.** A level-3 library can depend on one below level 3. That one's releases stay yours; its consumers wait on them with a `Blocked-by:` line, and are woken when you release.
 - **Who can ask.** The gatekeeper answers the coordinator only: they share a network no other agent joins, and each request carries a key only the coordinator's container holds (`secrets/gatekeeper/coordinator-key`).
+
+### Backups
+
+Forgejo, the run ledger and the run archive live in Docker volumes, inside Docker Desktop's disk image, which Time Machine doesn't usefully back up. `scripts/backup.sh` copies them into the kit's folder, so Time Machine picks the copies up with everything else here, `secrets/` included.
+
+1. Check that Time Machine covers this folder: it isn't in Time Machine's "Exclude from Backups" list.
+2. Run `scripts/backup-install.sh` once. A launchd job then runs `scripts/backup.sh` daily at 03:30, or when the Mac next wakes, as long as Docker Desktop is running. If a backup fails, you get a notification; the log is `control/backup.log`. `scripts/backup-install.sh --remove` takes it out.
+3. Now and then, run `scripts/restore-test.sh`. It restores the newest backup into a throwaway Forgejo of its own, which can reach nothing, so it can't push old refs to GitHub. It compares the copy's repositories, refs, issues, pull requests and comments with what the live Forgejo held while the backup was made. With `KEEP=1` it leaves the copy running on `127.0.0.1:3002` for you to look at.
+
+- **What a backup holds.** Each is a folder in `backups/` (`BACKUP_DIR`), named by its UTC time, and readable by you only, because it holds tokens' hashes, Forgejo's own secrets and transcripts.
+  - `forgejo.tar.gz`, from `forgejo dump`: the repositories, the database as SQL, attachments and Forgejo's configuration.
+  - `ledger.db`, the run ledger.
+  - `run-archive.tar.gz`, every run's and session's log and transcript.
+- **How long they're kept.** The newest 7 stay (`BACKUP_KEEP`); Time Machine keeps the history beyond that.
+- **Restoring.** `scripts/restore.sh backups/<time>` replaces Forgejo, the ledger and the run archive with that backup, after you type `restore` to confirm, then starts the kit again. It first keeps a raw copy of the current Forgejo data beside the backups. Use it when Docker's volumes are lost, after a Docker Desktop reset for example, or on a new Mac. `secrets/` must be the kit's own, from Time Machine on a new Mac, because Forgejo keeps only the tokens' hashes. Anything since the backup is lost from Forgejo, though GitHub's mirrors may have the latest commits.
 
 ### The same checkout in the dev container
 

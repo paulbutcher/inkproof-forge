@@ -187,6 +187,15 @@ Forgejo has no email without SMTP. The dispatcher records a notice for every `ne
 
 `scripts/backup.sh` runs `forgejo dump` daily from a host launchd job, plus copies of the dispatcher's ledger and the run archive, into `BACKUP_DIR` (default `backups/`, outside every volume), keeping the last N. `scripts/restore.sh` restores a dump into a fresh volume. `scripts/restore-test.sh` restores the latest dump into a throwaway compose project on another port and compares repositories, refs, issues, pull requests and comments with the live instance.
 
+Decided with the human (2026-11-10): Time Machine already backs up the Mac, so the dumps go into the kit's folder, which it covers, and it keeps their history; `BACKUP_KEEP` (default 7) only bounds the disk they take. Bind-mounting the live volumes for Time Machine was rejected: SQLite over Docker Desktop's file sharing is slow and has a history of locking trouble, a crash-consistent copy is never checked, and a dump is portable to another machine or a later Forgejo.
+
+What each part does, as built:
+
+- **The dump.** `forgejo dump` holds the database twice: as SQL, written consistently, and as a raw copy of the live SQLite file, which may be mid-write. A restore rebuilds the database from the SQL, and leaves out queues, indexes and temporary files, which Forgejo rebuilds. The ledger is copied with SQLite's online backup. Backups are readable by the human only.
+- **What "compares" means.** `scripts/backup.sh` records a snapshot of Forgejo (`kit snapshot`) just before and just after the dump: every repository, every branch and tag with its commit, and every issue and pull request with its title, state and comment count. `scripts/restore-test.sh` takes the same snapshot of the restored copy. Everything that stood still between the two live snapshots must match exactly, and anything that changed during the backup is skipped and counted.
+- **The throwaway copy can reach nothing.** It is on an internal network, with mirrors, webhooks and Actions off, so it can't push the backup's old refs to GitHub. Its own port, `RESTORE_TEST_PORT` (3002), is for the human to look at it.
+- **Restoring for real.** `scripts/restore.sh` asks for confirmation, keeps a raw copy of the current Forgejo data, and restores into fresh volumes. It needs the kit's own `secrets/`, because Forgejo keeps only the tokens' hashes.
+
 ## Repository layout
 
 ```
