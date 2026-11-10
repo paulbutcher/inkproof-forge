@@ -55,7 +55,7 @@ Requests are open issues labelled `request` and `new`. For each one, remove `new
 - **Reject**: comment with your reasons and close the issue as not planned. Protecting the cohesion of your project is a valid reason.
 - **Escalate**: add `needs-human` and wait for the human when the decision is theirs: a question or trade-off that needs their judgement; a change to `CLAUDE.md`, `.forgejo/`, `lean-toolchain` or `REQUIREMENTS.md`; or, below autonomy level 3, a change to `API.lock`.
 
-When the work is merged and `CHANGELOG.md` on `main` has its entry for the next release (see Definition of done), add `ready-for-release` and comment with the pull request's link. At autonomy level 3 the coordinator verifies and releases it, and the release tag is commented on the issue for you; otherwise, after the human releases it, comment with the release tag. The requester then upgrades, checks the acceptance criteria, adds `verified` and closes the issue.
+When the work is merged and `CHANGELOG.md` on `main` has its entry for the next release (see Definition of done), add `ready-for-release` and comment with the pull request's link. Your run usually ends before an auto-merge lands; a run starts for you when a pull request of yours merges while a request it names with `Refs` is still open without `ready-for-release`, so do this step then. At autonomy level 3 the coordinator verifies and releases it, and the release tag is commented on the issue for you; otherwise, after the human releases it, comment with the release tag. The requester then upgrades, checks the acceptance criteria, adds `verified` and closes the issue.
 
 ## Requirements
 

@@ -135,8 +135,8 @@ Blocked-by: $ORG/$COORDINATION#$up")"
     '{action: "published", release: {tag_name: $t}, repository: $r, sender: {login: $h}}')"
   fake_hook action_run_failure "$(jq -nc --argjson r "$(repo_json "$S4_LIB")" --argjson n "$pr" \
     --arg p "$(jq -nc --argjson n "$pr" '{pull_request: {number: $n, user: {login: "core"}}}')" \
-    '{action: "failure", run: {event: "pull_request", commit_sha: "stage4fake000", event_payload: $p},
-      repository: $r, sender: {login: "ci"}}')"
+    '{action: "failure", run: {event: "pull_request", commit_sha: "stage4fake000", event_payload: $p,
+      repository: $r, trigger_user: {login: "core"}}}')"
   fake_hook push "$(jq -nc --argjson r "$(repo_json "$S4_LIB")" --arg h "$HUMAN_USER" \
     '{ref: "refs/heads/main", after: "", repository: $r, sender: {login: $h}}')"
   fake_hook issues "$(jq -nc --argjson r "$(repo_json "$S4_DEP")" \

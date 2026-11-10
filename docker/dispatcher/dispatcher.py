@@ -13,6 +13,8 @@ needs them.
   POST /admin/drop           drop an agent's pending triggers (Bearer: admin key)
   POST /admin/reconcile      reconcile now (Bearer: admin key)
   GET  /status               agents, queues, recent runs, sessions, notices
+  GET  /activity?after=T     events, queued work, runs, sessions and notices
+                             after epoch T, for activity.sh
   GET  /notices.txt?after=N  notices after id N, one per line, for notify.sh
   GET  /healthz
 
@@ -40,6 +42,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -156,15 +159,28 @@ CREATE INDEX IF NOT EXISTS triggers_pending ON triggers (agent, run_id);
 CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
 """)
-try:
-    DB.execute("ALTER TABLE triggers ADD COLUMN not_before REAL")  # ledgers from before stage 5
-except sqlite3.OperationalError:
-    pass
+for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
+               "events ADD COLUMN detail TEXT"):     # ledgers from before the activity stream
+    try:
+        DB.execute(f"ALTER TABLE {column}")
+    except sqlite3.OperationalError:
+        pass
 
 
 def q(sql, *args):
     with LOCK:
         return DB.execute(sql, args).fetchall()
+
+
+# Once: conformance reviews that the reconciler dropped by mistake (before
+# this was fixed, it dropped a review still settling, which `once` then never
+# queued again). Renamed rather than deleted, so the history stays, they no
+# longer stop the reconciler queueing the review again where it's still due.
+if not q("SELECT 1 FROM kv WHERE key='repaired-conformance-drops'"):
+    with LOCK:
+        DB.execute("UPDATE triggers SET key = key || ':dropped' WHERE key LIKE 'conf:%' AND run_id=-1 "
+                   "AND key NOT LIKE '%:dropped'")
+        DB.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('repaired-conformance-drops', '1')")
 
 
 def kv_get(key, default=None):
@@ -359,11 +375,17 @@ def queue_conformance(repo, n, sha=None):
     head = pr["head"]["sha"]
     if pr["state"] != "open" or wip(pr.get("title")) or (sha and sha != head):
         return
-    drop_pending(REVIEWER, f"conf:{repo}#{n}:")
+    key = f"conf:{repo}#{n}:{head[:12]}"
+    # Reviews waiting for an older head are superseded. The one for this head
+    # stays: dropping it would end it for good, since it's queued only once,
+    # and the reconciler calls this for every open pull request.
+    q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL AND key LIKE ? AND key<>?",
+      REVIEWER, f"conf:{repo}#{n}:%", key)
     if any(r["user"]["login"] == REVIEWER and r.get("commit_id") == head
            for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
+        drop_pending(REVIEWER, key)
         return
-    add_trigger(REVIEWER, f"conf:{repo}#{n}:{head[:12]}", f"review pull request {repo}#{n} at {head[:12]}",
+    add_trigger(REVIEWER, key, f"review pull request {repo}#{n} at {head[:12]}",
                 once=True, not_before=now() + SETTLE)
 
 
@@ -398,6 +420,51 @@ def queue_coordinator_review(repo, n, sha=None):
         return
     add_trigger(COORDINATOR, f"review-requested:{repo}#{n}:{head[:12]}",
                 f"review requested from you on pull request {repo}#{n}, whose CI passed at {head[:12]}", once=True)
+
+
+REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
+REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
+
+
+def requests_awaiting_release(repo, pr):
+    """The open requests on repo that a merged pull request refers to with
+    `Refs` (in its description or its commits) and that aren't yet labelled
+    ready-for-release: their owner has that step still to do."""
+    texts = [pr.get("body") or ""]
+    try:
+        texts += [(c.get("commit") or {}).get("message") or ""
+                  for c in forge_list(f"/repos/{ORG}/{repo}/pulls/{pr['number']}/commits")]
+    except Exception as e:
+        log(f"reading {repo}#{pr['number']}'s commits failed: {e!r}")
+    numbers = set()
+    for text in texts:
+        for line in REFS.findall(text):
+            for org, r, k in REF.findall(line):
+                if (not org or (org.lower() == ORG.lower() and r == repo)) and int(k) != pr["number"]:
+                    numbers.add(int(k))
+    found = []
+    for k in sorted(numbers):
+        try:
+            issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{k}") or {}
+        except Exception:
+            continue
+        labels = {l["name"] for l in issue.get("labels") or []}
+        if (issue.get("state") == "open" and not issue.get("pull_request")
+                and "request" in labels and "ready-for-release" not in labels):
+            found.append(k)
+    return found
+
+
+def wake_after_merge(repo, owner, pr):
+    if not owner or (pr.get("user") or {}).get("login") != owner:
+        return
+    waiting = requests_awaiting_release(repo, pr)
+    if waiting:
+        n = pr["number"]
+        refs = ", ".join(f"{repo}#{k}" for k in waiting)
+        add_trigger(owner, f"merged:{repo}#{n}",
+                    f"your pull request {repo}#{n} merged; it answers {refs}, not yet labelled ready-for-release",
+                    once=True)
 
 
 def conformance_wants_changes(repo, n):
@@ -485,8 +552,12 @@ def handle(event, payload):
         review = payload.get("review") or {}
         n = pr.get("number")
         rejected = "rejected" in event or review.get("type") == "pull_request_review_rejected"
+        approved = "approved" in event or review.get("type") == "pull_request_review_approved"
+        content = review.get("content") or ""
+        # A bare approval asks nothing of the author: its scheduled merge goes ahead.
+        asks = wants_reply(content) and not (approved and not content.strip())
         if (owner and trusted and sender != owner and (pr.get("user") or {}).get("login") == owner
-                and pr.get("state") == "open" and (rejected or wants_reply(review.get("content")))):
+                and pr.get("state") == "open" and (rejected or asks)):
             what = "changes requested on" if rejected else "review on"
             add_trigger(owner, f"review:{repo}#{n}:{payload.get('_delivery')}", f"{what} pull request {repo}#{n}")
 
@@ -499,6 +570,10 @@ def handle(event, payload):
             drop_pending(REVIEWER, f"conf:{repo}#{n}:")  # a newer head supersedes the waiting review
         if not has_ci(repo) and action in ("opened", "reopened", "synchronized"):
             queue_conformance(repo, n)  # nothing to wait for: no CI here
+        # Auto-merge lands after the owner's run has ended: wake it to finish
+        # the requests the pull request answers (CHANGELOG.md, ready-for-release).
+        if action == "closed" and pr.get("merged"):
+            wake_after_merge(repo, owner, pr)
         if not coord:
             return
         if action == "opened":
@@ -566,6 +641,12 @@ def reconcile():
                 if mine and mine[0].get("status") == "failure":
                     add_trigger(owner, f"ci-failed:{repo}#{pr['number']}:{sha[:12]}",
                                 f"CI failed on pull request {repo}#{pr['number']}", once=True)
+            # Merges a missed webhook would have lost.
+            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=closed&sort=recentupdate", limit=20):
+                merged = pr.get("merged_at")
+                if (pr.get("merged") and merged and pr["user"]["login"] == owner
+                        and now() - datetime.fromisoformat(merged.replace("Z", "+00:00")).timestamp() < RECONCILE * 2):
+                    wake_after_merge(repo, owner, pr)
             check_behind(repo)
         except Exception as e:
             log(f"reconciling {repo} failed: {e!r}")
@@ -723,6 +804,144 @@ def notices_text(after):
     return "\n".join(out) + ("\n" if out else "")
 
 
+# --- Activity -------------------------------------------------------------------
+
+def event_detail(event_type, payload, repo, number):
+    """What the activity stream says about an event beyond its type: read
+    from the payload when it arrives, since payloads aren't all kept."""
+    d = {}
+    item = payload.get("pull_request") or payload.get("issue") or {}
+    if item.get("title"):
+        d["title"] = " ".join(item["title"].split())[:80]
+    if event_type in ("issue_label", "pull_request_label") and number:
+        labels = {l["name"] for l in item.get("labels") or []}
+        with LOCK:
+            row = DB.execute("SELECT labels FROM labels WHERE repo=? AND number=?", (repo, number)).fetchone()
+        if row:
+            before = set(json.loads(row["labels"]))
+            d["added"], d["removed"] = sorted(labels - before), sorted(before - labels)
+        else:
+            d["labels"] = sorted(labels)
+    if payload.get("pull_request") and payload.get("action") == "closed":
+        d["merged"] = bool(payload["pull_request"].get("merged"))
+    if payload.get("requested_reviewer"):
+        d["reviewer"] = payload["requested_reviewer"].get("login")
+    if payload.get("comment"):
+        d["no_reply"] = not wants_reply(payload["comment"].get("body"))
+    if event_type.startswith("pull_request_review") and isinstance(payload.get("review"), dict):
+        d["no_reply"] = not wants_reply(payload["review"].get("content"))
+    if payload.get("ref"):
+        d["ref"] = payload["ref"].removeprefix("refs/heads/").removeprefix("refs/tags/")
+        if payload.get("ref_type"):
+            d["ref_type"] = payload["ref_type"]
+        if "total_commits" in payload or "commits" in payload:
+            d["commits"] = payload.get("total_commits") or len(payload.get("commits") or [])
+    if (payload.get("release") or {}).get("tag_name"):
+        d["tag"] = payload["release"]["tag_name"]
+    run = payload.get("run")
+    if isinstance(run, dict):
+        d["sha"] = (run.get("commit_sha") or "")[:12]
+        d["workflow"] = run.get("workflow_id")
+        try:
+            d["pr"] = (json.loads(run.get("event_payload") or "{}").get("pull_request") or {}).get("number")
+        except ValueError:
+            pass
+        if not d.get("pr"):
+            d["ref"] = run.get("prettyref") or ""
+    return d
+
+
+def describe_event(e):
+    d = json.loads(e["detail"] or "{}")
+    t, a, repo, n = e["type"], e["action"], e["repo"] or "?", e["number"]
+    where = f"{repo}#{n}" if n else repo
+    title = f" “{d['title']}”" if d.get("title") else ""
+    quiet = " (no reply needed)" if d.get("no_reply") else ""
+    if t == "push":
+        c = d.get("commits")
+        return f"pushed {c} commit{'' if c == 1 else 's'} to {repo} {d.get('ref', '')}" if c is not None else f"pushed to {repo}"
+    if t in ("create", "delete"):
+        if not d.get("ref"):
+            return f"{t}d a branch or tag in {repo}"
+        return f"{t}d {d.get('ref_type', 'ref')} {repo} {d['ref']}"
+    if t == "issues":
+        return f"{a} issue {where}{title if a == 'opened' else ''}"
+    if t in ("issue_label", "pull_request_label"):
+        if "labels" in d:
+            return f"labels on {where}: {', '.join(d['labels']) or 'none'}"
+        changes = [f"+{l}" for l in d.get("added", [])] + [f"-{l}" for l in d.get("removed", [])]
+        return f"labelled {where}: {' '.join(changes)}" if changes else f"labelled {where}"
+    if t == "pull_request_review_request":
+        if not d.get("reviewer"):
+            return f"requested a review on {where}"
+        return f"asked {'you' if d['reviewer'] == HUMAN else d['reviewer']} to review {where}"
+    if t == "pull_request_sync":
+        return f"pushed to pull request {where}"
+    if t == "pull_request":
+        if a == "closed":
+            if "merged" not in d:
+                return f"closed pull request {where}"
+            return f"merged pull request {where}{title}" if d["merged"] else f"closed pull request {where} unmerged"
+        return f"{a} pull request {where}{title if a == 'opened' else ''}"
+    if t == "pull_request_review_approved":
+        return f"approved {where}{quiet}"
+    if t == "pull_request_review_rejected":
+        return f"requested changes on {where}"
+    if t in ("pull_request_review_comment", "pull_request_comment", "issue_comment"):
+        return f"commented on {where}{quiet}"
+    if t in ("action_run_success", "action_run_failure"):
+        on = f"{repo}#{d['pr']}" if d.get("pr") else f"{repo} {d.get('ref', '')}".strip()
+        on = f" on {on}" if e["repo"] else ""  # runs recorded before their repository was
+        sha = f" at {d['sha']}" if d.get("sha") else ""
+        return f"CI {'passed' if t.endswith('success') else 'failed'}{on}{sha}"
+    if t == "release":
+        return f"released {repo} {d['tag']}" if d.get("tag") else f"published a release of {repo}"
+    return f"{t} {a or ''} {where}".replace("  ", " ")
+
+
+def activity(after=0.0, limit=40, tz=0):
+    """The kit's activity, oldest first: Forgejo events, queued work, runs,
+    the human's sessions and notices. Entries after `after` (epoch seconds),
+    at most `limit`, the newest kept; tz is the reader's offset in seconds,
+    for the times inside entries."""
+    def hm(t):
+        return time.strftime("%H:%M", time.gmtime(t + tz))
+    you = lambda who: "you" if who == HUMAN else (who or "?")
+    out = []
+    for e in q("SELECT * FROM events WHERE at>? ORDER BY at DESC LIMIT ?", after, limit):
+        who = "ci" if e["type"].startswith("action_run") else you(e["sender"])
+        out.append({"id": f"e{e['id']}", "at": e["at"], "who": who, "text": describe_event(e)})
+    for t in q("SELECT * FROM triggers WHERE created>? ORDER BY created DESC LIMIT ?", after, limit):
+        wait = f" (from {hm(t['not_before'])})" if t["not_before"] and t["not_before"] > t["created"] + 1 else ""
+        out.append({"id": f"t{t['id']}", "at": t["created"], "who": t["agent"], "text": f"queued: {t['description']}{wait}"})
+    for r in q("SELECT * FROM runs WHERE claimed>? OR ended>? ORDER BY id DESC LIMIT ?", after, after, limit):
+        if r["claimed"] and r["claimed"] > after:
+            out.append({"id": f"r{r['id']}s", "at": r["claimed"], "who": r["agent"],
+                        "text": f"run {r['id']} started: {'; '.join(json.loads(r['triggers'] or '[]'))}"})
+        if r["ended"] and r["ended"] > after:
+            bits = [r["outcome"] or "ended"]
+            if r["cost"] is not None:
+                bits.append(f"${r['cost']:.2f}")
+            if r["forge_changes"] is not None:
+                bits.append(f"{r['forge_changes']} Forgejo change{'' if r['forge_changes'] == 1 else 's'}")
+            denied = len(json.loads(r["denied"] or "[]"))
+            if denied:
+                bits.append(f"{denied} denied")
+            out.append({"id": f"r{r['id']}e", "at": r["ended"], "who": r["agent"],
+                        "text": f"run {r['id']} ended: {', '.join(bits)}"})
+    for s in q("SELECT * FROM sessions WHERE started>? OR ended>? ORDER BY id DESC LIMIT ?", after, after, limit):
+        if s["started"] and s["started"] > after:
+            out.append({"id": f"s{s['id']}s", "at": s["started"], "who": "you",
+                        "text": f"session started in {s['agent']}'s container: {s['agent']} starts no run while you're active"})
+        if s["ended"] and s["ended"] > after:
+            out.append({"id": f"s{s['id']}e", "at": s["ended"], "who": "you", "text": f"session ended in {s['agent']}'s container"})
+    for n in q("SELECT * FROM notices WHERE at>? ORDER BY id DESC LIMIT ?", after, limit):
+        where = f"{n['repo']}#{n['number']}" if n["number"] else (n["repo"] or "")
+        out.append({"id": f"n{n['id']}", "at": n["at"], "who": "kit", "text": f"notice for you ({n['kind']}): {where}"})
+    out.sort(key=lambda x: x["at"])
+    return out[-limit:]
+
+
 # --- HTTP -----------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -821,14 +1040,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, {"error": "not JSON"})
         event = self.headers.get("X-Forgejo-Event") or "?"
         event_type = self.headers.get("X-Forgejo-Event-Type") or event
+        run = payload.get("run")
+        if isinstance(run, dict):
+            # An Actions run carries its repository inside the run, and has no sender.
+            payload.setdefault("repository", run.get("repository") or {})
+            payload.setdefault("sender", {"login": "ci"})
         delivery = "".join(c for c in (self.headers.get("X-Forgejo-Delivery") or str(time.time_ns()))
                            if c.isalnum() or c == "-")
         repo = (payload.get("repository") or {}).get("name")
         sender = (payload.get("sender") or {}).get("login")
         number = (payload.get("issue") or payload.get("pull_request") or {}).get("number")
         t = now()
-        q("INSERT INTO events (at, event, type, action, repo, sender, number, delivery) VALUES (?,?,?,?,?,?,?,?)",
-          t, event, event_type, payload.get("action"), repo, sender, number, delivery)
+        try:
+            detail = json.dumps(event_detail(event_type, payload, repo, number))
+        except Exception as e:
+            detail = None
+            log(f"couldn't summarise a {event_type} event: {e!r}")
+        q("INSERT INTO events (at, event, type, action, repo, sender, number, delivery, detail) "
+          "VALUES (?,?,?,?,?,?,?,?,?)",
+          t, event, event_type, payload.get("action"), repo, sender, number, delivery, detail)
         self.save(delivery, body, {"at": iso(t), "event": event, "type": event_type, "delivery": delivery,
                                    "repo": repo, "action": payload.get("action"), "sender": sender, "number": number})
         payload["_delivery"] = delivery
@@ -869,6 +1099,10 @@ class Handler(BaseHTTPRequestHandler):
                         for s in q("SELECT * FROM sessions WHERE COALESCE(started, ended)>=? ORDER BY id", since)]
             notices = [dict(n, at=iso(n["at"])) for n in q("SELECT * FROM notices WHERE at>=? ORDER BY id", since)]
             return self.reply(200, {"runs": runs, "sessions": sessions, "notices": notices})
+        if url.path == "/activity":
+            qs = urllib.parse.parse_qs(url.query)
+            arg = lambda k, d: (qs.get(k) or [d])[0] or d
+            return self.reply(200, activity(float(arg("after", "0")), int(arg("limit", "40")), int(arg("tz", "0"))))
         if url.path == "/notices.txt":
             after = int((urllib.parse.parse_qs(url.query).get("after") or ["0"])[0] or 0)
             return self.reply_text(200, notices_text(after))

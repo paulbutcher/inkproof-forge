@@ -18,7 +18,7 @@ roles/                  each agent's role, which comes before the protocol in it
 docker/tools/           admin tools (bootstrap, tests) run in a container, not on the host
 docker/ports/           forwards 127.0.0.1:FORGE_PORT to Forgejo, DISPATCHER_PORT to the dispatcher
 templates/repo/         what every repository needs: CI workflow, request template, pin check
-scripts/                up, down, bootstrap, migrate, mirrors, setup-repo, open, status,
+scripts/                up, down, bootstrap, migrate, mirrors, setup-repo, open, status, activity,
                         stop-run, pause, resume, notify, notify-install, milestone,
                         milestone-diff, kit, and each
                         stage's test
@@ -88,6 +88,7 @@ Day to day:
 - **Pause.** `scripts/pause.sh` stops everything: no run starts, a run under way is refused its next tool call and ends, every scheduled merge is cancelled and recorded in `control/paused-merges.json`, and only you may merge. Your own sessions in agent containers still work. `scripts/resume.sh` restores the merge lists, reschedules those merges in your name, and lets agents start again.
 - **Notifications.** Forgejo shows the dispatcher's mentions in its notifications. For macOS notifications too, run `scripts/notify-install.sh` once: a launchd job then shows each new notice every minute (`needs-human`, a `blocking` upstream issue, a reached cap, a run the extension doesn't list), and nothing routine. `scripts/notify-install.sh --remove` takes it out.
 - **Status.** `scripts/status.sh` shows each agent's state (idle, running, human active, paused or capped), its waiting work and spend today, recent runs, your sessions and notices, then open requests, pull requests, recommendations and `needs-human` items across the project.
+- **Activity.** `scripts/activity.sh` follows what's happening, a line each, in your time zone: pushes, pull requests, reviews, labels, CI results and releases from Forgejo, with who did them; work queued for an agent and why; runs starting and ending, with their outcome and cost; your sessions in agent containers, during which that agent starts no run; and notices. It shows the last 40 entries and then follows until Ctrl-C. `-n 200` shows more first, `--once` doesn't follow, and a word keeps only the lines containing it: `scripts/activity.sh scale`.
 
 ### Reviews
 
@@ -101,6 +102,8 @@ Four reviewers run as agents of their own. They own no repository and never push
 - **Recommendations** are issues on `inkproof-coordination` labelled `recommendation`, `review:<kind>` and `needs-human`; each review also posts one report on the milestone issue, and you get one notice per report rather than one per recommendation. Close each recommendation you accept. To reject one, add `declined`, say why in a comment, and close it: reviewers don't raise a declined recommendation again without new evidence. Reviewers propose; changing the kit, a role or `CLAUDE.md` is yours.
 
 Turning reviews on for a repository is part of `scripts/setup-repo.sh <repository> 1`: re-run it for each repository, and merge the pull request it opens, which adds `conformance` to `.forgejo/CODEOWNERS`.
+
+`inkproof-coordination` has CODEOWNERS of its own: a pull request that changes only `NEEDS-HUMAN.md` merges once `conformance` approves it, so the coordinator keeps that list current without you. Every other change there, `ROADMAP.md` and `REQUIREMENTS.md` included, waits for your approval too.
 
 ### Level 2: the gatekeeper approves on CI
 

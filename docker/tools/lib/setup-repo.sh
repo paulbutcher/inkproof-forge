@@ -139,27 +139,43 @@ ensure_tag_protection() {
 }
 
 # The CODEOWNERS a level needs. Forgejo reads it from main, as Go regular
-# expressions matched against whole paths; every matching line adds owners.
+# expressions matched against whole paths; every matching line adds owners,
+# and a line starting with ! adds them for every path it doesn't match.
 codeowners() {
-  local level="$1" catchall api
+  local level="$1" repo="${2:-}" catchall api conf=""
   case "$level" in
     1) catchall="@$HUMAN_USER"; api="@$HUMAN_USER" ;;
     2) catchall="@gatekeeper"; api="@$HUMAN_USER" ;;
     3) catchall="@gatekeeper"; api="@coordinator" ;;
   esac
-  $CONFORMANCE_REVIEW && catchall="$catchall @conformance"
-  cat <<EOF
+  $CONFORMANCE_REVIEW && conf=" @conformance"
+  if [ "$repo" = "$COORDINATION" ]; then
+    # The coordinator's NEEDS-HUMAN.md merges on conformance's approval
+    # alone; everything else, ROADMAP.md and REQUIREMENTS.md included, is
+    # the human's. (It stays at level 1: it has no CI.)
+    cat <<EOF2
+# Code owners for inkproof-coordination (scripts/setup-repo.sh checks this file).
+# Each line is a Go regular expression matched against a whole path, without
+# a leading slash; every matching line adds its owners, and a line starting
+# with ! adds them for every path it doesn't match. Each owner's review
+# request blocks the merge until they approve.
+.*$conf
+!NEEDS-HUMAN\.md @$HUMAN_USER
+EOF2
+    return
+  fi
+  cat <<EOF2
 # Code owners for autonomy level $level (scripts/setup-repo.sh checks this file).
 # Each line is a Go regular expression matched against a whole path, without
 # a leading slash; every matching line adds its owners, and each owner's
 # review request blocks the merge until they approve.
-.* $catchall
+.* $catchall$conf
 API\.lock $api
 \.forgejo/.* @$HUMAN_USER
 lean-toolchain @$HUMAN_USER
 CLAUDE\.md @$HUMAN_USER
 REQUIREMENTS\.md @$HUMAN_USER
-EOF
+EOF2
 }
 
 # file_ops REPO REF LEVEL: the file operations, as a JSON array for Forgejo's
@@ -169,7 +185,7 @@ file_ops() {
   local files=".forgejo/issue_template/request.md .forgejo/CODEOWNERS"
   has_ci "$repo" && files=".forgejo/workflows/checks.yml scripts/check-pins.sh $files"
   for f in $files; do
-    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
+    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level" "$repo")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
     if [ "$(api GET "/repos/$ORG/$repo/contents/$f?ref=$ref")" = 200 ]; then
       have="$(jq -r '.content // ""' "$RESP" | base64 -d)"
       FILE_SHA="$(jq -r .sha "$RESP")"
@@ -233,15 +249,32 @@ check_files() {
   return 3
 }
 
+# A setup pull request for another level would set that level if merged: close it.
+close_other_levels() {
+  local repo="$1" level="$2" n b
+  call 200 GET "/repos/$ORG/$repo/pulls?state=open&limit=50" \
+    | jq -r --arg b "kit/setup-level-$level" '.[] | select((.head.ref | startswith("kit/setup-level-")) and .head.ref != $b) | "\(.number) \(.head.ref)"' \
+    | while read -r n b; do
+        call 201 POST "/repos/$ORG/$repo/issues/$n/comments" "$(jq -nc --arg l "$level" '{body: "(no reply needed)\n\nClosed: `scripts/setup-repo.sh` now sets this repository up for level \($l)."}')" >/dev/null
+        call 201 PATCH "/repos/$ORG/$repo/pulls/$n" '{"state":"closed"}' >/dev/null
+        api DELETE "/repos/$ORG/$repo/branches/$b" >/dev/null
+        changed "$repo: closed #$n, the setup pull request for level ${b#kit/setup-level-}"
+      done
+}
+
 cmd_setup_repo() {
   local repo="${1:-}" level="${2:-}"
   TOKEN="$(token_of human)"
   [ -n "$repo" ] && [ -n "$level" ] || die "usage: setup-repo <repository> <level 1-3>"
   case "$level" in
-    1) ;;
-    2|3) die "level $level arrives in a later stage of the kit" ;;
+    1|2|3) ;;
     *) die "the level is 1, 2 or 3" ;;
   esac
+  # From level 2 the gatekeeper approves on CI, which the coordination
+  # repository doesn't have: its pull requests could never merge.
+  if [ "$level" != 1 ] && ! has_ci "$repo"; then
+    die "$repo has no CI, so it stays at level 1: from level 2 the gatekeeper approves only on CI"
+  fi
   [ "$(api GET "/repos/$ORG/$repo")" = 200 ] || die "$ORG/$repo isn't in Forgejo"
   log "Setting up $ORG/$repo for autonomy level $level:"
   ensure_labels "$repo"
@@ -249,5 +282,9 @@ cmd_setup_repo() {
   ensure_branch_protection "$repo" "$level"
   ensure_tag_protection "$repo" "$level"
   log "Made $CHANGES change(s) to Forgejo's settings."
+  if [ "$level" = 3 ] && [ "$(api GET "/repos/$ORG/$repo/contents/API.lock?ref=main")" != 200 ]; then
+    log "Warning: $repo has no API.lock on main, so no release can be computed for it until it has one."
+  fi
+  close_other_levels "$repo" "$level"
   check_files "$repo" "$level"
 }
