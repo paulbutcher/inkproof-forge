@@ -27,6 +27,9 @@ x-agent-args: &agent-args
   FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
   HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
   GH_OWNERS: ${GH_OWNER:?set GH_OWNER in .env} ${GH_FORMER_OWNERS:-}
+  # Forgejo as the human's browser reaches it, written into the coordinator's
+  # role for links to the human.
+  FORGE_WEB_URL: http://localhost:${FORGE_PORT:-3000}
 
 x-agent-build: &agent-build
   context: ./docker/agent
@@ -207,6 +210,9 @@ services:
       MAX_DELAY_SECONDS: ${MAX_DELAY_SECONDS:-900}
       MAX_SPEND_PER_DAY: ${MAX_SPEND_PER_DAY:-0}
       RECONCILE_SECONDS: ${RECONCILE_SECONDS:-900}
+      IDLE_SECONDS: ${IDLE_SECONDS:-1200}
+      UNVERIFIED_NUDGE_SECONDS: ${UNVERIFIED_NUDGE_SECONDS:-86400}
+      UNVERIFIED_STALL_SECONDS: ${UNVERIFIED_STALL_SECONDS:-172800}
       CONFORMANCE_SETTLE_SECONDS: ${CONFORMANCE_SETTLE_SECONDS:-600}
       REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
     volumes:

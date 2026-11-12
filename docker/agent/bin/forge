@@ -152,14 +152,23 @@ def review(repo, n, path):
     if open_findings and asked >= rounds:
         for f in open_findings:
             f["status"] = "escalated"
-        s, labels = api("GET", f"/repos/{ORG}/{repo}/labels?limit=100")
-        ids = [l["id"] for l in labels or [] if l["name"] == "needs-human"]
-        api("POST", f"/repos/{ORG}/{repo}/issues/{n}/labels", {"labels": ids})
+        listed = "\n".join(f"- **{f['section']}**: {f['finding'].strip()}" for f in open_findings)
+        # The decision first, then the label: the dispatcher takes needs-human
+        # off anything that doesn't state its decision.
         body = ("(no reply needed)\n\n" + render(summary, findings, asked + 1, rounds, escalated=True)
-                + f"\n\nAfter {rounds} rounds these findings are still open, so the human decides them.")
+                + f"\n\nAfter {rounds} rounds these findings are still open, so you decide them.\n\n"
+                + "## Question\n\nDo these findings stand? The author disagrees with each:\n\n" + listed
+                + "\n\n## Options\n\n- Uphold them: say which, and the author fixes them.\n"
+                + "- Overrule them: say so, and approve the pull request.\n"
+                + "\n## Recommendation\n\nUphold them: each names the rule it breaks. Read the author's replies "
+                + "on this pull request first.\n\n## If you say go ahead\n\nThe findings stand and the author "
+                + "fixes them; I review again once they have.\n\n## Blocked on this\n\nThis pull request's merge.")
         s, p = api("POST", f"/repos/{ORG}/{repo}/issues/{n}/comments", {"body": body})
         if s // 100 != 2:
             die(f"couldn't escalate {repo}#{n} ({s}): {(p or {}).get('message', '')}")
+        s, labels = api("GET", f"/repos/{ORG}/{repo}/labels?limit=100")
+        ids = [l["id"] for l in labels or [] if l["name"] == "needs-human"]
+        api("POST", f"/repos/{ORG}/{repo}/issues/{n}/labels", {"labels": ids})
         print(f"After {rounds} rounds, {repo}#{n} is labelled needs-human for the human to decide.")
         return
     event = "REQUEST_CHANGES" if open_findings else "APPROVED"

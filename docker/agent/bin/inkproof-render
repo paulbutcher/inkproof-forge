@@ -2,15 +2,16 @@
 # Run once at image build, as root: writes the agent's managed CLAUDE.md (its
 # role, then the protocol) and the system git configuration, both root-owned
 # so the agent can't change them.
-#   inkproof-render AGENT REPO FORGE_ORG HUMAN_USER "GH_OWNER..."
+#   inkproof-render AGENT REPO FORGE_ORG HUMAN_USER "GH_OWNER..." FORGE_WEB_URL
 set -eu
-agent="$1" repo="$2" org="$3" human="$4" owners="$5"
+agent="$1" repo="$2" org="$3" human="$4" owners="$5" web="$6"
 share=/usr/local/share/inkproof
 [ -f "$share/roles/$agent.md" ] || { echo "no role for $agent in roles/" >&2; exit 1; }
 
 render() {
   sed -e "s|{{AGENT}}|$agent|g" -e "s|{{REPO}}|$repo|g" \
-      -e "s|{{ORG}}|$org|g" -e "s|{{HUMAN}}|$human|g" "$1"
+      -e "s|{{ORG}}|$org|g" -e "s|{{HUMAN}}|$human|g" \
+      -e "s|{{FORGE_WEB_URL}}|$web|g" "$1"
 }
 { render "$share/roles/$agent.md"; echo; render "$share/PROTOCOL.md"; } > /etc/claude-code/CLAUDE.md
 

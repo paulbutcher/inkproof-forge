@@ -195,8 +195,9 @@ cmd_bootstrap() {
   # level-3 repositories.
   ensure_team gatekeeper-review "$(units write write write | jq -c '."repo.releases" = "write"')" gatekeeper "*"
   ensure_token dispatcher "$SCOPES_ISSUES"
-  # The dispatcher comments on issues to notify the human, on any repository.
-  ensure_team dispatcher-notify "$(units read write read)" dispatcher "*"
+  # The dispatcher comments on issues to notify the human, on any repository,
+  # and keeps the human assigned to what waits on them: pull requests too.
+  ensure_team dispatcher-notify "$(units read write write)" dispatcher "*"
   # CI reads this project's repositories to fetch dependencies; the job's own
   # token reads only the repository it runs for.
   FRESH_TOKEN=0

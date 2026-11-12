@@ -53,9 +53,25 @@ Requests are open issues labelled `request` and `new`. For each one, remove `new
 - **Accept**: add `accepted` and comment with your plan.
 - **Counter-propose**: add `counter-proposal` and explain the alternative.
 - **Reject**: comment with your reasons and close the issue as not planned. Protecting the cohesion of your project is a valid reason.
-- **Escalate**: add `needs-human` and wait for the human when the decision is theirs: a question or trade-off that needs their judgement; a change to `CLAUDE.md`, `.forgejo/`, `lean-toolchain` or `REQUIREMENTS.md`; or, below autonomy level 3, a change to `API.lock`.
+- **Escalate**: when the decision is the human's, put it to them as described under "Decisions for the human": a question or trade-off that needs their judgement; a change to `CLAUDE.md`, `.forgejo/`, `lean-toolchain` or `REQUIREMENTS.md`; or, below autonomy level 3, a change to `API.lock`.
 
-When the work is merged and `CHANGELOG.md` on `main` has its entry for the next release (see Definition of done), add `ready-for-release` and comment with the pull request's link. Your run usually ends before an auto-merge lands; a run starts for you when a pull request of yours merges while a request it names with `Refs` is still open without `ready-for-release`, so do this step then. At autonomy level 3 the coordinator verifies and releases it, and the release tag is commented on the issue for you; otherwise, after the human releases it, comment with the release tag. The requester then upgrades, checks the acceptance criteria, adds `verified` and closes the issue.
+When the work is merged and `CHANGELOG.md` on `main` has its entry for the next release (see Definition of done), add `ready-for-release` and comment with the pull request's link. Your run usually ends before an auto-merge lands; a run starts for you when a pull request of yours merges while a request it names with `Refs` is still open without `ready-for-release`, so do this step then. At autonomy level 3 the coordinator releases it through the gatekeeper, which comments `Released in vX.Y.Z` on the issue. Below level 3 the human releases it; if no `Released in vX.Y.Z` comment follows, add one yourself, starting a line with exactly that.
+
+That comment starts a run for the requester. Upgrade to the release, check the acceptance criteria, then add `verified` and close the issue. If you can't (the upgrade breaks your build, or a criterion isn't met), say so on the issue instead, and file what blocks you as usual. If it's still unverified a day after the release, you're woken again; after two days it becomes the human's problem.
+
+## Decisions for the human
+
+Everything waiting on the human is in one place: open issues and pull requests assigned to them, and pull requests requesting their review. The dispatcher assigns them to anything labelled `needs-human`, and unassigns them when the label comes off.
+
+- `needs-human` means the human must decide. Something waiting on an agent, or on time, never carries it.
+- Before adding the label, write the decision in the issue's description or in one comment, so the human can answer it as it stands, under these headings:
+  - `## Question`: what they must decide, in a sentence or two.
+  - `## Options`: each choice, and what follows from it.
+  - `## Recommendation`: yours, and why.
+  - `## If you say go ahead`: exactly what you will do if they just accept your recommendation.
+  - `## Blocked on this`: what can't move until they answer, with links.
+- The dispatcher takes `needs-human` off anything missing those headings, says which are missing, and starts a run for whoever added it. Write them, then add the label again.
+- When the human answers, act on it and take the label off.
 
 ## Requirements
 

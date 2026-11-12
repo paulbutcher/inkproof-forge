@@ -31,6 +31,10 @@ becomes one run.
 Every RECONCILE_SECONDS, and on start, it checks Forgejo for work a missed
 webhook would have lost: untriaged requests, failed Actions runs on agents'
 pull requests, and agents' pull requests behind main.
+
+Once the kit has been quiet for IDLE_SECONDS (no run, no queued work, no CI),
+it wakes the coordinator to tell the human what it needs from them, once per
+quiet spell.
 """
 
 import hashlib
@@ -260,34 +264,11 @@ def notify(key, kind, repo, number, text):
         log(f"couldn't post the notice for {repo}#{number}: {e}")
 
 
-def notify_agent(agent, key, kind, text):
+def notify_agent(agent, key, kind, title, sections):
     """A notice about an agent rather than an issue (caps, failed transcript
-    rewrites): on one needs-human issue per agent, reused until the human
-    closes it."""
-    repo = AGENTS[agent]["own"] or COORDINATION
-    if not add_notice(key, kind, repo, None, text):
-        return
-    try:
-        n = kv_get(f"notice-issue:{agent}")
-        if n:
-            issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
-            if issue.get("state") != "open":
-                n = None
-        if not n:
-            labels = [l["id"] for l in forge_list(f"/repos/{ORG}/{repo}/labels", 100) if l["name"] == "needs-human"]
-            issue = forge("POST", f"/repos/{ORG}/{repo}/issues", {
-                "title": f"Kit notices: {agent}",
-                "body": f"{NO_REPLY}\n\nThe dispatcher posts notices about `{agent}` here: reached caps, and runs "
-                        "the extension doesn't list. Close this issue once you've dealt with them; the next "
-                        "notice opens a new one.",
-                "labels": labels})
-            n = issue["number"]
-            kv_set(f"notice-issue:{agent}", n)
-        comment(repo, n, text)
-        q("UPDATE notices SET posted=1, number=? WHERE key=?", n, key)
-        log(f"notified {HUMAN} about {agent}: {kind}")
-    except Exception as e:
-        log(f"couldn't post the notice about {agent}: {e}")
+    rewrites): a decision of its own for the human, on the agent's repository
+    (a reviewer's on the coordination repository)."""
+    decision_issue(AGENTS[agent]["own"] or COORDINATION, key, kind, title, sections)
 
 
 # --- Webhooks -> triggers -------------------------------------------------------
@@ -359,6 +340,15 @@ def wip(title):
 
 def drop_pending(agent, prefix):
     q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL AND key LIKE ?", agent, prefix + "%")
+
+
+def drop_reviews_of_closed(repo, n):
+    """A pull request merged or closed before its reviews ran: drop them.
+    Renamed as well, since each is queued once per head, so that reopening
+    the pull request can queue them again."""
+    for agent, prefix in ((REVIEWER, f"conf:{repo}#{n}:"), (COORDINATOR, f"review-requested:{repo}#{n}:")):
+        q("UPDATE triggers SET run_id=-1, key = key || ':closed:' || CAST(? AS INTEGER) "
+          "WHERE agent=? AND run_id IS NULL AND key LIKE ?", now(), agent, prefix + "%")
 
 
 def has_ci(repo):
@@ -472,6 +462,140 @@ def conformance_wants_changes(repo, n):
     return bool(mine) and mine[-1].get("state") == "REQUEST_CHANGES"
 
 
+# --- What waits on the human ------------------------------------------------------
+#
+# Everything waiting on the human is an open issue or pull request assigned to
+# them (labelled needs-human, or a blocking upstream issue), or a pull request
+# requesting their review: Forgejo's own dashboards are the list. A
+# needs-human item must put its decision so it can be answered as it stands.
+
+DECISION = ("Question", "Options", "Recommendation", "If you say go ahead", "Blocked on this")
+RELEASED = re.compile(r"^Released in (v\d+\.\d+\.\d+)\b", re.M)
+NUDGE = int(os.environ.get("UNVERIFIED_NUDGE_SECONDS", "86400"))
+STALL = int(os.environ.get("UNVERIFIED_STALL_SECONDS", "172800"))
+
+
+def missing_sections(text):
+    return [s for s in DECISION if not re.search(rf"(?im)^#+\s*{re.escape(s)}\s*:?\s*$", text or "")]
+
+
+def waits_on_human(labels):
+    return "needs-human" in labels or {"upstream", "blocking"} <= labels
+
+
+def set_assigned(repo, n, item, assign):
+    have = [a["login"] for a in item.get("assignees") or []]
+    if assign == (HUMAN in have):
+        return
+    want = have + [HUMAN] if assign else [a for a in have if a != HUMAN]
+    forge("PATCH", f"/repos/{ORG}/{repo}/issues/{n}", {"assignees": want})
+    log(f"{'assigned' if assign else 'unassigned'} {HUMAN} {'to' if assign else 'from'} {repo}#{n}")
+
+
+def refuse_needs_human(repo, n, item, sender):
+    """needs-human added without the decision written out: take it off, say
+    why, and wake the agent that added it. Returns whether it was refused."""
+    if sender in (HUMAN, "dispatcher"):
+        return False
+    texts = [item.get("body") or ""] + [c.get("body") or ""
+                                        for c in forge_list(f"/repos/{ORG}/{repo}/issues/{n}/comments")]
+    best = min((missing_sections(t) for t in texts), key=len)
+    if not best:
+        return False
+    label = next((l["id"] for l in item.get("labels") or [] if l["name"] == "needs-human"), None)
+    if label is not None:
+        forge("DELETE", f"/repos/{ORG}/{repo}/issues/{n}/labels/{label}")
+    forge("POST", f"/repos/{ORG}/{repo}/issues/{n}/comments", {"body": (
+        f"{NO_REPLY}\n\n`needs-human` is off again: a decision for the human states it so they can answer "
+        f"as it stands, under the headings {', '.join(f'`## {s}`' for s in DECISION)}, in the description "
+        f"or one comment (Protocol: Escalate). Missing here: {', '.join(best)}. Write them, then add the label.")})
+    if sender in AGENTS:
+        add_trigger(sender, f"nh-refused:{repo}#{n}:{int(now())}",
+                    f"needs-human taken off {repo}#{n}: the decision lacks the sections your protocol asks for")
+    log(f"took needs-human off {repo}#{n}, added by {sender}: missing {', '.join(best)}")
+    return True
+
+
+def human_labels_changed(repo, n, item, labels, added, removed, sender):
+    """Keep the human's assignment in step with needs-human and blocking
+    upstream issues. Returns the labels, and the labels added, that stand."""
+    if "needs-human" in added and refuse_needs_human(repo, n, item, sender):
+        added = added - {"needs-human"}
+        labels = labels - {"needs-human"}
+    if (added | removed) & {"needs-human", "blocking", "upstream"} and item.get("state") == "open":
+        set_assigned(repo, n, item, waits_on_human(labels))
+    return labels, added
+
+
+def decision_issue(repo, key, kind, title, sections):
+    """A decision for the human from the kit itself: once per key, an issue
+    labelled needs-human and assigned to them, with the decision's sections."""
+    if not add_notice(key, kind, repo, None, title):
+        return
+    try:
+        labels = [l["id"] for l in forge_list(f"/repos/{ORG}/{repo}/labels", 100) if l["name"] == "needs-human"]
+        body = f"{NO_REPLY}\n\n" + "\n\n".join(f"## {h}\n\n{sections[h].strip()}" for h in DECISION)
+        issue = forge("POST", f"/repos/{ORG}/{repo}/issues",
+                      {"title": title, "body": body, "labels": labels, "assignees": [HUMAN]})
+        q("UPDATE notices SET posted=1, number=? WHERE key=?", issue["number"], key)
+        log(f"asked {HUMAN} to decide {repo}#{issue['number']}: {title}")
+    except Exception as e:
+        log(f"couldn't open the decision {title!r} on {repo}: {e}")
+
+
+def waiting_on_human():
+    """How many open issues and pull requests wait on the human: assigned to
+    them, or requesting their review."""
+    found = set()
+    for repo in OWNER_OF:
+        for i in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&assigned_by={HUMAN}"):
+            found.add((repo, i["number"]))
+        for p in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+            if HUMAN in {u["login"] for u in p.get("requested_reviewers") or []}:
+                found.add((repo, p["number"]))
+    return len(found)
+
+
+def check_released_requests(repo):
+    """Open requests released but not verified: the requester is woken again
+    after NUDGE seconds; after STALL, the stall is the human's."""
+    for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request"):
+        labels = {l["name"] for l in issue.get("labels") or []}
+        if "verified" in labels:
+            continue
+        n = issue["number"]
+        released = [(c, RELEASED.search(c.get("body") or "")) for c in
+                    forge_list(f"/repos/{ORG}/{repo}/issues/{n}/comments")
+                    if (c.get("user") or {}).get("login") in ("gatekeeper", HUMAN, OWNER_OF.get(repo))]
+        released = [(c, m) for c, m in released if m]
+        if not released:
+            continue
+        c, m = released[-1]
+        tag = m[1]
+        age = now() - datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")).timestamp()
+        requester = (issue.get("user") or {}).get("login") or "?"
+        if age > NUDGE and requester in AGENTS and AGENTS[requester]["own"]:
+            add_trigger(requester, f"unverified:{repo}#{n}:{tag}",
+                        f"your request {repo}#{n} was released in {tag} {int(age // 3600)} hours ago and you "
+                        "haven't verified it: upgrade, check its acceptance criteria and verify it, or say on "
+                        "the issue what stops you", once=True)
+        if age > STALL:
+            decision_issue(COORDINATION, f"stalled:{repo}#{n}:{tag}", "stalled",
+                           f"Released but never verified: {repo}#{n}", {
+                "Question": f"[{repo}#{n}]({issue.get('html_url', '')}) was released in {tag} "
+                            f"{int(age // 86400)} days ago, and its requester, `{requester}`, hasn't verified it, "
+                            "even after being woken again a day later. Something has stalled: what should happen?",
+                "Options": f"- Find out why: `scripts/activity.sh {repo}#{n}` and `scripts/activity.sh {requester}` "
+                           "show what happened to it, and fix the kit if a step is missing.\n"
+                           "- Verify it yourself against its acceptance criteria, add `verified` and close it.\n"
+                           "- Close it as no longer needed, saying why.",
+                "Recommendation": "Find out why first: a release nobody verifies is usually a missing wake-up, "
+                                  "an upgrade the requester can't make, or a requester that isn't an agent.",
+                "If you say go ahead": "Nothing happens on its own: the kit has already done what it can. "
+                                       "Close this issue once you've dealt with it.",
+                "Blocked on this": f"{repo}#{n}, and anything whose `Blocked-by:` line names it."})
+
+
 def handle(event, payload):
     repo = (payload.get("repository") or {}).get("name") or ""
     sender = (payload.get("sender") or {}).get("login") or ""
@@ -494,6 +618,7 @@ def handle(event, payload):
             return
         is_pr = bool(issue.get("pull_request"))
         kind = "pull request" if is_pr else "issue"
+        labels, added = human_labels_changed(repo, n, issue, labels, added, removed, sender)
         if "blocking" in added and "upstream" in labels:
             notify(f"blocking:{repo}#{n}", "blocking", repo, n,
                    "this upstream issue is marked `blocking`: an agent can't continue until it's resolved upstream. "
@@ -517,10 +642,16 @@ def handle(event, payload):
                 add_trigger(coord, f"filed:{repo}#{n}", f"request filed: {repo}#{n}", once=True)
             if "ready-for-release" in added:
                 add_trigger(coord, f"rfr:{repo}#{n}:{int(now())}", f"ready-for-release added to {kind} {repo}#{n}")
-            if "needs-human" in added:
+            # The kit's own decisions (caps, stalls) and its refusals aren't the coordinator's.
+            if "needs-human" in added and sender != "dispatcher":
                 add_trigger(coord, f"nh+:{repo}#{n}:{int(now())}", f"needs-human added to {kind} {repo}#{n}")
-            if "needs-human" in removed:
+            if "needs-human" in removed and sender != "dispatcher":
                 add_trigger(coord, f"nh-:{repo}#{n}:{int(now())}", f"needs-human removed from {kind} {repo}#{n}")
+            if action == "closed" and (issue.get("milestone") or {}).get("id"):
+                ms = forge("GET", f"/repos/{ORG}/{repo}/milestones/{issue['milestone']['id']}") or {}
+                if ms.get("open_issues") == 0:
+                    add_trigger(coord, f"milestone-done:{repo}:{ms.get('id')}",
+                                f"the last open issue in milestone {ms.get('title')} on {repo} was closed", once=True)
         if repo == COORDINATION and "upstream" in labels and action == "closed":
             wake_blocked((repo, n), f"upstream issue {repo}#{n} was closed")
 
@@ -533,6 +664,15 @@ def handle(event, payload):
         if owner and sender != owner and issue.get("state") == "open" and wants_reply(c.get("body")):
             add_trigger(owner, f"comment:{c.get('id')}", f"comment on {'pull request' if is_pr else 'issue'} {repo}#{n}")
         labels = {l["name"] for l in issue.get("labels") or []}
+        # A release comment on a request needs no reply, but its requester has
+        # work: upgrade, check the acceptance criteria and verify.
+        released = RELEASED.search(c.get("body") or "")
+        requester = (issue.get("user") or {}).get("login")
+        if (released and sender in ("gatekeeper", HUMAN, owner) and not is_pr and issue.get("state") == "open"
+                and "request" in labels and requester in AGENTS and AGENTS[requester]["own"]):
+            add_trigger(requester, f"released:{repo}#{n}:{released[1]}",
+                        f"your request {repo}#{n} was released in {released[1]}: upgrade to it, check its "
+                        "acceptance criteria, and verify it", once=True)
         # The author answers conformance's findings in a comment: conformance looks again.
         if (is_pr and issue.get("state") == "open" and sender == (issue.get("user") or {}).get("login")
                 and sender != REVIEWER and wants_reply(c.get("body")) and conformance_wants_changes(repo, n)):
@@ -566,8 +706,18 @@ def handle(event, payload):
         n = pr.get("number")
         if not trusted:
             return
+        if action == "label_updated":
+            labels = {l["name"] for l in pr.get("labels") or []}
+            labels, added = human_labels_changed(repo, n, pr, labels, *labels_changed(repo, n, labels), sender)
+            if "needs-human" in added and sender != "dispatcher":
+                notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
+                       "this needs your decision (`needs-human`).")
+                if coord:
+                    add_trigger(coord, f"nh+:{repo}#{n}:{int(now())}", f"needs-human added to pull request {repo}#{n}")
         if action == "synchronized":
             drop_pending(REVIEWER, f"conf:{repo}#{n}:")  # a newer head supersedes the waiting review
+        if action == "closed":
+            drop_reviews_of_closed(repo, n)
         if not has_ci(repo) and action in ("opened", "reopened", "synchronized"):
             queue_conformance(repo, n)  # nothing to wait for: no CI here
         # Auto-merge lands after the owner's run has ended: wake it to finish
@@ -648,6 +798,12 @@ def reconcile():
                         and now() - datetime.fromisoformat(merged.replace("Z", "+00:00")).timestamp() < RECONCILE * 2):
                     wake_after_merge(repo, owner, pr)
             check_behind(repo)
+            check_released_requests(repo)
+            # What waits on the human but isn't assigned to them: from before
+            # assignment, or a missed webhook.
+            for labels in ("needs-human", "upstream,blocking"):
+                for item in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&labels={labels}"):
+                    set_assigned(repo, item["number"], item, True)
         except Exception as e:
             log(f"reconciling {repo} failed: {e!r}")
     # Pull requests whose head passed CI (or that have no CI) but which
@@ -666,6 +822,75 @@ def reconcile():
         except Exception as e:
             log(f"reconciling {repo}'s reviews failed: {e!r}")
     kv_set("reconciled", now())
+
+
+# --- Idle summaries -------------------------------------------------------------
+
+IDLE = int(os.environ.get("IDLE_SECONDS", "1200"))
+IDLE_TRIGGER = "the kit is idle"  # each idle trigger begins so
+
+
+def last_activity():
+    """When anything last happened: an event, work queued or a run ending,
+    leaving out the idle summaries themselves (and the human's sessions, so
+    reading one doesn't call for another)."""
+    found = [q("SELECT MAX(at) AS m FROM events")[0]["m"],
+             q("SELECT MAX(created) AS m FROM triggers WHERE key NOT LIKE 'idle:%'")[0]["m"],
+             q("SELECT MAX(ended) AS m FROM runs WHERE triggers NOT LIKE ?", f"%{IDLE_TRIGGER}%")[0]["m"]]
+    return max([t for t in found if t] or [0])
+
+
+def ci_running():
+    """Whether an Actions run is under way. A run left waiting for over an
+    hour (its pull request closed before a runner took it) doesn't count."""
+    for repo in OWNER_OF:
+        if not has_ci(repo):
+            continue
+        for status in ("running", "waiting"):
+            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?status={status}") or {}
+            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
+            for r in runs or []:
+                if r.get("status") != status:
+                    continue
+                if status == "running":
+                    return True
+                created = datetime.fromisoformat((r.get("created") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
+                if now() - created.timestamp() < 3600:
+                    return True
+    return False
+
+
+def check_idle():
+    """Wake the coordinator to tell the human what it needs from them, once
+    the kit has gone quiet: no run, no queued work (except an agent's held by
+    its cap, which is the human's to lift), the human active nowhere, no CI,
+    and nothing new for IDLE seconds. Once per quiet spell."""
+    if not COORDINATOR or IDLE <= 0 or paused():
+        return
+    if q("SELECT 1 FROM runs WHERE ended IS NULL"):
+        return
+    if any(not capped(r["agent"]) for r in q("SELECT DISTINCT agent FROM triggers WHERE run_id IS NULL")):
+        return
+    if any(human_active(a) for a in AGENTS):
+        return
+    last = last_activity()
+    if now() - last < IDLE or float(kv_get("idle-summary", 0)) >= last:
+        return
+    if ci_running():
+        return
+    kv_set("idle-summary", now())
+    n = waiting_on_human()
+    waiting = f"{n} item{'' if n == 1 else 's'} wait{'s' if n == 1 else ''} on you" if n else "nothing waits on you"
+    add_trigger(COORDINATOR, f"idle:{int(now())}", f"{IDLE_TRIGGER}; {waiting}")
+
+
+def idler():
+    while True:
+        time.sleep(60)
+        try:
+            check_idle()
+        except Exception as e:
+            log(f"checking for idleness failed: {e!r}")
 
 
 def reconciler():
@@ -730,10 +955,18 @@ def claim(agent):
         why = capped(agent)
         if why:
             day = time.strftime("%Y-%m-%d", time.gmtime())
-            notify_agent(agent, f"cap:{agent}:{day}", "cap",
-                         f"`{agent}` reached {why} at {iso(now())}, with {len(rows)} trigger(s) waiting. "
-                         "They start after midnight UTC, or sooner if you raise the cap in `.env` and rerun "
-                         "`scripts/up.sh`.")
+            waiting = "\n".join(f"- {d}" for d in dict.fromkeys(r["description"] for r in rows))
+            notify_agent(agent, f"cap:{agent}:{day}", "cap", f"{agent} reached {why} ({day})", {
+                "Question": f"`{agent}` reached {why} at {iso(now())}, with {len(rows)} trigger(s) waiting. "
+                            "Should it carry on today?",
+                "Options": "- Raise `MAX_RUNS_PER_DAY` (or `MAX_SPEND_PER_DAY`) in `.env` and rerun "
+                           "`scripts/up.sh`: the waiting work starts within a minute.\n"
+                           "- Leave it: the waiting work starts after midnight UTC.",
+                "Recommendation": "Leave it unless the waiting work is urgent. If caps are reached most days, "
+                                  "raise them.",
+                "If you say go ahead": "Nothing changes: the waiting work starts after midnight UTC. "
+                                       "Close this issue.",
+                "Blocked on this": f"`{agent}`'s waiting work:\n{waiting}"})
             return None
         t = now()
         if t - rows[-1]["created"] < DEBOUNCE and t - rows[0]["created"] < MAX_DELAY:
@@ -768,9 +1001,17 @@ def end_run(agent, run_id, r):
     if (r.get("outcome") or "").startswith("exited"):
         requeue(run_id)  # Claude never finished a reply: none of the work was done
     if not r.get("in_extension") and r.get("session_id"):
+        sid = r.get("session_id")
         notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",
-                     f"run {run_id} of `{agent}` isn't listed in the Claude extension, because its transcript "
-                     f"couldn't be rewritten. Resume it by its session ID, `{r.get('session_id')}`.")
+                     f"Run {run_id} of {agent} isn't listed in the Claude extension", {
+            "Question": f"Run {run_id} of `{agent}` isn't listed in the Claude extension in its container, because "
+                        "its transcript couldn't be rewritten. Do you need to continue that conversation?",
+            "Options": f"- Resume it by its session ID: `claude --resume {sid}` in `{agent}`'s container.\n"
+                       "- Leave it: its log and transcript are in the run archive.",
+            "Recommendation": "Leave it unless you need that conversation. If this keeps happening, the "
+                              "runner's transcript rewrite needs fixing in the kit.",
+            "If you say go ahead": "Nothing happens. Close this issue.",
+            "Blocked on this": "Nothing."})
     log(f"{agent} run {run_id} ended: {r.get('outcome')}")
     return True
 
@@ -896,6 +1137,8 @@ def describe_event(e):
         return f"CI {'passed' if t.endswith('success') else 'failed'}{on}{sha}"
     if t == "release":
         return f"released {repo} {d['tag']}" if d.get("tag") else f"published a release of {repo}"
+    if t in ("issue_assign", "pull_request_assign"):
+        return f"{a} {where}"
     return f"{t} {a or ''} {where}".replace("  ", " ")
 
 
@@ -1133,4 +1376,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     log(f"listening on :8080; agents: {', '.join(AGENTS)}")
     threading.Thread(target=reconciler, daemon=True).start()
+    threading.Thread(target=idler, daemon=True).start()
     ThreadingHTTPServer(("", 8080), Handler).serve_forever()

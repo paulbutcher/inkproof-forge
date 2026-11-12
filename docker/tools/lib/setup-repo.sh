@@ -139,31 +139,15 @@ ensure_tag_protection() {
 }
 
 # The CODEOWNERS a level needs. Forgejo reads it from main, as Go regular
-# expressions matched against whole paths; every matching line adds owners,
-# and a line starting with ! adds them for every path it doesn't match.
+# expressions matched against whole paths; every matching line adds owners.
 codeowners() {
-  local level="$1" repo="${2:-}" catchall api conf=""
+  local level="$1" catchall api conf=""
   case "$level" in
     1) catchall="@$HUMAN_USER"; api="@$HUMAN_USER" ;;
     2) catchall="@gatekeeper"; api="@$HUMAN_USER" ;;
     3) catchall="@gatekeeper"; api="@coordinator" ;;
   esac
   $CONFORMANCE_REVIEW && conf=" @conformance"
-  if [ "$repo" = "$COORDINATION" ]; then
-    # The coordinator's NEEDS-HUMAN.md merges on conformance's approval
-    # alone; everything else, ROADMAP.md and REQUIREMENTS.md included, is
-    # the human's. (It stays at level 1: it has no CI.)
-    cat <<EOF2
-# Code owners for inkproof-coordination (scripts/setup-repo.sh checks this file).
-# Each line is a Go regular expression matched against a whole path, without
-# a leading slash; every matching line adds its owners, and a line starting
-# with ! adds them for every path it doesn't match. Each owner's review
-# request blocks the merge until they approve.
-.*$conf
-!NEEDS-HUMAN\.md @$HUMAN_USER
-EOF2
-    return
-  fi
   cat <<EOF2
 # Code owners for autonomy level $level (scripts/setup-repo.sh checks this file).
 # Each line is a Go regular expression matched against a whole path, without
@@ -185,7 +169,7 @@ file_ops() {
   local files=".forgejo/issue_template/request.md .forgejo/CODEOWNERS"
   has_ci "$repo" && files=".forgejo/workflows/checks.yml scripts/check-pins.sh $files"
   for f in $files; do
-    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level" "$repo")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
+    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
     if [ "$(api GET "/repos/$ORG/$repo/contents/$f?ref=$ref")" = 200 ]; then
       have="$(jq -r '.content // ""' "$RESP" | base64 -d)"
       FILE_SHA="$(jq -r .sha "$RESP")"
@@ -198,10 +182,14 @@ file_ops() {
       '. + [{operation: $o, path: $p, content: $c} + (if $s == "" then {} else {sha: $s} end)]' <<<"$ops")"
   done
   # Everything left in .github/: Forgejo ignores its CODEOWNERS, and would run
-  # its workflow if .forgejo/workflows/ were missing.
+  # its workflow if .forgejo/workflows/ were missing. And the coordinator's
+  # retired NEEDS-HUMAN.md: what waits on the human is the issues assigned to
+  # them, and the pull requests that request their review.
+  local retired=""
+  [ "$repo" = "$COORDINATION" ] && retired="NEEDS-HUMAN.md"
   commit="$(call 200 GET "/repos/$ORG/$repo/branches/$ref" | jq -r .commit.id)"
   call 200 GET "/repos/$ORG/$repo/git/trees/$commit?recursive=true&per_page=10000" \
-    | jq -c --argjson ops "$ops" '$ops + [.tree[] | select(.type == "blob" and (.path | startswith(".github/")))
+    | jq -c --argjson ops "$ops" --arg r "$retired" '$ops + [.tree[] | select(.type == "blob" and (.path | startswith(".github/") or . == $r))
                                            | {operation: "delete", path: .path, sha: .sha}]'
 }
 
@@ -217,10 +205,11 @@ check_files() {
   log "$repo's files need changing for level $level:"
   jq -r '.[] | "  \(.operation) \(.path)"' <<<"$ops" >&2
   pr="$(call 200 GET "/repos/$ORG/$repo/pulls?state=open&limit=50" \
-    | jq -c --arg b "$branch" '[.[] | select(.head.ref == $b)][0] // empty')"
+    | jq -c --arg b "$branch" '[.[] | select(.head.ref == $b or (.head.ref | startswith($b + "-")))][0] // empty')"
   if [ -n "$pr" ]; then
     n="$(jq -r .number <<<"$pr")"
     url="$(jq -r .html_url <<<"$pr")"
+    branch="$(jq -r .head.ref <<<"$pr")"
     ops="$(file_ops "$repo" "$branch" "$level")"
     if [ "$(jq length <<<"$ops")" != 0 ]; then
       call 201 POST "/repos/$ORG/$repo/contents" "$(jq -nc --argjson f "$ops" --arg b "$branch" \
@@ -228,8 +217,14 @@ check_files() {
       changed "$repo: updated pull request #$n"
     fi
   else
-    # A branch left from a pull request that was closed without merging.
-    api DELETE "/repos/$ORG/$repo/branches/$branch" >/dev/null
+    # A branch left from a pull request that was closed, or merged without
+    # deleting it. Forgejo closes the pull requests from a deleted branch a
+    # moment later, by name, which would catch a new one from the same name:
+    # so the new one gets a name of its own.
+    if [ "$(api GET "/repos/$ORG/$repo/branches/$branch")" = 200 ]; then
+      api DELETE "/repos/$ORG/$repo/branches/$branch" >/dev/null
+      branch="$branch-$(date +%s)"
+    fi
     call 201 POST "/repos/$ORG/$repo/contents" "$(jq -nc --argjson f "$ops" --arg b "$branch" --arg l "$level" \
       '{branch: "main", new_branch: $b, files: $f,
         message: "Set up for autonomy level \($l) (scripts/setup-repo.sh)"}')" >/dev/null
@@ -253,12 +248,14 @@ check_files() {
 close_other_levels() {
   local repo="$1" level="$2" n b
   call 200 GET "/repos/$ORG/$repo/pulls?state=open&limit=50" \
-    | jq -r --arg b "kit/setup-level-$level" '.[] | select((.head.ref | startswith("kit/setup-level-")) and .head.ref != $b) | "\(.number) \(.head.ref)"' \
+    | jq -r --arg b "kit/setup-level-$level" '.[] | select((.head.ref | startswith("kit/setup-level-"))
+        and .head.ref != $b and (.head.ref | startswith($b + "-") | not)) | "\(.number) \(.head.ref)"' \
     | while read -r n b; do
         call 201 POST "/repos/$ORG/$repo/issues/$n/comments" "$(jq -nc --arg l "$level" '{body: "(no reply needed)\n\nClosed: `scripts/setup-repo.sh` now sets this repository up for level \($l)."}')" >/dev/null
         call 201 PATCH "/repos/$ORG/$repo/pulls/$n" '{"state":"closed"}' >/dev/null
         api DELETE "/repos/$ORG/$repo/branches/$b" >/dev/null
-        changed "$repo: closed #$n, the setup pull request for level ${b#kit/setup-level-}"
+        b="${b#kit/setup-level-}"
+        changed "$repo: closed #$n, the setup pull request for level ${b%%-*}"
       done
 }
 

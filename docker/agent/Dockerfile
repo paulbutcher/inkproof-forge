@@ -62,8 +62,11 @@ ARG FORGE_ORG
 ARG HUMAN_USER
 # Space-separated GitHub owners whose inkproof- URLs mean this project.
 ARG GH_OWNERS
+# Forgejo as the human's browser reaches it.
+ARG FORGE_WEB_URL
 RUN test -n "$AGENT" && test -n "$AGENT_REPO" && test -n "$FORGE_ORG" && test -n "$HUMAN_USER" && test -n "$GH_OWNERS" \
- && /usr/local/bin/inkproof-render "$AGENT" "$AGENT_REPO" "$FORGE_ORG" "$HUMAN_USER" "$GH_OWNERS"
+ && test -n "$FORGE_WEB_URL" \
+ && /usr/local/bin/inkproof-render "$AGENT" "$AGENT_REPO" "$FORGE_ORG" "$HUMAN_USER" "$GH_OWNERS" "$FORGE_WEB_URL"
 
 USER agent
 WORKDIR /workspace

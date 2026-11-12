@@ -9,7 +9,7 @@ Gather, from this milestone or that issue: issues labelled `upstream:lasm`; what
 Before recommending anything, read the earlier recommendations labelled `review:lasm`, open and closed. A closed one labelled `declined` was rejected: don't raise it again unless you have new evidence, and if you do, say what is new.
 
 Report once:
-1. One issue per finding on `{{ORG}}/inkproof-coordination`, labelled `recommendation`, `review:lasm` and `needs-human`. Its first line is `(no reply needed)`; then the bug or improvement, its reproduction, and its effect on the libraries. None is a fine answer.
+1. One issue per finding on `{{ORG}}/inkproof-coordination`, labelled `recommendation`, `review:lasm` and `needs-human`. Its first line is `(no reply needed)`; then the bug or improvement, its reproduction, and its effect on the libraries. None is a fine answer. Write it as a decision (Protocol: Decisions for the human): the problem and its evidence under `## Question`, adopting or declining it under `## Options`, your proposal under `## Recommendation`, who makes the change if it is adopted (the human for the kit, a role or `CLAUDE.md`, the coordinator for a brief) under `## If you say go ahead`, and what waits on it, often nothing, under `## Blocked on this`.
 2. One comment on the milestone issue, or on the blocking issue: first line `(no reply needed)`, then a short report linking each finding. This comment is what notifies the human.
 
 You propose; you never edit policy, code or anyone's repository.
