@@ -800,10 +800,12 @@ def reconcile():
             check_behind(repo)
             check_released_requests(repo)
             # What waits on the human but isn't assigned to them: from before
-            # assignment, or a missed webhook.
+            # assignment, or a missed webhook. Forgejo ignores a label filter
+            # naming a label the repository lacks, so check each item's own.
             for labels in ("needs-human", "upstream,blocking"):
                 for item in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&labels={labels}"):
-                    set_assigned(repo, item["number"], item, True)
+                    if waits_on_human({l["name"] for l in item.get("labels") or []}):
+                        set_assigned(repo, item["number"], item, True)
         except Exception as e:
             log(f"reconciling {repo} failed: {e!r}")
     # Pull requests whose head passed CI (or that have no CI) but which
