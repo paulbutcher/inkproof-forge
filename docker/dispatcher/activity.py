@@ -8,14 +8,34 @@ time): the newest time shown, the day last shown, and the entries already
 shown near that time. Entries are printed one per line, in the reader's
 time zone (TZ, an offset in seconds); FILTER, if given, keeps the lines that
 contain it, ignoring case. The last line is the new STATE, after a tab.
+
+With ACTIVITY_LINKS set to Forgejo's address for the reader (with the
+organisation), each issue or pull request named as repo#n links there:
+ACTIVITY_LINK_STYLE "osc" makes the name itself a terminal hyperlink, "urls"
+adds the address at the end of the line.
 """
 import json
+import os
+import re
 import sys
 import time
 import urllib.request
 
 state, tz, limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 needle = (sys.argv[4] if len(sys.argv) > 4 else "").lower()
+web, style = os.environ.get("ACTIVITY_LINKS", "").rstrip("/"), os.environ.get("ACTIVITY_LINK_STYLE", "osc")
+REF = re.compile(r"\b([A-Za-z0-9_.-]+)#(\d+)\b")
+
+
+def linked(text):
+    if not web:
+        return text
+    if style == "urls":
+        urls = [f"{web}/{m[1]}/issues/{m[2]}" for m in REF.finditer(text)]
+        return text + "".join(f"  {u}" for u in dict.fromkeys(urls))
+    return REF.sub(lambda m: f"\033]8;;{web}/{m[1]}/issues/{m[2]}\033\\{m[0]}\033]8;;\033\\", text)
+
+
 cursor, day, seen = 0.0, "", set()
 if state:
     s = json.loads(state)
@@ -38,7 +58,7 @@ for e in entries:
     if d != day:
         print(f"-- {d} --")
         day = d
-    print(line)
+    print(linked(line))
 
 if entries:
     cursor = max(cursor, max(e["at"] for e in entries))

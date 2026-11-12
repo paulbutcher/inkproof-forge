@@ -9,6 +9,7 @@
 #   kit setup-repo REPO LEVEL  apply an autonomy level to a repository
 #   kit pause, kit resume  the human's brake (scripts/pause.sh, resume.sh)
 #   kit project-status  requests, pull requests and needs-human items
+#   kit reviews DAYS   which reviews have taken place, and their results
 #   kit dispatcher METHOD PATH [JSON]  the dispatcher's admin requests
 #   kit milestone NAME  open the milestone issue that starts the reviews
 #   kit milestone-diff  every API.lock change since the last milestone
@@ -66,6 +67,7 @@ case "${1:-}" in
   pause) cmd_pause ;;
   resume) cmd_resume ;;
   project-status) cmd_project_status ;;
+  reviews) shift; cmd_reviews "$@" ;;
   dispatcher) shift; cmd_dispatcher "$@" ;;
   milestone) shift; cmd_milestone "$@" ;;
   milestone-diff) cmd_milestone_diff ;;
