@@ -63,6 +63,11 @@ ORG = os.environ.get("FORGE_ORG", "")
 HUMAN = os.environ.get("HUMAN_USER", "")
 PREFIX = os.environ.get("REPO_PREFIX", "inkproof-")
 CAP = int(os.environ.get("MAX_RUNS_PER_DAY", "20"))
+# The coordinator is woken by every other agent's work, so it has its own cap.
+COORDINATOR_CAP = int(os.environ.get("MAX_COORDINATOR_RUNS_PER_DAY", "40"))
+# How long the coordinator's "pull request opened" waits, so that a review
+# requested from it soon after shares the run.
+OPENED_HOLD = int(os.environ.get("PR_OPENED_HOLD_SECONDS", "600"))
 SPEND_CAP = float(os.environ.get("MAX_SPEND_PER_DAY", "0") or 0)  # dollars per agent; 0: none
 DEBOUNCE = int(os.environ.get("DEBOUNCE_SECONDS", "60"))
 MAX_DELAY = int(os.environ.get("MAX_DELAY_SECONDS", "900"))
@@ -410,6 +415,9 @@ def queue_coordinator_review(repo, n, sha=None):
         return
     add_trigger(COORDINATOR, f"review-requested:{repo}#{n}:{head[:12]}",
                 f"review requested from you on pull request {repo}#{n}, whose CI passed at {head[:12]}", once=True)
+    # A pull request opened lately shares this run rather than having its own.
+    q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL",
+      COORDINATOR, f"pr-opened:{repo}#{n}")
 
 
 REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
@@ -694,8 +702,10 @@ def handle(event, payload):
         rejected = "rejected" in event or review.get("type") == "pull_request_review_rejected"
         approved = "approved" in event or review.get("type") == "pull_request_review_approved"
         content = review.get("content") or ""
-        # A bare approval asks nothing of the author: its scheduled merge goes ahead.
-        asks = wants_reply(content) and not (approved and not content.strip())
+        # An approval asks nothing of the author, whatever it says (the
+        # coordinator's say what it checked): its scheduled merge goes ahead.
+        # A reviewer who wants more requests changes or comments.
+        asks = wants_reply(content) and not approved
         if (owner and trusted and sender != owner and (pr.get("user") or {}).get("login") == owner
                 and pr.get("state") == "open" and (rejected or asks)):
             what = "changes requested on" if rejected else "review on"
@@ -727,9 +737,8 @@ def handle(event, payload):
         if not coord:
             return
         if action == "opened":
-            add_trigger(coord, f"pr-opened:{repo}#{n}", f"pull request opened: {repo}#{n}", once=True)
-        elif action == "closed" and pr.get("merged"):
-            add_trigger(coord, f"pr-merged:{repo}#{n}", f"pull request merged: {repo}#{n}", once=True)
+            add_trigger(coord, f"pr-opened:{repo}#{n}", f"pull request opened: {repo}#{n}", once=True,
+                        not_before=now() + OPENED_HOLD)
         elif action == "review_requested" and (payload.get("requested_reviewer") or {}).get("login") == COORDINATOR:
             queue_coordinator_review(repo, n)  # once CI has passed on the head
 
@@ -919,10 +928,18 @@ def spend_today(agent):
     return q("SELECT COALESCE(SUM(cost), 0) AS s FROM runs WHERE agent=? AND claimed>=?", agent, day_start())[0]["s"]
 
 
+def cap_of(agent):
+    return COORDINATOR_CAP if agent == COORDINATOR else CAP
+
+
+def cap_setting(agent):
+    return "MAX_COORDINATOR_RUNS_PER_DAY" if agent == COORDINATOR else "MAX_RUNS_PER_DAY"
+
+
 def capped(agent):
     """Why the agent can't start another run today, or None."""
-    if runs_today(agent) >= CAP:
-        return f"its daily cap of {CAP} runs"
+    if runs_today(agent) >= cap_of(agent):
+        return f"its daily cap of {cap_of(agent)} runs"
     if SPEND_CAP and spend_today(agent) >= SPEND_CAP:
         return f"its daily spending cap of ${SPEND_CAP:.2f}"
     return None
@@ -961,7 +978,7 @@ def claim(agent):
             notify_agent(agent, f"cap:{agent}:{day}", "cap", f"{agent} reached {why} ({day})", {
                 "Question": f"`{agent}` reached {why} at {iso(now())}, with {len(rows)} trigger(s) waiting. "
                             "Should it carry on today?",
-                "Options": "- Raise `MAX_RUNS_PER_DAY` (or `MAX_SPEND_PER_DAY`) in `.env` and rerun "
+                "Options": f"- Raise `{cap_setting(agent)}` (or `MAX_SPEND_PER_DAY`) in `.env` and rerun "
                            "`scripts/up.sh`: the waiting work starts within a minute.\n"
                            "- Leave it: the waiting work starts after midnight UTC.",
                 "Recommendation": "Leave it unless the waiting work is urgent. If caps are reached most days, "
@@ -1022,7 +1039,7 @@ def status():
     agents = {}
     for name in AGENTS:
         pending = q("SELECT description, created, not_before FROM triggers WHERE agent=? AND run_id IS NULL ORDER BY created", name)
-        agents[name] = {"state": agent_state(name), "runs_today": runs_today(name), "cap": CAP,
+        agents[name] = {"state": agent_state(name), "runs_today": runs_today(name), "cap": cap_of(name),
                         "spend_today": round(spend_today(name), 2), "spend_cap": SPEND_CAP or None,
                         "pending": [{"trigger": p["description"], "since": iso(p["created"]),
                                      "after": iso(p["not_before"])} for p in pending]}
