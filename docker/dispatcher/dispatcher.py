@@ -1051,7 +1051,49 @@ def status():
     notices = [dict(n, at=iso(n["at"])) for n in q("SELECT * FROM notices ORDER BY id DESC LIMIT 50")]
     reconciled = kv_get("reconciled")
     return {"paused": paused(), "reconciled": iso(float(reconciled)) if reconciled else None,
-            "agents": agents, "runs": runs, "sessions": sessions, "notices": notices}
+            "agents": agents, "runs": runs, "sessions": sessions, "notices": notices,
+            "summary": kit_summary()}
+
+
+def kit_summary():
+    """One line: whether the kit will make progress by itself, or nothing
+    happens until the human acts. The same test as check_idle, without its
+    wait for quiet."""
+    try:
+        waiting = waiting_on_human()
+        ci = ci_running()
+    except Exception as e:
+        return f"Kit: can't tell ({e!r} from Forgejo)"
+    wait = (f"{waiting} item{'' if waiting == 1 else 's'} wait{'s' if waiting == 1 else ''} on you"
+            if waiting else "nothing waits on you")
+    if paused():
+        return f"Kit: paused, nothing starts until scripts/resume.sh; {wait}"
+    running = [r["agent"] for r in q("SELECT agent FROM runs WHERE ended IS NULL ORDER BY id")]
+    queued = q("SELECT agent, not_before FROM triggers WHERE run_id IS NULL")
+    capped_agents = sorted({t["agent"] for t in queued if capped(t["agent"])})
+    queued = [t for t in queued if t["agent"] not in capped_agents]
+    later = [t for t in queued if t["not_before"] and t["not_before"] > now()]
+    yours = [a for a in AGENTS if human_active(a)]
+    work = []
+    if running:
+        work.append(f"{len(running)} running ({', '.join(running)})")
+    if queued:
+        held = f", {len(later)} of them not yet due" if later else ""
+        work.append(f"{len(queued)} queued for {', '.join(sorted({t['agent'] for t in queued}))}{held}")
+    if ci:
+        work.append("CI running")
+    extra = []
+    if capped_agents:
+        extra.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
+    if yours:
+        extra.append(f"you're active in {', '.join(yours)}, whose runs wait for you")
+    tail = "".join(f"; {x}" for x in extra)
+    if work:
+        return f"Kit: working: {', '.join(work)}; {wait}{tail}"
+    if waiting or capped_agents:
+        return f"Kit: quiet, nothing happens until you act; {wait}{tail}"
+    return (f"Kit: quiet, and nothing waits on you: stalled or finished (the coordinator's idle summary "
+            f"says which){tail}")
 
 
 def notices_text(after):

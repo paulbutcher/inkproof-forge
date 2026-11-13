@@ -4,6 +4,8 @@
 # gatekeeper's latest approvals.
 # Then open requests, pull requests, recommendations and needs-human items
 # across the project's repositories, from Forgejo.
+# Last, one line saying whether the kit will make progress by itself or is
+# waiting on you.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 json="$(docker compose exec -T dispatcher python3 -c \
@@ -40,3 +42,5 @@ else
 fi
 echo
 docker compose run --rm -T tools project-status
+echo
+docker compose run --rm -T --no-deps --entrypoint jq tools -r ".summary // \"Kit: unknown (rebuild the dispatcher: docker compose up -d --build dispatcher)\"" <<<"$json"
