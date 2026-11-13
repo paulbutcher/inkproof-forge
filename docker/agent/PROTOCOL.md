@@ -37,6 +37,22 @@ Your account identifies you, so don't sign comments. A comment from a trusted ac
 - Depend on other libraries only at release tags (`vX.Y.Z`), through their public API. Never depend on a branch or commit, and never import modules named `Internal`. CI enforces the pinning.
 - Keep their GitHub URLs in `lakefile` and `lake-manifest.json`. Git fetches this project's repositories from Forgejo for you.
 
+## Reuse before you build
+
+Before designing anything new (a type, an algorithm, a group of lemmas), find out whether it already exists, in this order:
+
+1. this project's other libraries: every `inkproof-` repository's `API.lock`, and its source for private declarations, at `/workspace/<repo>`;
+2. the catalogue of known libraries, `PRIOR-ART.md` in `inkproof-coordination`, which includes the human's own Lean libraries;
+3. Lean core, Std, Batteries and Mathlib: search them with Loogle (`https://loogle.lean-lang.org/json?q=<query>`) or by reading their source;
+4. other Lean packages, on Reservoir (`https://reservoir.lean-lang.org`).
+
+Say in the pull request what you checked and what you found, in a `Prior art:` line. "None found" is a fine answer.
+
+- **In a library you depend on**: use it.
+- **In one of this project's libraries you don't depend on, or private in one you do**: don't write it again. If ARCH-1 lets you depend on that library, request that it be made public. If not, ask the coordinator, with a request on `inkproof-coordination`, to move it to the lowest library both can depend on. Either way, carry on as under "Never work around a dependency".
+- **Outside this project, in a library you don't depend on yet**: adding a dependency is the human's decision (Decisions for the human). Say what it provides, whether it works under Lasm (PLAT-3), and what it adds to every consumer's build. If you decide against it, record the reason in `DESIGN.md`.
+- **Nowhere**: build it, in the lowest library where it makes sense. Something with no knowledge of your library's domain belongs lower down, so say so in your pull request.
+
 ## Never work around a dependency
 
 If a library you depend on is missing something, or is wrong, do **not** reimplement it, copy its code, reach into its internals, or bend your design around the gap. Instead:

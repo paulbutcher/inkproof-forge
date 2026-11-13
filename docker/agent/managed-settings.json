@@ -16,6 +16,7 @@
       "Grep",
       "Task",
       "TodoWrite",
+      "WebFetch",
       "mcp__lean-lsp"
     ],
     "deny": [
