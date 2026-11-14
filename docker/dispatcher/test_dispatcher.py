@@ -136,6 +136,18 @@ class Case(unittest.TestCase):
         d._cache.clear()
         self.f = Forge()
         d.forge = self.f
+        # A claim checks a trigger is still owed on the item its key names,
+        # so every rule's key must name the item it was evaluated on.
+        owed_on = d.owed_on
+        self.addCleanup(setattr, d, "owed_on", owed_on)
+
+        def checked(it):
+            found = owed_on(it)
+            for o in found[0]:
+                m = d.RULE_KEY.match(o.key)
+                self.assertTrue(m and (m[2], int(m[3])) == (it.repo, it.n), f"{o.key} evaluated on {it.at}")
+            return found
+        d.owed_on = checked
 
     def queued(self, agent=None):
         """(agent, kind) of each waiting trigger, or just the kinds for one agent."""
@@ -635,6 +647,14 @@ class Mechanics(Case):
         d.evaluate(CORE, 1)
         d.q("UPDATE triggers SET created=?", d.now() - 3600)
         self.assertEqual(d.claim("core")["triggers"], [f"untriaged request {CORE}#1"])
+
+    def test_a_claim_keeps_merged_work_to_finish_consumer_metrics_12(self):
+        self.f.issue(CORE, 5, "scale", ["request", "accepted"])
+        self.f.pull(CORE, 7, "core", body="Refs #5", state="closed", merged=100)
+        d.evaluate(CORE, 5)
+        d.q("UPDATE triggers SET created=?", d.now() - 3600)
+        self.assertEqual(d.claim("core")["triggers"],
+                         [f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release"])
 
     def test_the_first_sweep_records_what_the_old_triggers_covered(self):
         d.q("DELETE FROM kv")

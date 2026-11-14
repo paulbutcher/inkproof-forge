@@ -907,7 +907,7 @@ def owner_rules(it, blocked, unblocked_at):
         # 6. Merged work it still has to finish: CHANGELOG.md and ready-for-release.
         if merged and not held:
             p = max(merged, key=lambda m: m[0]["merged_at"])[0]
-            o.append(Owed(owner, f"merged:{it.repo}#{p['number']}:{it.n}",
+            o.append(Owed(owner, f"merged:{at}:{p['number']}",
                           f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
                           "not yet labelled ready-for-release"))
         # 7. Accepted, nothing in its way and nothing under way, while the
