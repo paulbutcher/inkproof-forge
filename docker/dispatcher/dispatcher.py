@@ -842,6 +842,142 @@ def handle(event, payload):
                         f"CI failed on pull request {repo}#{n}", once=True)
 
 
+# --- Stalls ---------------------------------------------------------------------
+#
+# Work that waits on an agent but that no event will wake it for: the event
+# came and went while the agent did something else, or never comes. Each is
+# woken once per state, so an agent that answers by doing nothing isn't woken
+# again until something changes.
+
+QUIET = int(os.environ.get("STALL_QUIET_SECONDS", "600"))
+
+
+def when(stamp):
+    """A Forgejo timestamp, in seconds."""
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def ago(stamp):
+    return now() - when(stamp)
+
+
+def busy(agent):
+    """Running, with work queued, or with the human in its container: what it
+    leaves undone may yet be done."""
+    return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent)
+                or q("SELECT 1 FROM triggers WHERE agent=? AND run_id IS NULL", agent)
+                or human_active(agent))
+
+
+def timeline(repo, n):
+    return forge_list(f"/repos/{ORG}/{repo}/issues/{n}/timeline", 200)
+
+
+def last_label_event(events, label, added):
+    """When label was last added (or removed), from a timeline: Forgejo marks
+    an addition with the body "1"."""
+    found = [e["created_at"] for e in events if e.get("type") == "label"
+             and (e.get("label") or {}).get("name") == label and ((e.get("body") or "") == "1") == added]
+    return found[-1] if found else None
+
+
+def merge_scheduled(events):
+    """The latest schedule or cancellation in a pull request's timeline decides."""
+    found = [e["type"] for e in events if e.get("type") in ("pull_scheduled_merge", "pull_cancel_scheduled_merge")]
+    return bool(found) and found[-1] == "pull_scheduled_merge"
+
+
+def check_unscheduled_merges(repo, owner):
+    """The owner's open pull requests with no merge scheduled. Agents schedule
+    "merge when checks succeed" on every pull request; one that doesn't, or
+    whose schedule Forgejo dropped, never merges, and its approvals wake no one."""
+    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+        n, sha = pr["number"], pr["head"]["sha"]
+        if pr["user"]["login"] != owner or wip(pr.get("title")) or ago(pr["updated_at"]) < QUIET:
+            continue
+        if merge_scheduled(timeline(repo, n)):
+            continue
+        add_trigger(owner, f"unscheduled:{repo}#{n}:{sha[:12]}",
+                    f"your pull request {repo}#{n} has no merge scheduled, so it won't merge: schedule it "
+                    "(`forge pr automerge`), or close it if it's no longer wanted", once=True)
+
+
+def check_ready_for_release(repo):
+    """Issues still labelled ready-for-release that the coordinator hasn't
+    looked at since the label was added or main last changed: a refusal it
+    asked the owner to fix, fixed with the label left on, adds no label and so
+    wakes no one."""
+    issues = forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=ready-for-release")
+    issues = [i for i in issues if "ready-for-release" in {l["name"] for l in i.get("labels") or []}]
+    if not issues:
+        return
+    main = forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"]
+    for issue in issues:
+        n = issue["number"]
+        events = timeline(repo, n)
+        labelled = last_label_event(events, "ready-for-release", True) or issue["created_at"]
+        changed = max(when(labelled), when(main["timestamp"]))
+        looked = [when(e["created_at"]) for e in events if e.get("type") == "comment"
+                  and (e.get("user") or {}).get("login") == COORDINATOR]
+        if (looked and looked[-1] > changed) or now() - changed < QUIET:
+            continue
+        add_trigger(COORDINATOR, f"rfr-again:{repo}#{n}:{main['id'][:12]}:{labelled}",
+                    f"{repo}#{n} is still labelled ready-for-release, and "
+                    + ("main has changed since you last looked at it" if looked else "you haven't looked at it"),
+                    once=True)
+
+
+def opened_for(repo, owner):
+    """The issues the owner's open pull requests refer to with Refs."""
+    found = set()
+    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
+        if pr["user"]["login"] != owner:
+            continue
+        for line in REFS.findall(pr.get("body") or ""):
+            for org, r, k in REF.findall(line):
+                if not org or (org.lower() == ORG.lower() and r == repo):
+                    found.add(int(k))
+    return found
+
+
+def check_idle_requests(repo, owner):
+    """Accepted requests that nothing holds up (not blocked, no pull request
+    under way, not ready for release or released) while their owner has
+    nothing to do: it unblocked them in a run spent on other work, or a
+    refusal took ready-for-release off them. Woken once each time a request
+    is unblocked."""
+    under_way = None
+    for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=accepted"):
+        labels = {l["name"] for l in issue.get("labels") or []}
+        if (not {"request", "accepted"} <= labels
+                or labels & {"blocked", "ready-for-release", "verified", "new", "needs-human"}
+                or ago(issue["updated_at"]) < QUIET):
+            continue
+        n = issue["number"]
+        if under_way is None:
+            under_way = opened_for(repo, owner)
+        if n in under_way:
+            continue
+        events = timeline(repo, n)
+        if any(e.get("type") == "comment" and RELEASED.search(e.get("body") or "") for e in events):
+            continue  # the requester's to verify
+        since = (last_label_event(events, "blocked", False) or last_label_event(events, "accepted", True)
+                 or issue["created_at"])
+        add_trigger(owner, f"idle-request:{repo}#{n}:{since}",
+                    f"your accepted request {repo}#{n} isn't blocked and has no pull request under way: "
+                    "work on it, or say on it what it waits for (`blocked` with a `Blocked-by:` line)", once=True)
+
+
+def check_stalls(repo, owner):
+    if paused():
+        return
+    if owner and not busy(owner):
+        check_unscheduled_merges(repo, owner)
+        check_idle_requests(repo, owner)
+    if COORDINATOR and not busy(COORDINATOR):
+        check_ready_for_release(repo)
+
+
 # --- Reconciliation -------------------------------------------------------------
 
 def reconcile():
@@ -872,6 +1008,7 @@ def reconcile():
                     wake_after_merge(repo, owner, pr)
             check_behind(repo)
             check_released_requests(repo)
+            check_stalls(repo, owner)
             # What waits on the human but isn't assigned to them: from before
             # assignment, or a missed webhook. Forgejo ignores a label filter
             # naming a label the repository lacks, so check each item's own.

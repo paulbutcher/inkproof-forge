@@ -3,6 +3,7 @@ Run by scripts/test-dispatcher.sh, in the dispatcher's image."""
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 STATE = tempfile.mkdtemp()
 CONF = os.path.join(STATE, "agents.conf")
@@ -183,6 +184,153 @@ class ClosingWakesWhatItBlocks(unittest.TestCase):
 
     def test_another_issue_closing_wakes_nothing(self):
         self.assertEqual(self.close("inkproof-coordination", 71, ["request"]), [])
+
+
+class Stalls(unittest.TestCase):
+    """Work no event will wake anyone for, found by the reconciler: from
+    2026-11-14, scale#43 (approved, never scheduled to merge),
+    consumer-metrics#13 (fixed after a refused release with the label left
+    on) and float#5 (unblocked in a run spent on other work)."""
+
+    def setUp(self):
+        d.q("DELETE FROM triggers")
+        d.q("DELETE FROM runs")
+        d.q("DELETE FROM kv")
+        self.pulls, self.issues, self.timelines = [], [], {}
+        self.main = {"id": "m" * 40, "timestamp": self.at(3600)}
+
+        def forge(method, path, body=None):
+            path = path.split("&limit=")[0].split("?limit=")[0]
+            if path == "/repos/org/inkproof-core/pulls?state=open":
+                return self.pulls
+            if path.startswith("/repos/org/inkproof-core/issues?"):
+                want = path.split("labels=")[1]
+                return [i for i in self.issues if want in {l["name"] for l in i["labels"]}]
+            if path.startswith("/repos/org/inkproof-core/issues/") and path.endswith("/timeline"):
+                return self.timelines.get(int(path.split("/")[-2]), [])
+            if path == "/repos/org/inkproof-core/branches/main":
+                return {"commit": self.main}
+            raise AssertionError(f"unexpected call {method} {path}")
+        d.forge = forge
+
+    @staticmethod
+    def at(seconds_ago):
+        return datetime.fromtimestamp(d.now() - seconds_ago, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def label(self, name, added, seconds_ago, by="core"):
+        return {"type": "label", "label": {"name": name}, "body": "1" if added else "",
+                "created_at": self.at(seconds_ago), "user": {"login": by}}
+
+    def comment(self, by, seconds_ago, body="..."):
+        return {"type": "comment", "user": {"login": by}, "body": body, "created_at": self.at(seconds_ago)}
+
+    def issue(self, n, *labels, updated=3600):
+        self.issues.append({"number": n, "labels": [{"name": l} for l in labels], "user": {"login": "coordinator"},
+                            "created_at": self.at(7200), "updated_at": self.at(updated)})
+
+    def woken(self, agent):
+        return [r["key"].split(":")[0] for r in d.q("SELECT key FROM triggers WHERE agent=?", agent)]
+
+    # Pull requests
+
+    def pr(self, n=7, updated=3600, title="Use float", body=""):
+        self.pulls.append({"number": n, "title": title, "body": body, "user": {"login": "core"},
+                           "head": {"sha": "a" * 40}, "updated_at": self.at(updated)})
+
+    def test_an_approved_pull_request_never_scheduled_wakes_its_owner(self):
+        self.pr()
+        self.timelines[7] = [{"type": "review", "created_at": self.at(3600)}]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), ["unscheduled"])
+        d.q("UPDATE triggers SET run_id=1")
+        d.check_stalls("inkproof-core", "core")  # once per head
+        self.assertEqual(len(self.woken("core")), 1)
+
+    def test_a_scheduled_merge_wakes_no_one(self):
+        self.pr()
+        self.timelines[7] = [{"type": "pull_scheduled_merge", "created_at": self.at(3600)}]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), [])
+
+    def test_a_cancelled_schedule_does(self):
+        self.pr()
+        self.timelines[7] = [{"type": "pull_scheduled_merge", "created_at": self.at(3600)},
+                             {"type": "pull_cancel_scheduled_merge", "created_at": self.at(3000)}]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), ["unscheduled"])
+
+    def test_a_pull_request_just_opened_or_wip_waits(self):
+        self.pr(7, updated=30)
+        self.pr(8, title="WIP: later")
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), [])
+
+    def test_a_busy_owner_is_left_alone(self):
+        self.pr()
+        d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?)", d.now())
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), [])
+
+    def test_nothing_while_paused(self):
+        self.pr()
+        open(os.path.join(STATE, "paused"), "w").close()
+        try:
+            d.check_stalls("inkproof-core", "core")
+        finally:
+            os.remove(os.path.join(STATE, "paused"))
+        self.assertEqual(self.woken("core"), [])
+
+    # ready-for-release
+
+    def test_a_fix_after_a_refused_release_wakes_the_coordinator(self):
+        self.issue(13, "request", "accepted", "ready-for-release")
+        self.timelines[13] = [self.label("ready-for-release", True, 4000), self.comment("coordinator", 3900)]
+        self.main["timestamp"] = self.at(2000)
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("coordinator"), ["rfr-again"])
+
+    def test_one_the_coordinator_has_looked_at_since_wakes_no_one(self):
+        self.issue(13, "request", "accepted", "ready-for-release")
+        self.timelines[13] = [self.label("ready-for-release", True, 4000), self.comment("coordinator", 1000)]
+        self.main["timestamp"] = self.at(2000)
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("coordinator"), [])
+
+    def test_a_label_the_coordinator_never_saw_wakes_it(self):
+        self.issue(13, "request", "accepted", "ready-for-release")
+        self.timelines[13] = [self.label("ready-for-release", True, 4000)]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("coordinator"), ["rfr-again"])
+
+    def test_a_label_just_added_waits_for_its_own_wake(self):
+        self.issue(13, "request", "accepted", "ready-for-release")
+        self.timelines[13] = [self.label("ready-for-release", True, 30)]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("coordinator"), [])
+
+    # Accepted requests
+
+    def test_an_unblocked_request_left_alone_wakes_its_owner(self):
+        self.issue(5, "request", "accepted")
+        self.timelines[5] = [self.label("accepted", True, 7000), self.label("blocked", True, 6000),
+                             self.label("blocked", False, 3000)]
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), ["idle-request"])
+        d.q("UPDATE triggers SET run_id=1")
+        d.check_stalls("inkproof-core", "core")  # once per unblocking
+        self.assertEqual(len(self.woken("core")), 1)
+
+    def test_requests_held_up_or_under_way_wake_no_one(self):
+        self.issue(1, "request", "accepted", "blocked")
+        self.issue(2, "request", "accepted", "needs-human")
+        self.issue(3, "request", "accepted")
+        self.pr(9, body="Refs org/inkproof-core#3")
+        self.timelines[9] = [{"type": "pull_scheduled_merge", "created_at": self.at(3600)}]
+        self.issue(4, "request", "accepted")
+        self.timelines[4] = [self.comment("gatekeeper", 3000, "(no reply needed)\n\nReleased in v0.2.0: ...")]
+        self.issue(6, "request", "accepted", updated=30)
+        d.check_stalls("inkproof-core", "core")
+        self.assertEqual(self.woken("core"), [])
 
 
 if __name__ == "__main__":
