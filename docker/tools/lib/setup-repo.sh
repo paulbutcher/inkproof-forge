@@ -92,11 +92,15 @@ approvers() {
 
 ensure_branch_protection() {
   local repo="$1" level="$2" body have keys
+  # A pull request merely behind main may merge: requiring it up to date made
+  # every merge to main cost each open pull request an update, a new head and
+  # a new round of reviews. CI on main after the merge catches what the two
+  # changes break together, and a release needs it to pass.
   body="$(jq -nc --argjson a "$(approvers "$level")" '{
     rule_name: "main", enable_push: false, enable_merge_whitelist: false,
     required_approvals: 1, enable_approvals_whitelist: true, approvals_whitelist_username: $a,
     block_on_rejected_reviews: true, block_on_official_review_requests: true,
-    block_on_outdated_branch: true, dismiss_stale_approvals: true, ignore_stale_approvals: false,
+    block_on_outdated_branch: false, dismiss_stale_approvals: true, ignore_stale_approvals: false,
     enable_status_check: true, status_check_contexts: ["checks*"],
     require_signed_commits: false, apply_to_admins: false}')"
   # The coordination repository has no CI: nothing to require.

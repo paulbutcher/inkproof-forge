@@ -26,11 +26,14 @@ issue text, because they become a run's prompt.
 A claim is granted only when the agent has no run, is under its daily caps,
 the kit isn't paused, and its newest trigger has settled for the debounce
 period (or its oldest has waited the maximum delay), so a burst of events
-becomes one run.
+becomes one run. A run that fails, times out or exits early has its work
+queued again, up to MAX_RUN_RETRIES times; then it's the human's.
 
 Every RECONCILE_SECONDS, and on start, it checks Forgejo for work a missed
-webhook would have lost: untriaged requests, failed Actions runs on agents'
-pull requests, and agents' pull requests behind main.
+webhook would have lost, or no webhook will bring: untriaged requests, failed
+Actions runs on agents' pull requests, their pull requests that conflict with
+main or have no merge scheduled, accepted requests no one has started, and
+ready-for-release work the coordinator hasn't looked at since main changed.
 
 Once the kit has been quiet for IDLE_SECONDS (no run, no queued work, no CI),
 it wakes the coordinator to tell the human what it needs from them, once per
@@ -73,6 +76,10 @@ DEBOUNCE = int(os.environ.get("DEBOUNCE_SECONDS", "60"))
 MAX_DELAY = int(os.environ.get("MAX_DELAY_SECONDS", "900"))
 RECONCILE = int(os.environ.get("RECONCILE_SECONDS", "900"))
 SETTLE = int(os.environ.get("CONFORMANCE_SETTLE_SECONDS", "600"))
+# A run that fails, times out or exits early is tried again this many times,
+# after RETRY_DELAY_SECONDS times the attempt; then it is the human's.
+RETRIES = int(os.environ.get("MAX_RUN_RETRIES", "2"))
+RETRY_DELAY = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))
 REVIEWER = "conformance"
 MILESTONE_REVIEWERS = ("architecture", "process", "lasm")
 KEEP_PAYLOADS = 500
@@ -169,7 +176,8 @@ CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
 """)
 for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
-               "events ADD COLUMN detail TEXT"):     # ledgers from before the activity stream
+               "events ADD COLUMN detail TEXT",      # ledgers from before the activity stream
+               "triggers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"):  # before failed runs were retried
     try:
         DB.execute(f"ALTER TABLE {column}")
     except sqlite3.OperationalError:
@@ -300,21 +308,32 @@ def project_repo(repo):
     return repo.startswith(PREFIX)
 
 
-def pr_behind(repo, pr):
-    """Whether main has commits the pull request's branch lacks."""
-    cmp = forge("GET", f"/repos/{ORG}/{repo}/compare/{pr['head']['sha']}...main")
-    return (cmp or {}).get("total_commits", 0) > 0
+def main_failed(repo, owner, sha):
+    """CI failed on main: two pull requests that passed apart may fail
+    together, since one behind main may merge. Main stays unreleasable until
+    it's fixed, so its owner fixes it."""
+    if owner and sha:
+        add_trigger(owner, f"main-failed:{repo}:{sha[:12]}",
+                    f"CI failed on main of {repo} at {sha[:12]}: fix it before anything else", once=True)
 
 
-def check_behind(repo, main_sha=""):
+def check_main(repo, main_sha=""):
+    """Main's CI failing, and the owner's pull requests that conflict with
+    main. One merely behind main merges as it is (branch protection doesn't
+    require it to be up to date), so it needs no update: each update would be
+    a new head, and a new round of reviews, for nothing. Forgejo works out
+    conflicts after a push to main, so one it hasn't yet is found by the next
+    reconciliation."""
     owner = OWNER_OF.get(repo)
     if not owner:
         return
     main_sha = main_sha or forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"]["id"]
+    if has_ci(repo) and ci_state(repo, main_sha) == "failure":
+        main_failed(repo, owner, main_sha)  # a missed webhook
     for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-        if pr["user"]["login"] == owner and pr_behind(repo, pr):
-            add_trigger(owner, f"behind:{repo}#{pr['number']}:{main_sha[:12]}",
-                        f"pull request {repo}#{pr['number']} is behind main", once=True)
+        if pr["user"]["login"] == owner and pr.get("mergeable") is False:
+            add_trigger(owner, f"conflicts:{repo}#{pr['number']}:{main_sha[:12]}",
+                        f"pull request {repo}#{pr['number']} conflicts with main", once=True)
 
 
 def wake_blocked(match, what):
@@ -811,7 +830,7 @@ def handle(event, payload):
         wake_blocked((repo, None), f"{repo} released {tag}")
 
     elif event == "push" and payload.get("ref") == "refs/heads/main":
-        check_behind(repo, payload.get("after") or "")
+        check_main(repo, payload.get("after") or "")
 
     elif event == "action_run_success":
         run = payload.get("run") or {}
@@ -828,6 +847,9 @@ def handle(event, payload):
 
     elif event == "action_run_failure":
         run = payload.get("run") or {}
+        if run.get("event") == "push":  # CI runs on pushes to main only
+            main_failed(repo, owner, run.get("commit_sha") or "")
+            return
         if run.get("event") != "pull_request":
             return
         try:
@@ -1006,7 +1028,7 @@ def reconcile():
                 if (pr.get("merged") and merged and pr["user"]["login"] == owner
                         and now() - datetime.fromisoformat(merged.replace("Z", "+00:00")).timestamp() < RECONCILE * 2):
                     wake_after_merge(repo, owner, pr)
-            check_behind(repo)
+            check_main(repo)
             check_released_requests(repo)
             check_stalls(repo, owner)
             # What waits on the human but isn't assigned to them: from before
@@ -1202,7 +1224,41 @@ def claim(agent):
 
 
 def requeue(run_id):
+    """The run's work is still to do, through no fault of the run (the runner
+    restarted, or the kit was paused under it): queue it again as it was."""
     q("UPDATE triggers SET run_id=NULL WHERE run_id=?", run_id)
+
+
+def retry(agent, run_id, outcome):
+    """The run failed, timed out or exited early, so its work may be undone:
+    most triggers are queued once, and nothing else would queue them again.
+    Queue them again after a delay, up to RETRIES times; then put it to the
+    human, since another try would most likely fail the same way. Returns
+    whether they were queued again."""
+    rows = q("SELECT description, attempts FROM triggers WHERE run_id=?", run_id)
+    if not rows:
+        return False
+    attempt = max(r["attempts"] for r in rows) + 1
+    if attempt <= RETRIES:
+        q("UPDATE triggers SET run_id=NULL, attempts=?, not_before=? WHERE run_id=?",
+          attempt, now() + RETRY_DELAY * attempt, run_id)
+        log(f"{agent} run {run_id} {outcome}: its work is queued again (retry {attempt} of {RETRIES})")
+        return True
+    work = "\n".join(f"- {d}" for d in dict.fromkeys(r["description"] for r in rows))
+    notify_agent(agent, f"retries:{agent}:{run_id}", "failed-run",
+                 f"{agent}'s work failed {attempt} times (run {run_id})", {
+        "Question": f"Run {run_id} of `{agent}` ended `{outcome}`, the last of {attempt} tries at the same work. "
+                    "It won't be tried again by itself. What should happen to it?",
+        "Options": f"- Find out why from the run's log (`scripts/activity.sh {agent}`), fix the cause, and "
+                   f"continue the run yourself: `scripts/open.sh {agent}`, then resume it in the Claude "
+                   "extension.\n"
+                   "- Leave it: some of it (pull requests, untriaged requests, stalled work) is found again "
+                   "by the dispatcher's reconciliation; the rest waits for the next event on it.",
+        "Recommendation": "Find out why first: a run that fails every time is usually a cause outside it, such "
+                          "as a credential, the run length (`MAX_RUN_MINUTES`) or the turn limit.",
+        "If you say go ahead": "Nothing happens on its own. Close this issue once you've dealt with it.",
+        "Blocked on this": f"`{agent}`'s work from that run:\n{work}"})
+    return False
 
 
 def end_run(agent, run_id, r):
@@ -1218,9 +1274,12 @@ def end_run(agent, run_id, r):
       t, r.get("outcome"), r.get("cost"), r.get("turns"), json.dumps(r.get("denied") or []),
       r.get("session_id"), r.get("log"), r.get("transcript"), int(bool(r.get("in_extension"))),
       changes, r.get("archived_log"), r.get("archived_transcript"), run_id)
-    if (r.get("outcome") or "").startswith("exited"):
-        requeue(run_id)  # Claude never finished a reply: none of the work was done
-    else:
+    outcome = r.get("outcome") or ""
+    if paused() and outcome != "interrupted":
+        requeue(run_id)  # the pause refused its tool calls: it did what it could, not its work
+    elif outcome in ("completed", "interrupted") or not retry(agent, run_id, outcome):
+        # Done; or stopped by the human, who may continue it; or given up on.
+        # A retried run may still push, so its reviews wait for that.
         release_reviews(agent)
     if not r.get("in_extension") and r.get("session_id"):
         sid = r.get("session_id")

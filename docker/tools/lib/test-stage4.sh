@@ -61,7 +61,8 @@ s4_setup() {
   mkdir -p "/secrets/$S4_STRANGER"; ( umask 077; echo "$tok" > "/secrets/$S4_STRANGER/token" )
   s4_info "created $S4_STRANGER, a Forgejo account the kit doesn't trust, with write access to $S4_DEP"
 
-  # core's pull request, branched from main's parent so it is behind main.
+  # core's pull request, branched from main's parent so it is behind main
+  # (which, without a conflict, wakes no one).
   local branch="agent/core/stage4-test" parent n
   api DELETE "/repos/$ORG/$S4_LIB/branches/$branch" >/dev/null
   parent="$(call 200 GET "/repos/$ORG/$S4_LIB/git/commits/main" | jq -r '.parents[0].sha')"
@@ -170,7 +171,7 @@ s4_check_triggers() {
   expect coordinator "^review requested from you on pull request $S4_LIB#$pr$" "a review requested from it"
   expect core "^review on pull request $S4_LIB#$pr$" "a review of its pull request"
   expect core "^CI failed on pull request $S4_LIB#$pr$" "a failed Actions run on its pull request"
-  expect core "^pull request $S4_LIB#$pr is behind main$" "its pull request behind main"
+  expect_not core "^pull request $S4_LIB#$pr (is behind|conflicts with) main" "its pull request behind main but not conflicting"
   expect core "^$TEST_HUMAN_RE commented on upstream issue $COORDINATION#$up; $S4_LIB#$blocked is blocked on it$" \
     "the human's comment on the upstream issue it's blocked on"
   expect coordinator "^$S4_DEP released $S4_TAG$" "a release"

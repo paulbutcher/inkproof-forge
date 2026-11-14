@@ -64,8 +64,10 @@ class ConformanceSettles(unittest.TestCase):
     def test_run_that_exited_early_keeps_the_wait(self):
         d.forge = Forge("core")
         run = self.run_core()
+        d.q("INSERT INTO triggers (agent, key, description, created, run_id) VALUES ('core', 'k', 'work', ?, ?)",
+            d.now(), run)
         d.queue_conformance("inkproof-core", 7)
-        d.end_run("core", run, {"outcome": "exited 1"})
+        d.end_run("core", run, {"outcome": "exited 1"})  # retried: it may yet push
         self.assertGreater(self.review(), d.now() + 500)
 
     def test_human_in_the_container_counts_as_busy(self):
@@ -331,6 +333,106 @@ class Stalls(unittest.TestCase):
         self.issue(6, "request", "accepted", updated=30)
         d.check_stalls("inkproof-core", "core")
         self.assertEqual(self.woken("core"), [])
+
+
+class FailedRunsAreRetried(unittest.TestCase):
+    """A run's triggers are consumed when it's claimed; most are queued only
+    once, so a run that doesn't finish must give them back."""
+
+    def setUp(self):
+        for t in ("triggers", "runs", "notices"):
+            d.q(f"DELETE FROM {t}")
+        self.posted = []
+
+        def forge(method, path, body=None):
+            if method == "GET" and "/labels" in path:
+                return [{"id": 1, "name": "needs-human"}]
+            if method == "POST" and path == "/repos/org/inkproof-core/issues":
+                self.posted.append(body["title"])
+                return {"number": 99}
+            raise AssertionError(f"unexpected call {method} {path}")
+        d.forge = forge
+        d.add_trigger("core", "comment:1", "comment on issue inkproof-core#5", once=True)
+
+    def run_ending(self, outcome):
+        d.end_run("core", self.claim(), {"outcome": outcome})
+        return d.q("SELECT run_id, attempts, not_before FROM triggers WHERE key='comment:1'")[0]
+
+    def claim(self):
+        d.q("UPDATE triggers SET created=?, not_before=NULL", d.now() - 3600)
+        return d.claim("core")["run"]
+
+    def test_a_completed_run_consumes_its_work(self):
+        self.assertIsNotNone(self.run_ending("completed")["run_id"])
+
+    def test_a_failed_run_is_retried_later_then_put_to_the_human(self):
+        t = self.run_ending("failed: error_max_turns")
+        self.assertIsNone(t["run_id"])
+        self.assertEqual(t["attempts"], 1)
+        self.assertAlmostEqual(t["not_before"], d.now() + d.RETRY_DELAY, delta=5)
+        t = self.run_ending("timed out after 240 minutes")
+        self.assertEqual((t["run_id"], t["attempts"]), (None, 2))
+        self.assertAlmostEqual(t["not_before"], d.now() + 2 * d.RETRY_DELAY, delta=5)
+        self.assertEqual(self.posted, [])
+        t = self.run_ending("exited (status 1) before finishing a reply")
+        self.assertIsNotNone(t["run_id"])
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("failed 3 times", self.posted[0])
+
+    def test_a_run_the_human_stopped_isnt_retried(self):
+        self.assertIsNotNone(self.run_ending("interrupted")["run_id"])
+
+    def test_a_run_cut_short_by_a_pause_is_queued_again_as_it_was(self):
+        run = self.claim()
+        open(os.path.join(STATE, "paused"), "w").close()  # paused during the run
+        try:
+            d.end_run("core", run, {"outcome": "completed"})
+        finally:
+            os.remove(os.path.join(STATE, "paused"))
+        t = d.q("SELECT run_id, attempts FROM triggers WHERE key='comment:1'")[0]
+        self.assertEqual((t["run_id"], t["attempts"]), (None, 0))
+
+
+class MainChecks(unittest.TestCase):
+    """With branch protection not requiring an up-to-date branch, only a
+    conflict with main, or CI failing on main, wakes the owner."""
+
+    def setUp(self):
+        d.q("DELETE FROM triggers")
+        self.pulls, self.main_ci = [], "success"
+
+        def forge(method, path, body=None):
+            if path.startswith("/repos/org/inkproof-core/pulls?state=open"):
+                return self.pulls
+            if path.startswith("/repos/org/inkproof-core/actions/runs?head_sha="):
+                return {"workflow_runs": [{"commit_sha": "m" * 40, "status": self.main_ci}]}
+            raise AssertionError(f"unexpected call {method} {path}")
+        d.forge = forge
+
+    def woken(self):
+        return [r["description"] for r in d.q("SELECT description FROM triggers WHERE agent='core'")]
+
+    def test_behind_but_mergeable_wakes_no_one(self):
+        self.pulls = [{"number": 7, "user": {"login": "core"}, "mergeable": True}]
+        d.check_main("inkproof-core", "m" * 40)
+        self.assertEqual(self.woken(), [])
+
+    def test_a_conflict_wakes_the_owner(self):
+        self.pulls = [{"number": 7, "user": {"login": "core"}, "mergeable": False},
+                      {"number": 8, "user": {"login": "human"}, "mergeable": False}]
+        d.check_main("inkproof-core", "m" * 40)
+        self.assertEqual(self.woken(), ["pull request inkproof-core#7 conflicts with main"])
+
+    def test_ci_failing_on_main_wakes_the_owner(self):
+        self.main_ci = "failure"
+        d.check_main("inkproof-core", "m" * 40)
+        self.assertEqual(self.woken(), [f"CI failed on main of inkproof-core at {'m' * 12}: fix it before anything else"])
+
+    def test_the_failure_webhook_does_too(self):
+        d.handle("action_run_failure", {
+            "repository": {"name": "inkproof-core", "owner": {"login": "org"}}, "sender": {"login": "human"},
+            "run": {"event": "push", "commit_sha": "m" * 40}})
+        self.assertEqual(len(self.woken()), 1)
 
 
 if __name__ == "__main__":

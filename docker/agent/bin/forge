@@ -5,7 +5,6 @@ follow a rule tea can't enforce. Uses the agent's own token.
   forge pr automerge <n>          schedule "merge when checks succeed" on your
                                   pull request #n; it waits for the approvals
                                   your repository's autonomy level requires
-  forge pr update <n>             bring your pull request #n up to date with main
   forge ci <repo> <pr>            the Actions run for the pull request's head
                                   commit: success, failure, running or none
   forge pr approve <repo> <n> <message>
@@ -225,12 +224,6 @@ def main(argv):
         if s // 100 != 2:
             die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
         print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
-    elif len(argv) >= 3 and argv[0] == "pr" and argv[1] == "update":
-        n = number(argv[2])
-        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/update?style=merge")
-        if s // 100 != 2:
-            die(f"couldn't update #{n} ({s}): {(p or {}).get('message', '')}")
-        print(f"#{n} is up to date with main.")
     elif len(argv) >= 3 and argv[0] == "ci":
         sha, state = ci_state(repo_name(argv[1]), number(argv[2]))
         print(f"{state} ({sha[:12]})")
