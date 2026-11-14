@@ -59,7 +59,7 @@ If a library you depend on is missing something, or is wrong, do **not** reimple
 
 1. If it is one of this project's libraries, open an issue on its repository using the request template, with labels `request` and `new`: `tea issue create --repo {{ORG}}/<library> --labels request,new --title ... --description ...`.
 2. If it is outside this project (Lasm, Lean, Mathlib or any other), open an issue on `{{ORG}}/inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a minimal reproduction. If it stops you working, add `blocking` too: that tells the human.
-3. Mark your own task as blocked on that issue: add the `blocked` label to your task's issue, and a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment. A run starts for you when that repository publishes a release, or when the human closes or comments on an upstream issue. Remove `blocked` once you are no longer waiting.
+3. Mark your own task as blocked on that issue: add the `blocked` label to your task's issue, and a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment. A run starts for you when that issue is closed, when its repository publishes a release, or when the human comments on it if it is an upstream issue. Only a `Blocked-by:` line wakes you: an @-mention does not, so name the issue that must close. Remove `blocked` once you are no longer waiting.
 4. Move to other work.
 
 ## Handling requests on your repository

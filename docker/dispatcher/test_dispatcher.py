@@ -147,5 +147,43 @@ class ReleaseWakesTheRequester(unittest.TestCase):
         self.assertEqual(self.release("coordinator", "human"), ["coordinator"])
 
 
+class ClosingWakesWhatItBlocks(unittest.TestCase):
+    """inkproof-core#3 is blocked on whatever its Blocked-by: line names."""
+
+    def setUp(self):
+        d.q("DELETE FROM triggers")
+        d.q("DELETE FROM labels")
+        self.blocker = "org/inkproof-coordination#70"
+
+        def forge(method, path, body=None):
+            if path.startswith("/repos/org/inkproof-core/issues?") and "labels=blocked" in path:
+                return [{"number": 3, "body": f"Blocked-by: {self.blocker}", "user": {"login": "coordinator"}}]
+            if "/issues?" in path:
+                return []
+            if path.startswith("/repos/org/inkproof-core/issues/3/comments"):
+                return []
+            raise AssertionError(f"unexpected call {method} {path}")
+        d.forge = forge
+
+    def close(self, repo, n, labels=()):
+        d.handle("issues", {
+            "action": "closed", "repository": {"name": repo, "owner": {"login": "org"}},
+            "sender": {"login": "coordinator"},
+            "issue": {"number": n, "state": "closed", "user": {"login": "float"},
+                      "labels": [{"name": l} for l in labels]}})
+        return [r["description"] for r in d.q("SELECT description FROM triggers WHERE agent='core'")]
+
+    def test_a_closed_request_wakes_the_issue_it_blocks(self):
+        self.assertEqual(self.close("inkproof-coordination", 70, ["request"]),
+                         ["issue inkproof-coordination#70 was closed; inkproof-core#3 is blocked on it"])
+
+    def test_a_closed_upstream_issue_still_does(self):
+        self.assertEqual(self.close("inkproof-coordination", 70, ["upstream"]),
+                         ["upstream issue inkproof-coordination#70 was closed; inkproof-core#3 is blocked on it"])
+
+    def test_another_issue_closing_wakes_nothing(self):
+        self.assertEqual(self.close("inkproof-coordination", 71, ["request"]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

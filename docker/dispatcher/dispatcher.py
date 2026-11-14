@@ -714,8 +714,10 @@ def handle(event, payload):
                 if ms.get("open_issues") == 0:
                     add_trigger(coord, f"milestone-done:{repo}:{ms.get('id')}",
                                 f"the last open issue in milestone {ms.get('title')} on {repo} was closed", once=True)
-        if repo == COORDINATION and "upstream" in labels and action == "closed":
-            wake_blocked((repo, n), f"upstream issue {repo}#{n} was closed")
+        # Whatever a Blocked-by: line names, its closing ends the wait: an
+        # upstream issue, a request on another library, a decision.
+        if action == "closed" and not is_pr:
+            wake_blocked((repo, n), f"{'upstream issue' if 'upstream' in labels else 'issue'} {repo}#{n} was closed")
 
     elif event == "issue_comment" and action == "created":
         issue, c = payload.get("issue") or {}, payload.get("comment") or {}
