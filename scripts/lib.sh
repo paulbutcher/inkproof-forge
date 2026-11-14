@@ -21,7 +21,10 @@ set +a
 STATE_DIR="${STATE_DIR:-.}"
 # docker compose reads the same file, for these scripts and anything they run.
 COMPOSE_ENV_FILES="$KIT_ENV"
-export KIT_ENV STATE_DIR COMPOSE_ENV_FILES
+# The dispatcher's definition carries agents.conf's checksum, so that
+# `docker compose up -d` recreates it when the file changes.
+AGENTS_CONF_HASH="$(cksum < agents.conf | awk '{ print $1 }')"
+export KIT_ENV STATE_DIR COMPOSE_ENV_FILES AGENTS_CONF_HASH
 
 # The admin tools run from their image, so rebuild it whenever the kit's
 # copy of them changes; Docker's cache makes this quick when nothing has.

@@ -217,6 +217,9 @@ services:
       UNVERIFIED_STALL_SECONDS: ${UNVERIFIED_STALL_SECONDS:-172800}
       CONFORMANCE_SETTLE_SECONDS: ${CONFORMANCE_SETTLE_SECONDS:-600}
       REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
+      # It reads agents.conf only at start. The host scripts set this to the
+      # file's checksum, so scripts/up.sh recreates it when the file changes.
+      AGENTS_CONF_HASH: ${AGENTS_CONF_HASH:-}
     volumes:
       # webhook-secret, and token once scripts/bootstrap.sh has made it.
       - ${STATE_DIR:-.}/secrets/dispatcher:/run/secrets/dispatcher:ro
