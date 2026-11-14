@@ -465,9 +465,17 @@ def wake_after_merge(repo, owner, pr):
                     once=True)
 
 
-def conformance_wants_changes(repo, n):
+def conformance_awaits_reply(repo, n):
+    """conformance's last review asked for changes at the pull request's
+    current head, so an author's reply is its to read now. After a push the
+    head has moved on: the review queued for the new head (once CI passes)
+    reads the reply, and waking conformance before then is a run that can't
+    review."""
     mine = [r for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews") if r["user"]["login"] == REVIEWER]
-    return bool(mine) and mine[-1].get("state") == "REQUEST_CHANGES"
+    if not mine or mine[-1].get("state") != "REQUEST_CHANGES":
+        return False
+    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}") or {}
+    return mine[-1].get("commit_id") == (pr.get("head") or {}).get("sha")
 
 
 # --- What waits on the human ------------------------------------------------------
@@ -681,9 +689,10 @@ def handle(event, payload):
             add_trigger(requester, f"released:{repo}#{n}:{released[1]}",
                         f"your request {repo}#{n} was released in {released[1]}: upgrade to it, check its "
                         "acceptance criteria, and verify it", once=True)
-        # The author answers conformance's findings in a comment: conformance looks again.
+        # The author answers conformance's findings in a comment without pushing:
+        # conformance looks again. A reply after a push waits for the new head's review.
         if (is_pr and issue.get("state") == "open" and sender == (issue.get("user") or {}).get("login")
-                and sender != REVIEWER and wants_reply(c.get("body")) and conformance_wants_changes(repo, n)):
+                and sender != REVIEWER and wants_reply(c.get("body")) and conformance_awaits_reply(repo, n)):
             add_trigger(REVIEWER, f"conf-reply:{c.get('id')}",
                         f"the author replied on pull request {repo}#{n}, which you asked to change")
         # A milestone reviewer's report: one notice per report, not per recommendation.
