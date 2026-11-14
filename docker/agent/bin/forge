@@ -2,9 +2,13 @@
 """forge: the Forgejo operations agents need that tea lacks, or that must
 follow a rule tea can't enforce. Uses the agent's own token.
 
-  forge pr automerge <n>          schedule "merge when checks succeed" on your
-                                  pull request #n; it waits for the approvals
+  forge pr automerge <n>          merge your pull request #n now if nothing
+                                  stands in its way, else schedule "merge when
+                                  checks succeed": it waits for the approvals
                                   your repository's autonomy level requires
+  forge pr merge <n>              merge your pull request #n now, or say why
+                                  Forgejo won't: for a scheduled merge that
+                                  hasn't gone through
   forge ci <repo> <pr>            the Actions run for the pull request's head
                                   commit: success, failure, running or none
   forge pr approve <repo> <n> <message>
@@ -216,14 +220,22 @@ def ledger(days):
 
 
 def main(argv):
-    if len(argv) >= 3 and argv[0] == "pr" and argv[1] == "automerge":
+    if len(argv) >= 3 and argv[0] == "pr" and argv[1] in ("automerge", "merge"):
         n = number(argv[2])
-        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge",
-                   {"Do": "squash", "merge_when_checks_succeed": True,
-                    "delete_branch_after_merge": True})
-        if s // 100 != 2:
-            die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
-        print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
+        merge = {"Do": "squash", "delete_branch_after_merge": True}
+        # Forgejo acts on a scheduled merge only when a review or CI status
+        # arrives after it, so one scheduled once everything passed would
+        # never fire: merge directly when it can.
+        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge", merge)
+        if s // 100 == 2:
+            print(f"#{n} merged.")
+        elif argv[1] == "merge":
+            die(f"#{n} didn't merge ({s}): {(p or {}).get('message', '')}")
+        else:
+            s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge", {**merge, "merge_when_checks_succeed": True})
+            if s // 100 != 2:
+                die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
+            print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
     elif len(argv) >= 3 and argv[0] == "ci":
         sha, state = ci_state(repo_name(argv[1]), number(argv[2]))
         print(f"{state} ({sha[:12]})")

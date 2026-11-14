@@ -79,6 +79,10 @@ DEBOUNCE = int(os.environ.get("DEBOUNCE_SECONDS", "60"))
 MAX_DELAY = int(os.environ.get("MAX_DELAY_SECONDS", "900"))
 RECONCILE = int(os.environ.get("RECONCILE_SECONDS", "900"))
 SETTLE = int(os.environ.get("CONFORMANCE_SETTLE_SECONDS", "600"))
+# How long a scheduled merge may sit once nothing stands in its way before
+# its owner is told to merge it: Forgejo acts on a schedule only when a review
+# or CI status arrives after it, so one made once everything passed never fires.
+STUCK = int(os.environ.get("MERGE_STUCK_SECONDS", "600"))
 # A run that fails, times out or exits early is tried again this many times,
 # after RETRY_DELAY_SECONDS times the attempt; then it is the human's.
 RETRIES = int(os.environ.get("MAX_RUN_RETRIES", "2"))
@@ -660,7 +664,8 @@ def handle(event, payload):
 Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(None, False))
 
 # Kinds of trigger a rule queues, which a claim checks are still owed.
-RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "merged", "idle-request",
+RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "merged",
+              "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
               "review-requested", "rfr", "nh", "conf", "conf-reply", "milestone", "lasm-blocking"}
 # Kinds whose state, when the rules first run on an existing ledger, was
@@ -727,6 +732,33 @@ class Item:
         """The latest schedule or cancellation in the timeline decides."""
         found = [e["type"] for e in self.events if e.get("type") in ("pull_scheduled_merge", "pull_cancel_scheduled_merge")]
         return bool(found) and found[-1] == "pull_scheduled_merge"
+
+    def ready_since(self):
+        """When nothing last stood in the way of merging it, or None while
+        something does: CI passed on the head (where the repository has CI),
+        no conflict, no request for changes standing, and everyone a review
+        was requested from (code owners included) approved the head; at
+        least one approval. Ready since the latest of those approvals, the
+        last push and the merge's scheduling."""
+        if self.pr.get("mergeable") is not True or (has_ci(self.repo) and self.ci() != "success"):
+            return None
+        requested = set()
+        for e in self.events:
+            if e.get("type") == "review_request" and (e.get("assignee") or {}).get("login"):
+                (requested.discard if e.get("removed_assignee") else requested.add)(e["assignee"]["login"])
+        verdicts = {}
+        for r in self.reviews:  # oldest first: each reviewer's latest verdict stands
+            if r.get("state") in ("APPROVED", "REQUEST_CHANGES") and not r.get("dismissed"):
+                verdicts[login(r)] = r
+        if any(r["state"] == "REQUEST_CHANGES" for r in verdicts.values()):
+            return None
+        approved = {who: r for who, r in verdicts.items() if r.get("commit_id") == self.head}
+        if not approved or requested - set(approved):
+            return None
+        times = [when(r["submitted_at"]) for r in approved.values()]
+        times += [when(e["created_at"]) for e in self.events
+                  if e.get("type") in ("pull_push", "pull_scheduled_merge")]
+        return max(times)
 
 
 def blockers(it):
@@ -828,11 +860,17 @@ def owner_rules(it, blocked, unblocked_at):
         if it.pr.get("mergeable") is False:
             o.append(Owed(owner, f"conflicts:{at}:{head}:{main_of(it.repo)['id'][:12]}",
                           f"pull request {at} conflicts with main"))
-        # 5. No merge scheduled, so it would never merge.
+        # 5. No merge scheduled, so it would never merge; or one scheduled
+        #    that hasn't gone through STUCK after nothing stood in its way.
         if not wip(it.pr.get("title")) and not it.merge_scheduled():
             o.append(Owed(owner, f"unscheduled:{at}:{head}",
                           f"your pull request {at} has no merge scheduled, so it won't merge: schedule it "
                           "(`forge pr automerge`), or close it if it's no longer wanted"))
+        elif (not wip(it.pr.get("title")) and it.merge_scheduled()
+              and (ready := it.ready_since()) and now() >= ready + STUCK):
+            o.append(Owed(owner, f"stuck-merge:{at}:{head}:{iso(ready)}",
+                          f"your pull request {at} has every approval it needs and CI passed, but its scheduled "
+                          f"merge hasn't gone through: merge it now (`forge pr merge {it.n}`)"))
     request = not it.is_pr and "request" in it.labels and not it.labels & {"ready-for-release", "verified"}
     # Blocked by its Blocked-by: lines, or (naming none) by the label.
     held = blocked if blocked is not None else "blocked" in it.labels

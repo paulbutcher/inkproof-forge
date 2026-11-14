@@ -74,6 +74,12 @@ cmd_resume() {
         log "  $repo#$n is no longer open; not rescheduling it"
         continue
       fi
+      # Merge directly when nothing stands in the way: Forgejo acts on a
+      # scheduled merge only when a review or CI status arrives after it.
+      s="$(api POST "/repos/$ORG/$repo/pulls/$n/merge" '{"Do":"squash","delete_branch_after_merge":true}')"
+      case "$s" in
+        2*) log "  merged $repo#$n, in $HUMAN_USER's name"; continue ;;
+      esac
       s="$(api POST "/repos/$ORG/$repo/pulls/$n/merge" '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true}')"
       case "$s" in
         2*) log "  rescheduled the merge of $repo#$n, in $HUMAN_USER's name" ;;

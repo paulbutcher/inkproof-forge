@@ -233,6 +233,49 @@ class OwnerRules(Case):
                          [f"your pull request {CORE}#{n} has no merge scheduled, so it won't merge: schedule it "
                           "(`forge pr automerge`), or close it if it's no longer wanted" for n in (7, 9)])
 
+    def test_5_a_scheduled_merge_that_never_fired_scale_43(self):
+        """Approved by everyone requested and CI passed before the merge was
+        scheduled, so Forgejo never acted on the schedule."""
+        head, old = "a" * 40, "b" * 40
+
+        def requested(*who):
+            return [{**event("review_request", "core", 4000), "assignee": {"login": w}} for w in who]
+
+        def review(rid, who, ago, state="APPROVED", sha=head, dismissed=False):
+            return {"id": rid, "user": {"login": who}, "state": state, "commit_id": sha, "body": "",
+                    "submitted_at": at(ago), "dismissed": dismissed}
+
+        approvals = [review(1, "gatekeeper", 1700), review(2, "conformance", 1600), review(3, "coordinator", 1600)]
+        everyone = requested("gatekeeper", "conformance", "coordinator")
+        scheduled = [event("pull_scheduled_merge", "core", 1500)]
+        self.f.statuses[head] = ["success"]
+        # 7: ready 25 minutes ago. 8: scheduled only 5 minutes ago.
+        self.f.pull(CORE, 7, "core", events=everyone + scheduled, reviews=approvals)
+        self.f.pull(CORE, 8, "core", events=everyone + [event("pull_scheduled_merge", "core", 300)],
+                    reviews=approvals)
+        # 9: the coordinator's approval is of an older head.
+        self.f.pull(CORE, 9, "core", events=everyone + scheduled, reviews=approvals[:2] + [
+            review(3, "coordinator", 1600, sha=old)])
+        # 10: a request for changes still stands; 11: it was dismissed, then approved.
+        self.f.pull(CORE, 10, "core", events=everyone + scheduled, reviews=approvals + [
+            review(4, "human", 1600, "REQUEST_CHANGES")])
+        self.f.pull(CORE, 11, "core", events=everyone + scheduled, reviews=[
+            review(4, "conformance", 2000, "REQUEST_CHANGES", sha=old, dismissed=True)] + approvals)
+        # 12: CI still running on it.
+        self.f.pull(CORE, 12, "core", sha="c" * 40, events=everyone + scheduled, reviews=[
+            {**r, "commit_id": "c" * 40} for r in approvals])
+        self.f.statuses["c" * 40] = ["pending"]
+        for n in (7, 8, 9, 10, 11, 12):
+            d.evaluate(CORE, n)
+        stuck = [x for x in self.descriptions("core") if "hasn't gone through" in x]
+        self.assertEqual(stuck, [f"your pull request {CORE}#{n} has every approval it needs and CI passed, but its "
+                                 f"scheduled merge hasn't gone through: merge it now (`forge pr merge {n}`)"
+                                 for n in (7, 11)])
+        # Once per state: looked at again, it isn't queued again.
+        self.handled()
+        d.evaluate(CORE, 7)
+        self.assertNotIn("stuck-merge", self.queued("core"))
+
     def test_6_merged_work_still_to_finish(self):
         self.f.issue(CORE, 5, "scale", ["request", "accepted"])
         self.f.pull(CORE, 7, "core", body="Refs org/inkproof-core#5", state="closed", merged=100)
