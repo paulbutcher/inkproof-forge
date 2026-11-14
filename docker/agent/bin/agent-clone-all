@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Clones every one of this project's repositories that the agent can read and
+# hasn't cloned yet into /workspace/<repo>, as read-only background. Every
+# agent reads every repository, so a library added later is cloned before the
+# agent's next run, with no change to its container.
+#   agent-clone-all          at container start: waits for Forgejo
+#   agent-clone-all --quick  before a run: one attempt, never fails the run
+set -uo pipefail
+attempts=30
+[ "${1:-}" = --quick ] && attempts=1
+token="$(tr -d '[:space:]' < /run/secrets/forgejo_token)"
+prefix="${REPO_PREFIX:-inkproof-}"
+
+list() {
+  local page=1 got
+  while :; do
+    got="$(curl -fsS -m 30 -H "Authorization: token $token" \
+      "http://forgejo:3000/api/v1/orgs/${FORGE_ORG}/repos?limit=50&page=$page" | jq -r '.[].name')" || return 1
+    [ -n "$got" ] || return 0
+    printf '%s\n' "$got"
+    page=$((page + 1))
+  done
+}
+
+for i in $(seq 1 "$attempts"); do
+  repos="$(list)" && break
+  repos=""
+  [ "$i" = "$attempts" ] || { echo "agent-clone-all: can't list the repositories yet (attempt $i); retrying in 10s" >&2; sleep 10; }
+done
+[ -n "$repos" ] || { echo "agent-clone-all: couldn't list the repositories; check the token and Forgejo" >&2; exit 0; }
+
+for r in $repos; do
+  case "$r" in "$prefix"*) ;; *) continue ;; esac
+  [ "$r" = "${AGENT_REPO:-}" ] && continue
+  [ -d "/workspace/$r/.git" ] && continue
+  if git clone -q "http://forgejo:3000/${FORGE_ORG}/${r}.git" "/workspace/$r"; then
+    echo "agent-clone-all: cloned $r"
+  else
+    rm -rf "/workspace/$r"
+    echo "agent-clone-all: cloning $r failed" >&2
+  fi
+done
+exit 0

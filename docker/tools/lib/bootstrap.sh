@@ -170,6 +170,9 @@ cmd_bootstrap() {
       library)
         ensure_token "$name" "$SCOPES_WRITE"
         ensure_team "$name-own" "$U_OWN" "$name" "$own"
+        # Every library reads every repository, to reuse before it builds
+        # (the protocol); it files requests only on its dependencies.
+        ensure_team "$name-read" "$U_READ" "$name" "*"
         ensure_team "$name-deps" "$U_DEPS" "$name" "${r_list[@]}" ;;
       coordinator)
         ensure_token "$name" "$SCOPES_WRITE"

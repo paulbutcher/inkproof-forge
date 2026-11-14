@@ -9,6 +9,7 @@ CONF = os.path.join(STATE, "agents.conf")
 with open(CONF, "w") as f:
     f.write("coordinator coordinator inkproof-coordination *\n"
             "core library inkproof-core inkproof-coordination\n"
+            "scale library inkproof-scale inkproof-coordination,inkproof-core\n"
             "conformance pr-reviewer - *\n")
 os.environ.update(STATE_DIR=STATE, AGENTS_CONF=CONF, CONTROL_DIR=STATE, FORGE_ORG="org",
                   HUMAN_USER="human", CONFORMANCE_SETTLE_SECONDS="600")
@@ -121,6 +122,29 @@ class OpenedHoldEndsWithCI(unittest.TestCase):
         self.ci("failure")
         self.assertIsNone(self.held(7))
         self.assertGreater(self.held(8), d.now() + 500)
+
+
+class ReleaseWakesTheRequester(unittest.TestCase):
+    def setUp(self):
+        d.q("DELETE FROM triggers")
+
+    def release(self, requester, by):
+        d.handle("issue_comment", {
+            "action": "created", "repository": {"name": "inkproof-core", "owner": {"login": "org"}},
+            "sender": {"login": by},
+            "issue": {"number": 9, "state": "open", "user": {"login": requester},
+                      "labels": [{"name": "request"}]},
+            "comment": {"id": 1, "body": "(no reply needed)\n\nReleased in v1.2.3: http://forgejo/rel"}})
+        return [r["agent"] for r in d.q("SELECT agent FROM triggers WHERE key LIKE 'released:%'")]
+
+    def test_another_agents_request_wakes_it_to_verify(self):
+        self.assertEqual(self.release("scale", "gatekeeper"), ["scale"])
+
+    def test_the_coordinators_own_release_wakes_no_one(self):
+        self.assertEqual(self.release("coordinator", "gatekeeper"), [])
+
+    def test_the_humans_release_of_a_coordinator_request_wakes_it(self):
+        self.assertEqual(self.release("coordinator", "human"), ["coordinator"])
 
 
 if __name__ == "__main__":

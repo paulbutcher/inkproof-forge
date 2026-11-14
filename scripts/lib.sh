@@ -26,6 +26,14 @@ COMPOSE_ENV_FILES="$KIT_ENV"
 AGENTS_CONF_HASH="$(cksum < agents.conf | awk '{ print $1 }')"
 export KIT_ENV STATE_DIR COMPOSE_ENV_FILES AGENTS_CONF_HASH
 
+# compose.yaml includes the agents' services, generated from agents.conf.
+# Rewritten only when it changes, so its timestamp means something.
+awk -f scripts/compose-agents.awk agents.conf docker/agent/compose.base.yaml agents.conf > compose.agents.yaml.new \
+  || { echo "Couldn't generate compose.agents.yaml from agents.conf" >&2; rm -f compose.agents.yaml.new; exit 1; }
+if cmp -s compose.agents.yaml.new compose.agents.yaml; then rm -f compose.agents.yaml.new; else mv compose.agents.yaml.new compose.agents.yaml; fi
+# Every agent, in agents.conf's order.
+AGENTS="$(awk '!/^[[:space:]]*(#|$)/ { print $1 }' agents.conf | tr '\n' ' ')"
+
 # The admin tools run from their image, so rebuild it whenever the kit's
 # copy of them changes; Docker's cache makes this quick when nothing has.
 [ -n "${KIT_NO_BUILD:-}" ] || docker compose --profile tools build --quiet tools >/dev/null \

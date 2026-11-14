@@ -9,3 +9,7 @@ backups/
 # Editor and OS clutter
 .DS_Store
 *.swp
+
+# Generated from agents.conf by scripts/lib.sh.
+compose.agents.yaml
+compose.agents.yaml.new

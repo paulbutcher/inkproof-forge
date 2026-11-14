@@ -221,6 +221,11 @@ def interrupt(*_):
 
 def run(claim):
     run_id, triggers = claim["run"], claim.get("triggers", [])
+    # A library added since the container started: clone it before the run.
+    try:
+        subprocess.run(["agent-clone-all", "--quick"], timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"agent-clone-all: {e}")
     session = str(uuid.uuid4())
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     log_path = f"{LOGS}/runs/{stamp}-{session[:8]}.md"

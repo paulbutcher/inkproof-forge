@@ -1,0 +1,64 @@
+# The head of compose.agents.yaml, which scripts/lib.sh generates from
+# agents.conf on every run of a kit script; compose.yaml includes it. Each
+# agent's image is the shared base plus its own managed CLAUDE.md (role, then
+# protocol) and git rules, baked in at build. The generator replaces each AGENTS
+# placeholder below with every agent's name.
+x-agent-args: &agent-args
+  USER_UID: ${HOST_UID:-501}
+  USER_GID: ${HOST_GID:-20}
+  FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
+  HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
+  GH_OWNERS: ${GH_OWNER:?set GH_OWNER in .env} ${GH_FORMER_OWNERS:-}
+  # Forgejo as the human's browser reaches it, written into the coordinator's
+  # role for links to the human.
+  FORGE_WEB_URL: http://localhost:${FORGE_PORT:-3000}
+
+x-agent-build: &agent-build
+  context: ./docker/agent
+  target: agent
+  additional_contexts:
+    roles: ./roles
+
+x-agent-env: &agent-env
+  HTTPS_PROXY: http://proxy:3128
+  HTTP_PROXY: http://proxy:3128
+  https_proxy: http://proxy:3128
+  http_proxy: http://proxy:3128
+  NO_PROXY: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
+  no_proxy: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
+  FORGE_ORG: ${FORGE_ORG}
+  HUMAN_USER: ${HUMAN_USER}
+  # Whose issues and comments count; everyone else's are ignored.
+  TRUSTED_AUTHORS: ${HUMAN_USER} {{AGENTS}} gatekeeper dispatcher
+  # How long after the human's last activity a run may start, and the
+  # longest a run may last.
+  HUMAN_GRACE_SECONDS: ${HUMAN_GRACE_SECONDS:-600}
+  MAX_RUN_MINUTES: ${MAX_RUN_MINUTES:-240}
+  REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
+
+x-agent: &agent
+  init: true
+  restart: unless-stopped
+  networks: [agents]
+  depends_on:
+    archive-init: { condition: service_completed_successfully }
+    proxy: { condition: service_started }
+    dispatcher: { condition: service_started }
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  working_dir: /workspace
+  # CLAUDE_CODE_OAUTH_TOKEN, from secrets/claude/oauth-token (scripts/up.sh).
+  env_file:
+    - path: ${STATE_DIR:-.}/secrets/claude/agent.env
+      required: false   # scripts/up.sh refuses to start agents without it
+
+
+services:
+  # Creates each agent's folder in the run archive, owned by the agent's user,
+  # before any agent starts; each agent mounts only its own folder.
+  archive-init:
+    image: alpine:3.24
+    network_mode: none
+    entrypoint: ["sh", "-c", "for a in {{AGENTS}}; do mkdir -p /archive/$$a; chown ${HOST_UID:-501}:${HOST_GID:-20} /archive/$$a; done"]
+    volumes:
+      - run-archive:/archive

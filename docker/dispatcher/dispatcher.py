@@ -727,11 +727,15 @@ def handle(event, payload):
             add_trigger(owner, f"comment:{c.get('id')}", f"comment on {'pull request' if is_pr else 'issue'} {repo}#{n}")
         labels = {l["name"] for l in issue.get("labels") or []}
         # A release comment on a request needs no reply, but its requester has
-        # work: upgrade, check the acceptance criteria and verify.
+        # work: upgrade, check the acceptance criteria and verify. Except the
+        # coordinator's own requests released through the gatekeeper: it asked
+        # for that release, having just checked them, and verifies them in the
+        # same run (the unverified nudge still catches one it forgets).
         released = RELEASED.search(c.get("body") or "")
         requester = (issue.get("user") or {}).get("login")
+        own_release = requester == COORDINATOR and sender == "gatekeeper"
         if (released and sender in ("gatekeeper", HUMAN, owner) and not is_pr and issue.get("state") == "open"
-                and "request" in labels and requester in AGENTS and AGENTS[requester]["own"]):
+                and "request" in labels and requester in AGENTS and AGENTS[requester]["own"] and not own_release):
             add_trigger(requester, f"released:{repo}#{n}:{released[1]}",
                         f"your request {repo}#{n} was released in {released[1]}: upgrade to it, check its "
                         "acceptance criteria, and verify it", once=True)

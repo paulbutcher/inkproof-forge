@@ -48,8 +48,8 @@ fi
 
 # Agents. Each needs its Forgejo token (scripts/bootstrap.sh), its runner key
 # (made above) and the Claude token; without them it isn't started, rather
-# than started into a run that can only fail.
-AGENTS="coordinator devtools float core scale consumer-metrics conformance architecture process lasm"
+# than started into a run that can only fail. $AGENTS (scripts/lib.sh) is every
+# agent in agents.conf.
 claude_token="$STATE_DIR/secrets/claude/oauth-token"
 if [ ! -s "$claude_token" ]; then
   echo "Not starting agents: put a token from \`claude setup-token\` in ${claude_token#./} first (see README)."

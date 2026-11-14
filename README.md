@@ -7,9 +7,11 @@ The kit was built in stages: Forgejo, CI, the egress proxies and the bootstrap (
 ## Layout
 
 ```
-compose.yaml            Forgejo, port forwarder, proxies, CI runner and engine, dispatcher
+compose.yaml            Forgejo, port forwarder, proxies, CI runner and engine, dispatcher;
+                        it includes compose.agents.yaml, the agents, which scripts/lib.sh
+                        generates from agents.conf (never edit or commit it)
 .env.example            organisation, your Forgejo username and email, host UID/GID, port
-agents.conf             every agent: kind, own repository, repositories it reads
+agents.conf             every agent: kind, own repository, repositories it files issues on
 docker/proxy/           squid config and one allowlist each for agents, CI and Forgejo
 docker/ci/              runner config and entry point; image/ is the image CI jobs run in
 docker/dispatcher/      receives Forgejo's webhooks, queues work for agents, keeps the run ledger
@@ -81,7 +83,7 @@ Day to day:
 `scripts/up.sh` starts the coordinator and every library agent once each has its tokens. Each library's repository needs `scripts/setup-repo.sh <repository> 1` and its pull request merged, as for `inkproof-core`; so does `inkproof-coordination`, which gets code owners and the request template but no CI.
 
 - **What starts work.** Only you and the kit's accounts; never an agent's own actions, an untrusted account, or a comment whose first line is `(no reply needed)`.
-  - Every agent, on its own repository: a request (labels `request` and `new`), a comment or review on one of its open issues or pull requests, a failed Actions run on one of its pull requests, one of its pull requests falling behind `main`, one of its pull requests merging while a request it names with `Refs` still lacks `ready-for-release`, the release of a request it filed (and again a day later if it's still unverified), and a release, a closed upstream issue or your comment on one, when one of its `blocked` issues names it in a `Blocked-by:` line.
+  - Every agent, on its own repository: a request (labels `request` and `new`), a comment or review on one of its open issues or pull requests, a failed Actions run on one of its pull requests, one of its pull requests falling behind `main`, one of its pull requests merging while a request it names with `Refs` still lacks `ready-for-release`, the release of a request it filed (and again a day later if it's still unverified; the coordinator verifies its own requests as it releases them, so isn't woken for those), and a release, a closed upstream issue or your comment on one, when one of its `blocked` issues names it in a `Blocked-by:` line.
   - The coordinator, across the project: a request filed, a pull request opened (held until CI finishes on it, or 10 minutes at most, `PR_OPENED_HOLD_SECONDS`, so that a review requested from it shares the run), `ready-for-release` added, a release published, `needs-human` added or removed, a review requested from it, the last open issue in a milestone closing, and the kit going quiet (below).
 - **Missed webhooks** delay work rather than lose it: on start and every 15 minutes (`RECONCILE_SECONDS`), the dispatcher looks in Forgejo for untriaged requests, failed Actions runs on agents' pull requests, and their pull requests behind `main`.
 - **Caps.** Each agent starts at most 20 runs per UTC day (`MAX_RUNS_PER_DAY`), and the coordinator 40 (`MAX_COORDINATOR_RUNS_PER_DAY`), because every other agent's work wakes it, and optionally spends at most `MAX_SPEND_PER_DAY` dollars. A reached cap is a decision for you: an issue of its own, assigned to you, saying what's waiting and how to raise the cap.
@@ -98,9 +100,9 @@ Day to day:
 A new library starts in Forgejo, not on GitHub: `scripts/new-library.sh` creates its repository with a seed that builds and passes CI, and the push mirror then fills an empty GitHub repository.
 
 1. On GitHub, create an empty public repository `paulbutcher/<repository>`, with no README, and add it to the mirror token.
-2. Add the library's agent: a line in `agents.conf` (and the new repository in the reads of every library that will depend on it), `roles/<agent>.md`, and in `compose.yaml` and `scripts/up.sh` its service, volumes and name everywhere the other agents' names are listed.
+2. Add the library's agent: a line in `agents.conf` (and the new repository in the dependencies of every library that will depend on it), and its role in `roles/<agent>.md`. Its compose service is generated from `agents.conf`.
 3. `scripts/new-library.sh <repository> <Name>`, for example `scripts/new-library.sh inkproof-float Float`, creates the repository and commits its seed to `main`: a Lake package for `Inkproof.<Name>` with a test package, from `templates/library/`, and `CLAUDE.md`, `LICENSE`, `.gitignore`, `lean-toolchain` and the manifests' format from `inkproof-core` (`SEED_FROM` names another). It then gives the teams the repository and creates its labels. It never seeds over a repository with content.
-4. `scripts/mirrors.sh`, then `scripts/up.sh`, which starts the agent and gives the others their clone of the repository.
+4. `scripts/mirrors.sh`, then `scripts/up.sh`, which starts the agent. Every agent reads every repository, and clones a new one before its next run.
 5. `scripts/setup-repo.sh <repository> <level>`, and merge its pull request, as for any repository.
 
 ### Reviews
