@@ -362,8 +362,14 @@ def has_ci(repo):
 
 def queue_conformance(repo, n, sha=None):
     """Work for conformance: review pull request n at its head, once that head
-    has settled (no newer commit for SETTLE seconds) and if it hasn't already
-    reviewed it. Pull requests marked as work in progress are skipped."""
+    has settled and if it hasn't already reviewed it. Pull requests marked as
+    work in progress are skipped.
+
+    An agent pushes only during a run, so a head whose author is an agent with
+    no run under way, and whose container the human isn't using, has settled
+    already. Otherwise the review waits for the author's run to end
+    (release_reviews), or SETTLE seconds at most: the human's own pull
+    requests, and runs that go on, still get a review."""
     if REVIEWER not in AGENTS:
         return
     pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
@@ -380,8 +386,38 @@ def queue_conformance(repo, n, sha=None):
            for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
         drop_pending(REVIEWER, key)
         return
+    author = (pr.get("user") or {}).get("login")
+    settled = author in AGENTS and not may_push(author)
     add_trigger(REVIEWER, key, f"review pull request {repo}#{n} at {head[:12]}",
-                once=True, not_before=now() + SETTLE)
+                once=True, not_before=None if settled else now() + SETTLE)
+    if settled:  # queued while its author could still push
+        q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL", REVIEWER, key)
+
+
+def may_push(agent):
+    """Whether an agent could still push: a run under way, or the human
+    active in its container."""
+    return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent)) or human_active(agent)
+
+
+def release_reviews(agent):
+    """The agent's run has ended: the reviews of its pull requests that wait
+    to settle can start now."""
+    if may_push(agent):
+        return
+    for t in q("SELECT id, key FROM triggers WHERE agent=? AND run_id IS NULL AND key LIKE 'conf:%' "
+               "AND not_before>?", REVIEWER, now()):
+        m = re.match(r"conf:([^#]+)#(\d+):", t["key"])
+        if not m:
+            continue
+        try:
+            pr = forge("GET", f"/repos/{ORG}/{m[1]}/pulls/{m[2]}")
+        except Exception as e:
+            log(f"couldn't read {m[1]}#{m[2]} to release its review: {e!r}")
+            continue
+        if (pr.get("user") or {}).get("login") == agent:
+            q("UPDATE triggers SET not_before=NULL WHERE id=?", t["id"])
+            log(f"{agent}'s run ended: conformance may review {m[1]}#{m[2]} now")
 
 
 def ci_state(repo, sha):
@@ -1028,6 +1064,8 @@ def end_run(agent, run_id, r):
       changes, r.get("archived_log"), r.get("archived_transcript"), run_id)
     if (r.get("outcome") or "").startswith("exited"):
         requeue(run_id)  # Claude never finished a reply: none of the work was done
+    else:
+        release_reviews(agent)
     if not r.get("in_extension") and r.get("session_id"):
         sid = r.get("session_id")
         notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",
