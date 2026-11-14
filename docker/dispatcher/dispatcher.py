@@ -456,6 +456,16 @@ def queue_coordinator_review(repo, n, sha=None):
       COORDINATOR, f"pr-opened:{repo}#{n}")
 
 
+def release_opened(repo, n):
+    """CI has finished on pull request n, so whether it asks for the
+    coordinator's review is known: if it does, that review was queued and
+    shares the run; if not, none is coming. Either way, "pull request opened"
+    need hold no longer."""
+    if COORDINATOR:
+        q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL",
+          COORDINATOR, f"pr-opened:{repo}#{n}")
+
+
 REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
 REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
 
@@ -808,16 +818,19 @@ def handle(event, payload):
         if pr.get("number"):
             queue_conformance(repo, pr["number"], run.get("commit_sha"))
             queue_coordinator_review(repo, pr["number"], run.get("commit_sha"))
+            release_opened(repo, pr["number"])
 
     elif event == "action_run_failure":
         run = payload.get("run") or {}
-        if run.get("event") != "pull_request" or not owner:
+        if run.get("event") != "pull_request":
             return
         try:
             pr = json.loads(run.get("event_payload") or "{}").get("pull_request") or {}
         except ValueError:
             return
-        if (pr.get("user") or {}).get("login") == owner:
+        if pr.get("number"):
+            release_opened(repo, pr["number"])
+        if owner and (pr.get("user") or {}).get("login") == owner:
             n = pr.get("number")
             add_trigger(owner, f"ci-failed:{repo}#{n}:{run.get('commit_sha', '')[:12]}",
                         f"CI failed on pull request {repo}#{n}", once=True)

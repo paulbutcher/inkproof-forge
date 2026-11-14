@@ -93,5 +93,35 @@ class ConformanceSettles(unittest.TestCase):
         self.assertIsNone(self.review())
 
 
+class OpenedHoldEndsWithCI(unittest.TestCase):
+    def setUp(self):
+        d.q("DELETE FROM triggers")
+        d.q("DELETE FROM runs")
+        d.forge = Forge("core")
+        for n in (7, 8):
+            d.add_trigger("coordinator", f"pr-opened:inkproof-core#{n}", f"pull request opened: inkproof-core#{n}",
+                          once=True, not_before=d.now() + 600)
+
+    def held(self, n):
+        return d.q("SELECT not_before FROM triggers WHERE agent='coordinator' AND key=?",
+                   f"pr-opened:inkproof-core#{n}")[0]["not_before"]
+
+    def ci(self, outcome):
+        d.handle(f"action_run_{outcome}", {
+            "repository": {"name": "inkproof-core", "owner": {"login": "org"}}, "sender": {"login": "core"},
+            "run": {"event": "pull_request", "commit_sha": "a" * 40,
+                    "event_payload": '{"pull_request": {"number": 7, "user": {"login": "core"}}}'}})
+
+    def test_ci_passing_ends_the_hold_on_that_pull_request_only(self):
+        self.ci("success")
+        self.assertIsNone(self.held(7))
+        self.assertGreater(self.held(8), d.now() + 500)
+
+    def test_ci_failing_ends_the_hold_too(self):
+        self.ci("failure")
+        self.assertIsNone(self.held(7))
+        self.assertGreater(self.held(8), d.now() + 500)
+
+
 if __name__ == "__main__":
     unittest.main()
