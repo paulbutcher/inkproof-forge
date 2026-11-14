@@ -23,17 +23,19 @@ agent's own actions, and never a comment whose first line is
 `(no reply needed)`. Trigger descriptions carry only numbers and names, never
 issue text, because they become a run's prompt.
 
+What an agent owes comes from rules over each issue and pull request as it
+is now (see Rules), never from the events themselves: a webhook only says
+which items to evaluate again, and every RECONCILE_SECONDS, and on start, a
+sweep evaluates them all. Each rule queues a trigger once per version of the
+state it looks at, so nothing is lost to a missed webhook and nothing wakes
+an agent twice for the same state.
+
 A claim is granted only when the agent has no run, is under its daily caps,
 the kit isn't paused, and its newest trigger has settled for the debounce
 period (or its oldest has waited the maximum delay), so a burst of events
-becomes one run. A run that fails, times out or exits early has its work
-queued again, up to MAX_RUN_RETRIES times; then it's the human's.
-
-Every RECONCILE_SECONDS, and on start, it checks Forgejo for work a missed
-webhook would have lost, or no webhook will bring: untriaged requests, failed
-Actions runs on agents' pull requests, their pull requests that conflict with
-main or have no merge scheduled, accepted requests no one has started, and
-ready-for-release work the coordinator hasn't looked at since main changed.
+becomes one run; and only for triggers whose items still owe them. A run
+that fails, times out or exits early has its work queued again, up to
+MAX_RUN_RETRIES times; then it's the human's.
 
 Once the kit has been quiet for IDLE_SECONDS (no run, no queued work, no CI),
 it wakes the coordinator to tell the human what it needs from them, once per
@@ -49,6 +51,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime
 import urllib.error
 import urllib.parse
@@ -174,6 +177,8 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS triggers_pending ON triggers (agent, run_id);
 CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
+CREATE TABLE IF NOT EXISTS blocked_by (repo TEXT, number INTEGER, on_repo TEXT, on_number INTEGER);
+CREATE INDEX IF NOT EXISTS blocked_by_on ON blocked_by (on_repo, on_number);
 """)
 for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
                "events ADD COLUMN detail TEXT",      # ledgers from before the activity stream
@@ -189,16 +194,6 @@ def q(sql, *args):
         return DB.execute(sql, args).fetchall()
 
 
-# Once: conformance reviews that the reconciler dropped by mistake (before
-# this was fixed, it dropped a review still settling, which `once` then never
-# queued again). Renamed rather than deleted, so the history stays, they no
-# longer stop the reconciler queueing the review again where it's still due.
-if not q("SELECT 1 FROM kv WHERE key='repaired-conformance-drops'"):
-    with LOCK:
-        DB.execute("UPDATE triggers SET key = key || ':dropped' WHERE key LIKE 'conf:%' AND run_id=-1 "
-                   "AND key NOT LIKE '%:dropped'")
-        DB.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('repaired-conformance-drops', '1')")
-
 
 def kv_get(key, default=None):
     row = q("SELECT value FROM kv WHERE key=?", key)
@@ -209,22 +204,20 @@ def kv_set(key, value):
     q("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)", key, str(value))
 
 
-def add_trigger(agent, key, description, once=False, recent=0, not_before=None):
+def add_trigger(agent, key, description, once=False, not_before=None):
     """Queue work for an agent, unless the same key is already waiting; with
-    once, unless it was ever queued; with recent, unless it was queued in the
-    last `recent` seconds. With not_before, it waits until then to be claimed."""
+    once, unless it was ever queued. With not_before, it waits until then to
+    be claimed. Queued again without one while it waits, it waits no longer
+    (a review whose author's run has ended, a pull request whose CI has
+    finished), unless it waits to be retried."""
     if agent not in AGENTS:
         return
     with LOCK:
-        if once:
-            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=?", (agent, key)).fetchone()
-        elif recent:
-            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=? AND (run_id IS NULL OR created>?)",
-                             (agent, key, now() - recent)).fetchone()
-        else:
-            dup = DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=? AND run_id IS NULL",
-                             (agent, key)).fetchone()
+        dup = DB.execute("SELECT id, run_id, not_before, attempts FROM triggers WHERE agent=? AND key=? "
+                         + ("" if once else "AND run_id IS NULL ") + "ORDER BY id DESC", (agent, key)).fetchone()
         if dup:
+            if (dup["run_id"] is None and dup["not_before"] and not_before is None and not dup["attempts"]):
+                DB.execute("UPDATE triggers SET not_before=NULL WHERE id=?", (dup["id"],))
             return
         DB.execute("INSERT INTO triggers (agent, key, description, created, not_before) VALUES (?,?,?,?,?)",
                    (agent, key, description, now(), not_before))
@@ -284,7 +277,7 @@ def notify_agent(agent, key, kind, title, sections):
     decision_issue(AGENTS[agent]["own"] or COORDINATION, key, kind, title, sections)
 
 
-# --- Webhooks -> triggers -------------------------------------------------------
+# --- Reading Forgejo ------------------------------------------------------------
 
 def first_line(text):
     return ((text or "").strip().splitlines() or [""])[0].strip()
@@ -294,8 +287,13 @@ def wants_reply(body):
     return not first_line(body).startswith(NO_REPLY)
 
 
+def login(x):
+    return (x.get("user") or {}).get("login")
+
+
 def labels_changed(repo, number, labels):
-    """Labels added and removed since this issue was last seen."""
+    """Labels added and removed since this issue was last seen: for the
+    notices and the activity stream, not for waking anyone."""
     with LOCK:
         row = DB.execute("SELECT labels FROM labels WHERE repo=? AND number=?", (repo, number)).fetchone()
         DB.execute("INSERT OR REPLACE INTO labels (repo, number, labels) VALUES (?,?,?)",
@@ -308,115 +306,110 @@ def project_repo(repo):
     return repo.startswith(PREFIX)
 
 
-def main_failed(repo, owner, sha):
-    """CI failed on main: two pull requests that passed apart may fail
-    together, since one behind main may merge. Main stays unreleasable until
-    it's fixed, so its owner fixes it."""
-    if owner and sha:
-        add_trigger(owner, f"main-failed:{repo}:{sha[:12]}",
-                    f"CI failed on main of {repo} at {sha[:12]}: fix it before anything else", once=True)
-
-
-def check_main(repo, main_sha=""):
-    """Main's CI failing, and the owner's pull requests that conflict with
-    main. One merely behind main merges as it is (branch protection doesn't
-    require it to be up to date), so it needs no update: each update would be
-    a new head, and a new round of reviews, for nothing. Forgejo works out
-    conflicts after a push to main, so one it hasn't yet is found by the next
-    reconciliation."""
-    owner = OWNER_OF.get(repo)
-    if not owner:
-        return
-    main_sha = main_sha or forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"]["id"]
-    if has_ci(repo) and ci_state(repo, main_sha) == "failure":
-        main_failed(repo, owner, main_sha)  # a missed webhook
-    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-        if pr["user"]["login"] == owner and pr.get("mergeable") is False:
-            add_trigger(owner, f"conflicts:{repo}#{pr['number']}:{main_sha[:12]}",
-                        f"pull request {repo}#{pr['number']} conflicts with main", once=True)
-
-
-def wake_blocked(match, what):
-    """Wake every agent with an open `blocked` issue whose Blocked-by: line
-    matches (repo, number or None)."""
-    dep_repo, dep_n = match
-    for repo, owner in OWNER_OF.items():
-        try:
-            issues = forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=blocked")
-        except Exception as e:
-            log(f"couldn't read {repo}'s blocked issues: {e}")
-            continue
-        for issue in issues:
-            texts = [issue.get("body") or ""] if issue["user"]["login"] in TRUSTED else []
-            texts += [c.get("body") or "" for c in forge_list(f"/repos/{ORG}/{repo}/issues/{issue['number']}/comments", 100)
-                      if c["user"]["login"] in TRUSTED]
-            for org, r, n in BLOCKED_BY.findall("\n".join(texts)):
-                if org.lower() == ORG.lower() and r == dep_repo and (dep_n is None or int(n) == dep_n):
-                    add_trigger(owner, f"unblocked:{repo}#{issue['number']}:{what}",
-                                f"{what}; {repo}#{issue['number']} is blocked on it", once=True)
-                    break
-
-
 def wip(title):
     t = (title or "").strip().lower()
     return t.startswith(("wip", "[wip]", "draft"))
-
-
-def drop_pending(agent, prefix):
-    q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL AND key LIKE ?", agent, prefix + "%")
-
-
-def drop_reviews_of_closed(repo, n):
-    """A pull request merged or closed before its reviews ran: drop them.
-    Renamed as well, since each is queued once per head, so that reopening
-    the pull request can queue them again."""
-    for agent, prefix in ((REVIEWER, f"conf:{repo}#{n}:"), (COORDINATOR, f"review-requested:{repo}#{n}:")):
-        q("UPDATE triggers SET run_id=-1, key = key || ':closed:' || CAST(? AS INTEGER) "
-          "WHERE agent=? AND run_id IS NULL AND key LIKE ?", now(), agent, prefix + "%")
 
 
 def has_ci(repo):
     return repo != COORDINATION
 
 
-def queue_conformance(repo, n, sha=None):
-    """Work for conformance: review pull request n at its head, once that head
-    has settled and if it hasn't already reviewed it. Pull requests marked as
-    work in progress are skipped.
+def when(stamp):
+    """A Forgejo timestamp, in seconds."""
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
 
-    An agent pushes only during a run, so a head whose author is an agent with
-    no run under way, and whose container the human isn't using, has settled
-    already. Otherwise the review waits for the author's run to end
-    (release_reviews), or SETTLE seconds at most: the human's own pull
-    requests, and runs that go on, still get a review."""
-    if REVIEWER not in AGENTS:
-        return
-    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
-    head = pr["head"]["sha"]
-    if pr["state"] != "open" or wip(pr.get("title")) or (sha and sha != head):
-        return
-    key = f"conf:{repo}#{n}:{head[:12]}"
-    # Reviews waiting for an older head are superseded. The one for this head
-    # stays: dropping it would end it for good, since it's queued only once,
-    # and the reconciler calls this for every open pull request.
-    q("UPDATE triggers SET run_id=-1 WHERE agent=? AND run_id IS NULL AND key LIKE ? AND key<>?",
-      REVIEWER, f"conf:{repo}#{n}:%", key)
-    if any(r["user"]["login"] == REVIEWER and r.get("commit_id") == head
-           for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
-        drop_pending(REVIEWER, key)
-        return
-    author = (pr.get("user") or {}).get("login")
-    settled = author in AGENTS and not may_push(author)
-    add_trigger(REVIEWER, key, f"review pull request {repo}#{n} at {head[:12]}",
-                once=True, not_before=None if settled else now() + SETTLE)
-    if settled:  # queued while its author could still push
-        q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL", REVIEWER, key)
+
+def forge_all(path):
+    """Every page of a list."""
+    sep = "&" if "?" in path else "?"
+    out, page = [], 1
+    while True:
+        batch = forge("GET", f"{path}{sep}limit=50&page={page}") or []
+        out += batch
+        if len(batch) < 50:
+            return out
+        page += 1
+
+
+_cache = {}
+
+
+def cached(key, ttl, fn):
+    hit = _cache.get(key)
+    if hit and now() - hit[0] < ttl:
+        return hit[1]
+    value = fn()
+    _cache[key] = (now(), value)
+    return value
+
+
+def main_of(repo):
+    """main's head commit: id and timestamp."""
+    return cached(("main", repo), 20, lambda: forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"])
+
+
+def ci_state(repo, sha):
+    """success, failure, running or none: the commit statuses branch
+    protection requires (contexts starting "checks"), as it sees them."""
+    st = forge("GET", f"/repos/{ORG}/{repo}/commits/{sha}/status") or {}
+    states = {s.get("status") for s in st.get("statuses") or [] if (s.get("context") or "").startswith("checks")}
+    if not states:
+        return "none"
+    if states & {"failure", "error"}:
+        return "failure"
+    return "success" if states <= {"success", "warning"} else "running"
+
+
+def label_id(repo, name):
+    labels = cached(("labels", repo), 3600, lambda: forge_all(f"/repos/{ORG}/{repo}/labels"))
+    return next((l["id"] for l in labels if l["name"] == name), None)
+
+
+REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
+REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
+
+
+def pr_refs(repo, pr):
+    """The issues on repo a pull request refers to with `Refs`, in its
+    description or its commits."""
+    def read():
+        texts = [pr.get("body") or ""]
+        texts += [(c.get("commit") or {}).get("message") or ""
+                  for c in forge_all(f"/repos/{ORG}/{repo}/pulls/{pr['number']}/commits")]
+        found = set()
+        for text in texts:
+            for line in REFS.findall(text):
+                for org, r, k in REF.findall(line):
+                    if (not org or (org.lower() == ORG.lower() and r == repo)) and int(k) != pr["number"]:
+                        found.add(int(k))
+        return found
+    return cached(("refs", repo, pr["number"], pr["head"]["sha"], pr.get("body")), 3600, read)
+
+
+def owner_prs(repo, owner, state):
+    """The owner's pull requests on repo, open or (the last 20) merged, each
+    with the issues it refers to."""
+    def read():
+        if state == "open":
+            prs = forge_all(f"/repos/{ORG}/{repo}/pulls?state=open")
+        else:
+            prs = [p for p in forge("GET", f"/repos/{ORG}/{repo}/pulls?state=closed&sort=recentupdate&limit=20") or []
+                   if p.get("merged")]
+        return [(p, pr_refs(repo, p)) for p in prs if login(p) == owner]
+    return cached(("prs", repo, state), 30, read)
 
 
 def may_push(agent):
     """Whether an agent could still push: a run under way, or the human
     active in its container."""
     return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent)) or human_active(agent)
+
+
+def busy(agent):
+    """Running, with work queued, or with the human in its container: what it
+    leaves undone may yet be done."""
+    return bool(may_push(agent) or q("SELECT 1 FROM triggers WHERE agent=? AND run_id IS NULL", agent))
 
 
 def release_reviews(agent):
@@ -434,113 +427,9 @@ def release_reviews(agent):
         except Exception as e:
             log(f"couldn't read {m[1]}#{m[2]} to release its review: {e!r}")
             continue
-        if (pr.get("user") or {}).get("login") == agent:
+        if login(pr) == agent:
             q("UPDATE triggers SET not_before=NULL WHERE id=?", t["id"])
             log(f"{agent}'s run ended: conformance may review {m[1]}#{m[2]} now")
-
-
-def ci_state(repo, sha):
-    """success, failure, running or none: the Actions runs for sha."""
-    runs = (forge("GET", f"/repos/{ORG}/{repo}/actions/runs?head_sha={sha}") or {}).get("workflow_runs") or []
-    states = {r.get("status") for r in runs if r.get("commit_sha") == sha}
-    if not states:
-        return "none"
-    if states == {"success"}:
-        return "success"
-    return "failure" if states & {"failure", "cancelled", "skipped", "blocked"} else "running"
-
-
-def queue_coordinator_review(repo, n, sha=None):
-    """Work for the coordinator: a pull request that requests its review (at
-    level 3, a change to API.lock), once CI has passed on the head and if it
-    hasn't approved that head. A new commit dismisses its approval, so the
-    next head that passes CI wakes it again."""
-    if not COORDINATOR:
-        return
-    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
-    head = pr["head"]["sha"]
-    if pr["state"] != "open" or (sha and sha != head):
-        return
-    if COORDINATOR not in {u["login"] for u in pr.get("requested_reviewers") or []}:
-        return
-    if any(r["user"]["login"] == COORDINATOR and r.get("state") == "APPROVED" and r.get("commit_id") == head
-           and not r.get("dismissed") for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews")):
-        return
-    if has_ci(repo) and ci_state(repo, head) != "success":
-        return
-    add_trigger(COORDINATOR, f"review-requested:{repo}#{n}:{head[:12]}",
-                f"review requested from you on pull request {repo}#{n}, whose CI passed at {head[:12]}", once=True)
-    # A pull request opened lately shares this run rather than having its own.
-    q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL",
-      COORDINATOR, f"pr-opened:{repo}#{n}")
-
-
-def release_opened(repo, n):
-    """CI has finished on pull request n, so whether it asks for the
-    coordinator's review is known: if it does, that review was queued and
-    shares the run; if not, none is coming. Either way, "pull request opened"
-    need hold no longer."""
-    if COORDINATOR:
-        q("UPDATE triggers SET not_before=NULL WHERE agent=? AND key=? AND run_id IS NULL",
-          COORDINATOR, f"pr-opened:{repo}#{n}")
-
-
-REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
-REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
-
-
-def requests_awaiting_release(repo, pr):
-    """The open requests on repo that a merged pull request refers to with
-    `Refs` (in its description or its commits) and that aren't yet labelled
-    ready-for-release: their owner has that step still to do."""
-    texts = [pr.get("body") or ""]
-    try:
-        texts += [(c.get("commit") or {}).get("message") or ""
-                  for c in forge_list(f"/repos/{ORG}/{repo}/pulls/{pr['number']}/commits")]
-    except Exception as e:
-        log(f"reading {repo}#{pr['number']}'s commits failed: {e!r}")
-    numbers = set()
-    for text in texts:
-        for line in REFS.findall(text):
-            for org, r, k in REF.findall(line):
-                if (not org or (org.lower() == ORG.lower() and r == repo)) and int(k) != pr["number"]:
-                    numbers.add(int(k))
-    found = []
-    for k in sorted(numbers):
-        try:
-            issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{k}") or {}
-        except Exception:
-            continue
-        labels = {l["name"] for l in issue.get("labels") or []}
-        if (issue.get("state") == "open" and not issue.get("pull_request")
-                and "request" in labels and "ready-for-release" not in labels):
-            found.append(k)
-    return found
-
-
-def wake_after_merge(repo, owner, pr):
-    if not owner or (pr.get("user") or {}).get("login") != owner:
-        return
-    waiting = requests_awaiting_release(repo, pr)
-    if waiting:
-        n = pr["number"]
-        refs = ", ".join(f"{repo}#{k}" for k in waiting)
-        add_trigger(owner, f"merged:{repo}#{n}",
-                    f"your pull request {repo}#{n} merged; it answers {refs}, not yet labelled ready-for-release",
-                    once=True)
-
-
-def conformance_awaits_reply(repo, n):
-    """conformance's last review asked for changes at the pull request's
-    current head, so an author's reply is its to read now. After a push the
-    head has moved on: the review queued for the new head (once CI passes)
-    reads the reply, and waking conformance before then is a run that can't
-    review."""
-    mine = [r for r in forge_list(f"/repos/{ORG}/{repo}/pulls/{n}/reviews") if r["user"]["login"] == REVIEWER]
-    if not mine or mine[-1].get("state") != "REQUEST_CHANGES":
-        return False
-    pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}") or {}
-    return mine[-1].get("commit_id") == (pr.get("head") or {}).get("sha")
 
 
 # --- What waits on the human ------------------------------------------------------
@@ -637,29 +526,24 @@ def waiting_on_human():
     return len(found)
 
 
-def check_released_requests(repo):
-    """Open requests released but not verified: the requester is woken again
-    after NUDGE seconds; after STALL, the stall is the human's."""
-    for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request"):
+def check_unverified_stalls(repo):
+    """Open requests released but never verified: the requester was woken
+    again after NUDGE seconds (rule 10); after STALL, the stall is the human's."""
+    for issue in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request"):
         labels = {l["name"] for l in issue.get("labels") or []}
-        if "verified" in labels:
+        if "request" not in labels or "verified" in labels:
             continue
         n = issue["number"]
         released = [(c, RELEASED.search(c.get("body") or "")) for c in
-                    forge_list(f"/repos/{ORG}/{repo}/issues/{n}/comments")
-                    if (c.get("user") or {}).get("login") in ("gatekeeper", HUMAN, OWNER_OF.get(repo))]
+                    forge_all(f"/repos/{ORG}/{repo}/issues/{n}/comments")
+                    if login(c) in ("gatekeeper", HUMAN, OWNER_OF.get(repo))]
         released = [(c, m) for c, m in released if m]
         if not released:
             continue
         c, m = released[-1]
         tag = m[1]
-        age = now() - datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")).timestamp()
-        requester = (issue.get("user") or {}).get("login") or "?"
-        if age > NUDGE and requester in AGENTS and AGENTS[requester]["own"]:
-            add_trigger(requester, f"unverified:{repo}#{n}:{tag}",
-                        f"your request {repo}#{n} was released in {tag} {int(age // 3600)} hours ago and you "
-                        "haven't verified it: upgrade, check its acceptance criteria and verify it, or say on "
-                        "the issue what stops you", once=True)
+        age = now() - when(c["created_at"])
+        requester = login(issue) or "?"
         if age > STALL:
             decision_issue(COORDINATION, f"stalled:{repo}#{n}:{tag}", "stalled",
                            f"Released but never verified: {repo}#{n}", {
@@ -677,360 +561,574 @@ def check_released_requests(repo):
                 "Blocked on this": f"{repo}#{n}, and anything whose `Blocked-by:` line names it."})
 
 
+def later(fn, *args, delay=30):
+    def run():
+        try:
+            fn(*args)
+        except Exception as e:
+            log(f"evaluating {args} again failed: {e!r}")
+    t = threading.Timer(delay, run)
+    t.daemon = True
+    t.start()
+
+
 def handle(event, payload):
+    """A webhook: the kit's own side effects (notices, the human's
+    assignments, refusals), then the items it touched evaluated again. What
+    anyone owes comes from the items as they are now (see Rules), never from
+    the event itself, so a missed or late event loses nothing."""
     repo = (payload.get("repository") or {}).get("name") or ""
     sender = (payload.get("sender") or {}).get("login") or ""
     if ((payload.get("repository") or {}).get("owner") or {}).get("login", ORG).lower() != ORG.lower():
         return
     if not project_repo(repo):
         return
-    owner = OWNER_OF.get(repo)
     trusted = sender in TRUSTED
     action = payload.get("action")
-    coord = COORDINATOR if COORDINATOR and sender != COORDINATOR else None
+    item = payload.get("issue") or payload.get("pull_request") or {}
+    n = item.get("number")
 
-    if event == "issues":
-        issue = payload.get("issue") or {}
-        n = issue.get("number")
-        labels = {l["name"] for l in issue.get("labels") or []}
+    if event == "issues" or (event == "pull_request" and action == "label_updated"):
+        labels = {l["name"] for l in item.get("labels") or []}
         added, removed = labels_changed(repo, n, labels)
-        author = (issue.get("user") or {}).get("login")
-        if not trusted:
-            return
-        is_pr = bool(issue.get("pull_request"))
-        kind = "pull request" if is_pr else "issue"
-        labels, added = human_labels_changed(repo, n, issue, labels, added, removed, sender)
-        if "blocking" in added and "upstream" in labels:
-            notify(f"blocking:{repo}#{n}", "blocking", repo, n,
-                   "this upstream issue is marked `blocking`: an agent can't continue until it's resolved upstream. "
-                   "Close it or comment on it once a fix is available.")
-        # A recommendation's needs-human is grouped into its review's report notice.
-        if "needs-human" in added and sender != "dispatcher" and "recommendation" not in labels:
-            notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
-                   "this needs your decision (`needs-human`).")
-        if repo == COORDINATION and "milestone-review" in added:
-            for r in MILESTONE_REVIEWERS:
-                add_trigger(r, f"milestone:{repo}#{n}", f"milestone review requested on {repo}#{n}", once=True)
-        if (repo == COORDINATION and {"upstream", "upstream:lasm", "blocking"} <= labels
-                and added & {"upstream:lasm", "blocking"}):
-            add_trigger("lasm", f"lasm-blocking:{repo}#{n}", f"blocking Lasm issue {repo}#{n}", once=True)
-        if (owner and issue.get("state") == "open" and not is_pr
-                and {"request", "new"} <= labels and author in TRUSTED and author != owner
-                and sender != owner and action in ("opened", "reopened", "label_updated")):
-            add_trigger(owner, f"request:{repo}#{n}", f"untriaged request {repo}#{n}")
-        if coord:
-            if action == "opened" and "request" in labels and not is_pr:
-                add_trigger(coord, f"filed:{repo}#{n}", f"request filed: {repo}#{n}", once=True)
-            if "ready-for-release" in added:
-                add_trigger(coord, f"rfr:{repo}#{n}:{int(now())}", f"ready-for-release added to {kind} {repo}#{n}")
-            # The kit's own decisions (caps, stalls) and its refusals aren't the coordinator's.
-            if "needs-human" in added and sender != "dispatcher":
-                add_trigger(coord, f"nh+:{repo}#{n}:{int(now())}", f"needs-human added to {kind} {repo}#{n}")
-            if "needs-human" in removed and sender != "dispatcher":
-                add_trigger(coord, f"nh-:{repo}#{n}:{int(now())}", f"needs-human removed from {kind} {repo}#{n}")
-            if action == "closed" and (issue.get("milestone") or {}).get("id"):
-                ms = forge("GET", f"/repos/{ORG}/{repo}/milestones/{issue['milestone']['id']}") or {}
-                if ms.get("open_issues") == 0:
-                    add_trigger(coord, f"milestone-done:{repo}:{ms.get('id')}",
-                                f"the last open issue in milestone {ms.get('title')} on {repo} was closed", once=True)
-        # Whatever a Blocked-by: line names, its closing ends the wait: an
-        # upstream issue, a request on another library, a decision.
-        if action == "closed" and not is_pr:
-            wake_blocked((repo, n), f"{'upstream issue' if 'upstream' in labels else 'issue'} {repo}#{n} was closed")
-
-    elif event == "issue_comment" and action == "created":
-        issue, c = payload.get("issue") or {}, payload.get("comment") or {}
-        n = issue.get("number")
-        if not trusted:
-            return
-        is_pr = bool(payload.get("is_pull") or issue.get("pull_request"))
-        if owner and sender != owner and issue.get("state") == "open" and wants_reply(c.get("body")):
-            add_trigger(owner, f"comment:{c.get('id')}", f"comment on {'pull request' if is_pr else 'issue'} {repo}#{n}")
-        labels = {l["name"] for l in issue.get("labels") or []}
-        # A release comment on a request needs no reply, but its requester has
-        # work: upgrade, check the acceptance criteria and verify. Except the
-        # coordinator's own requests released through the gatekeeper: it asked
-        # for that release, having just checked them, and verifies them in the
-        # same run (the unverified nudge still catches one it forgets).
-        released = RELEASED.search(c.get("body") or "")
-        requester = (issue.get("user") or {}).get("login")
-        own_release = requester == COORDINATOR and sender == "gatekeeper"
-        if (released and sender in ("gatekeeper", HUMAN, owner) and not is_pr and issue.get("state") == "open"
-                and "request" in labels and requester in AGENTS and AGENTS[requester]["own"] and not own_release):
-            add_trigger(requester, f"released:{repo}#{n}:{released[1]}",
-                        f"your request {repo}#{n} was released in {released[1]}: upgrade to it, check its "
-                        "acceptance criteria, and verify it", once=True)
-        # The author answers conformance's findings in a comment without pushing:
-        # conformance looks again. A reply after a push waits for the new head's review.
-        if (is_pr and issue.get("state") == "open" and sender == (issue.get("user") or {}).get("login")
-                and sender != REVIEWER and wants_reply(c.get("body")) and conformance_awaits_reply(repo, n)):
-            add_trigger(REVIEWER, f"conf-reply:{c.get('id')}",
-                        f"the author replied on pull request {repo}#{n}, which you asked to change")
+        if trusted:
+            labels, added = human_labels_changed(repo, n, item, labels, added, removed, sender)
+            if "blocking" in added and "upstream" in labels:
+                notify(f"blocking:{repo}#{n}", "blocking", repo, n,
+                       "this upstream issue is marked `blocking`: an agent can't continue until it's resolved "
+                       "upstream. Close it or comment on it once a fix is available.")
+            # A recommendation's needs-human is grouped into its review's report notice.
+            if "needs-human" in added and sender != "dispatcher" and "recommendation" not in labels:
+                notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
+                       "this needs your decision (`needs-human`).")
+    elif event == "issue_comment" and action == "created" and trusted:
+        labels = {l["name"] for l in item.get("labels") or []}
         # A milestone reviewer's report: one notice per report, not per recommendation.
         if sender in MILESTONE_REVIEWERS and ({"milestone-review", "upstream:lasm"} & labels):
             notify(f"report:{sender}:{repo}#{n}", "report", repo, n,
                    f"the `{sender}` review has reported here. Its recommendations are issues labelled "
                    f"`recommendation` and `review:{sender}`: close each as accepted, or label it `declined`, "
                    "say why and close it.")
-        if repo == COORDINATION and "upstream" in labels and sender == HUMAN:
-            wake_blocked((repo, n), f"{HUMAN} commented on upstream issue {repo}#{n}")
-
-    elif event.startswith("pull_request_review") or event == "pull_request_comment":
-        pr = payload.get("pull_request") or {}
-        review = payload.get("review") or {}
-        n = pr.get("number")
-        rejected = "rejected" in event or review.get("type") == "pull_request_review_rejected"
-        approved = "approved" in event or review.get("type") == "pull_request_review_approved"
-        content = review.get("content") or ""
-        # An approval asks nothing of the author, whatever it says (the
-        # coordinator's say what it checked): its scheduled merge goes ahead.
-        # A reviewer who wants more requests changes or comments.
-        asks = wants_reply(content) and not approved
-        if (owner and trusted and sender != owner and (pr.get("user") or {}).get("login") == owner
-                and pr.get("state") == "open" and (rejected or asks)):
-            what = "changes requested on" if rejected else "review on"
-            add_trigger(owner, f"review:{repo}#{n}:{payload.get('_delivery')}", f"{what} pull request {repo}#{n}")
-
-    elif event == "pull_request":
-        pr = payload.get("pull_request") or {}
-        n = pr.get("number")
-        if not trusted:
-            return
-        if action == "label_updated":
-            labels = {l["name"] for l in pr.get("labels") or []}
-            labels, added = human_labels_changed(repo, n, pr, labels, *labels_changed(repo, n, labels), sender)
-            if "needs-human" in added and sender != "dispatcher":
-                notify(f"needs-human:{repo}#{n}:{int(now())}", "needs-human", repo, n,
-                       "this needs your decision (`needs-human`).")
-                if coord:
-                    add_trigger(coord, f"nh+:{repo}#{n}:{int(now())}", f"needs-human added to pull request {repo}#{n}")
-        if action == "synchronized":
-            drop_pending(REVIEWER, f"conf:{repo}#{n}:")  # a newer head supersedes the waiting review
-        if action == "closed":
-            drop_reviews_of_closed(repo, n)
-        if not has_ci(repo) and action in ("opened", "reopened", "synchronized"):
-            queue_conformance(repo, n)  # nothing to wait for: no CI here
-        # Auto-merge lands after the owner's run has ended: wake it to finish
-        # the requests the pull request answers (CHANGELOG.md, ready-for-release).
-        if action == "closed" and pr.get("merged"):
-            wake_after_merge(repo, owner, pr)
-        if not coord:
-            return
-        if action == "opened":
-            add_trigger(coord, f"pr-opened:{repo}#{n}", f"pull request opened: {repo}#{n}", once=True,
-                        not_before=now() + OPENED_HOLD)
-        elif action == "review_requested" and (payload.get("requested_reviewer") or {}).get("login") == COORDINATOR:
-            queue_coordinator_review(repo, n)  # once CI has passed on the head
-
     elif event == "release" and action == "published":
+        # The one wake-up that is an event, not a state: the coordinator
+        # hears of a release it didn't ask the gatekeeper for.
         tag = (payload.get("release") or {}).get("tag_name", "")
-        # A release the coordinator asked the gatekeeper for wakes it no further.
-        if coord and trusted and sender != "gatekeeper":
-            add_trigger(coord, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
-        wake_blocked((repo, None), f"{repo} released {tag}")
-
-    elif event == "push" and payload.get("ref") == "refs/heads/main":
-        check_main(repo, payload.get("after") or "")
-
-    elif event == "action_run_success":
-        run = payload.get("run") or {}
-        if run.get("event") != "pull_request":
-            return
-        try:
-            pr = json.loads(run.get("event_payload") or "{}").get("pull_request") or {}
-        except ValueError:
-            return
-        if pr.get("number"):
-            queue_conformance(repo, pr["number"], run.get("commit_sha"))
-            queue_coordinator_review(repo, pr["number"], run.get("commit_sha"))
-            release_opened(repo, pr["number"])
-
-    elif event == "action_run_failure":
-        run = payload.get("run") or {}
-        if run.get("event") == "push":  # CI runs on pushes to main only
-            main_failed(repo, owner, run.get("commit_sha") or "")
-            return
-        if run.get("event") != "pull_request":
-            return
-        try:
-            pr = json.loads(run.get("event_payload") or "{}").get("pull_request") or {}
-        except ValueError:
-            return
-        if pr.get("number"):
-            release_opened(repo, pr["number"])
-        if owner and (pr.get("user") or {}).get("login") == owner:
-            n = pr.get("number")
-            add_trigger(owner, f"ci-failed:{repo}#{n}:{run.get('commit_sha', '')[:12]}",
-                        f"CI failed on pull request {repo}#{n}", once=True)
-
-
-# --- Stalls ---------------------------------------------------------------------
-#
-# Work that waits on an agent but that no event will wake it for: the event
-# came and went while the agent did something else, or never comes. Each is
-# woken once per state, so an agent that answers by doing nothing isn't woken
-# again until something changes.
-
-QUIET = int(os.environ.get("STALL_QUIET_SECONDS", "600"))
-
-
-def when(stamp):
-    """A Forgejo timestamp, in seconds."""
-    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-
-
-def ago(stamp):
-    return now() - when(stamp)
-
-
-def busy(agent):
-    """Running, with work queued, or with the human in its container: what it
-    leaves undone may yet be done."""
-    return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent)
-                or q("SELECT 1 FROM triggers WHERE agent=? AND run_id IS NULL", agent)
-                or human_active(agent))
-
-
-def timeline(repo, n):
-    return forge_list(f"/repos/{ORG}/{repo}/issues/{n}/timeline", 200)
-
-
-def last_label_event(events, label, added):
-    """When label was last added (or removed), from a timeline: Forgejo marks
-    an addition with the body "1"."""
-    found = [e["created_at"] for e in events if e.get("type") == "label"
-             and (e.get("label") or {}).get("name") == label and ((e.get("body") or "") == "1") == added]
-    return found[-1] if found else None
-
-
-def merge_scheduled(events):
-    """The latest schedule or cancellation in a pull request's timeline decides."""
-    found = [e["type"] for e in events if e.get("type") in ("pull_scheduled_merge", "pull_cancel_scheduled_merge")]
-    return bool(found) and found[-1] == "pull_scheduled_merge"
-
-
-def check_unscheduled_merges(repo, owner):
-    """The owner's open pull requests with no merge scheduled. Agents schedule
-    "merge when checks succeed" on every pull request; one that doesn't, or
-    whose schedule Forgejo dropped, never merges, and its approvals wake no one."""
-    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-        n, sha = pr["number"], pr["head"]["sha"]
-        if pr["user"]["login"] != owner or wip(pr.get("title")) or ago(pr["updated_at"]) < QUIET:
-            continue
-        if merge_scheduled(timeline(repo, n)):
-            continue
-        add_trigger(owner, f"unscheduled:{repo}#{n}:{sha[:12]}",
-                    f"your pull request {repo}#{n} has no merge scheduled, so it won't merge: schedule it "
-                    "(`forge pr automerge`), or close it if it's no longer wanted", once=True)
-
-
-def check_ready_for_release(repo):
-    """Issues still labelled ready-for-release that the coordinator hasn't
-    looked at since the label was added or main last changed: a refusal it
-    asked the owner to fix, fixed with the label left on, adds no label and so
-    wakes no one."""
-    issues = forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=ready-for-release")
-    issues = [i for i in issues if "ready-for-release" in {l["name"] for l in i.get("labels") or []}]
-    if not issues:
+        if COORDINATOR and trusted and sender not in ("gatekeeper", COORDINATOR):
+            add_trigger(COORDINATOR, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
         return
-    main = forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"]
-    for issue in issues:
-        n = issue["number"]
-        events = timeline(repo, n)
-        labelled = last_label_event(events, "ready-for-release", True) or issue["created_at"]
-        changed = max(when(labelled), when(main["timestamp"]))
-        looked = [when(e["created_at"]) for e in events if e.get("type") == "comment"
-                  and (e.get("user") or {}).get("login") == COORDINATOR]
-        if (looked and looked[-1] > changed) or now() - changed < QUIET:
-            continue
-        add_trigger(COORDINATOR, f"rfr-again:{repo}#{n}:{main['id'][:12]}:{labelled}",
-                    f"{repo}#{n} is still labelled ready-for-release, and "
-                    + ("main has changed since you last looked at it" if looked else "you haven't looked at it"),
-                    once=True)
+
+    if not kv_get("rules-seeded"):
+        return  # the first sweep hasn't run: it would see this item anyway
+    if event == "push":
+        if payload.get("ref") == "refs/heads/main":
+            _cache.pop(("main", repo), None)
+            evaluate_repo(repo, items=True)
+        return
+    if event.startswith("action_run"):
+        # The rules read CI from commit statuses, which may lag the run's own
+        # event: look again a little later too.
+        run = payload.get("run") or {}
+        if run.get("event") == "push":
+            evaluate_repo(repo)
+            later(evaluate_repo, repo)
+            return
+        try:
+            n = (json.loads(run.get("event_payload") or "{}").get("pull_request") or {}).get("number")
+        except ValueError:
+            return
+        if n:
+            later(evaluate, repo, n)
+    if n:
+        evaluate(repo, n)
+    if event == "issues" and action == "closed":
+        evaluate_repo(repo)  # its milestone may be done
 
 
-def opened_for(repo, owner):
-    """The issues the owner's open pull requests refer to with Refs."""
-    found = set()
-    for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-        if pr["user"]["login"] != owner:
-            continue
-        for line in REFS.findall(pr.get("body") or ""):
-            for org, r, k in REF.findall(line):
-                if not org or (org.lower() == ORG.lower() and r == repo):
-                    found.add(int(k))
+# --- Rules ------------------------------------------------------------------------
+#
+# Every wake-up is a rule over an issue or pull request as it is now, or over
+# a repository (its main, its milestones). A rule names the agent that owes
+# something and a version: the state that makes it new, such as a head
+# commit, a comment or a time. A trigger is queued once per version, so an
+# agent that looks and leaves things as they are isn't woken again until
+# something changes, and a run that doesn't finish gives its triggers back
+# (retry). Webhooks only say which items to look at again; the sweep looks at
+# all of them every RECONCILE seconds; and a claim looks again at the items
+# behind its triggers, dropping what is no longer owed. The numbers are the
+# rules' in requirements.md (Triggers).
+
+Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(None, False))
+
+# Kinds of trigger a rule queues, which a claim checks are still owed.
+RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "merged", "idle-request",
+              "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
+              "review-requested", "rfr", "nh", "conf", "conf-reply", "milestone", "lasm-blocking"}
+# Kinds whose state, when the rules first run on an existing ledger, was
+# already acted on under the old event-driven triggers, or only reports what
+# happened: recorded as handled rather than queued. The others are work still
+# to do, which the old triggers may have missed.
+SEED_KINDS = {"comment", "review", "merged", "unblocked", "upstream-comment", "answered", "filed", "pr-opened",
+              "nh", "milestone", "lasm-blocking", "milestone-done"}
+RULE_KEY = re.compile(r"^([a-z-]+):([\w.-]+)#(\d+):")
+
+
+class Item:
+    """An issue or pull request, read once for all the rules."""
+
+    def __init__(self, repo, n):
+        self.repo, self.n = repo, n
+        self.issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+        self.is_pr = self.issue.get("pull_request") is not None
+        self.pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}") if self.is_pr else None
+        self.events = forge_all(f"/repos/{ORG}/{repo}/issues/{n}/timeline")
+        self.reviews = sorted(forge_all(f"/repos/{ORG}/{repo}/pulls/{n}/reviews"), key=lambda r: r["id"]) \
+            if self.is_pr else []
+        self.labels = {l["name"] for l in self.issue.get("labels") or []}
+        self.author = login(self.issue)
+        self.owner = OWNER_OF.get(repo)
+        self.open = self.issue.get("state") == "open"
+        self.kind = "pull request" if self.is_pr else "issue"
+        self.at = f"{repo}#{n}"
+        self._ci = None
+
+    @property
+    def head(self):
+        return self.pr["head"]["sha"]
+
+    def ci(self):
+        if self._ci is None:
+            self._ci = ci_state(self.repo, self.head) if has_ci(self.repo) else "none"
+        return self._ci
+
+    def comments(self):
+        return [e for e in self.events if e.get("type") == "comment"]
+
+    def by(self, who, types=None):
+        """When `who` last did anything here (of the given timeline types),
+        reviews included; 0 if never."""
+        times = [when(e["created_at"]) for e in self.events
+                 if login(e) == who and (types is None or e.get("type") in types)]
+        times += [when(r["submitted_at"]) for r in self.reviews if login(r) == who and r.get("submitted_at")]
+        return max(times or [0])
+
+    def label_event(self, label, added=True):
+        """When label was last added (or removed): Forgejo marks an addition with the body "1"."""
+        found = [e["created_at"] for e in self.events if e.get("type") == "label"
+                 and (e.get("label") or {}).get("name") == label and ((e.get("body") or "") == "1") == added]
+        return found[-1] if found else None
+
+    def released(self):
+        """The `Released in vX.Y.Z` comments (from the gatekeeper, the human
+        or the repository's owner), oldest first, with their tags."""
+        return [(c, m[1]) for c in self.comments() if login(c) in ("gatekeeper", HUMAN, self.owner)
+                for m in [RELEASED.search(c.get("body") or "")] if m]
+
+    def merge_scheduled(self):
+        """The latest schedule or cancellation in the timeline decides."""
+        found = [e["type"] for e in self.events if e.get("type") in ("pull_scheduled_merge", "pull_cancel_scheduled_merge")]
+        return bool(found) and found[-1] == "pull_scheduled_merge"
+
+
+def blockers(it):
+    """The issues its Blocked-by: lines name, from trusted authors, each with
+    when its line was first written."""
+    texts = [(it.issue["created_at"], it.issue.get("body") or "")] if it.author in TRUSTED else []
+    texts += [(c["created_at"], c.get("body") or "") for c in it.comments() if login(c) in TRUSTED]
+    found = {}
+    for at, text in texts:
+        for org, r, k in BLOCKED_BY.findall(text):
+            if org.lower() == ORG.lower() and project_repo(r) and (r, int(k)) != (it.repo, it.n):
+                found.setdefault((r, int(k)), at)
     return found
 
 
-def check_idle_requests(repo, owner):
-    """Accepted requests that nothing holds up (not blocked, no pull request
-    under way, not ready for release or released) while their owner has
-    nothing to do: it unblocked them in a run spent on other work, or a
-    refusal took ready-for-release off them. Woken once each time a request
-    is unblocked."""
-    under_way = None
-    for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=accepted"):
-        labels = {l["name"] for l in issue.get("labels") or []}
-        if (not {"request", "accepted"} <= labels
-                or labels & {"blocked", "ready-for-release", "verified", "new", "needs-human"}
-                or ago(issue["updated_at"]) < QUIET):
-            continue
-        n = issue["number"]
-        if under_way is None:
-            under_way = opened_for(repo, owner)
-        if n in under_way:
-            continue
-        events = timeline(repo, n)
-        if any(e.get("type") == "comment" and RELEASED.search(e.get("body") or "") for e in events):
-            continue  # the requester's to verify
-        since = (last_label_event(events, "blocked", False) or last_label_event(events, "accepted", True)
-                 or issue["created_at"])
-        add_trigger(owner, f"idle-request:{repo}#{n}:{since}",
-                    f"your accepted request {repo}#{n} isn't blocked and has no pull request under way: "
-                    "work on it, or say on it what it waits for (`blocked` with a `Blocked-by:` line)", once=True)
+def blocker_state(repo, n):
+    """When an issue stopped blocking (closed, or released) and why, and for
+    an open upstream issue, the human's latest comment on it."""
+    issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+    comments = forge_all(f"/repos/{ORG}/{repo}/issues/{n}/comments")
+    labels = {l["name"] for l in issue.get("labels") or []}
+    s = {"done": None, "what": None, "human": None}
+    if issue.get("state") == "closed":
+        s["done"] = issue.get("closed_at") or issue.get("updated_at")
+        s["what"] = f"{'upstream issue' if 'upstream' in labels else 'issue'} {repo}#{n} was closed"
+        return s
+    for c in comments:
+        m = RELEASED.search(c.get("body") or "")
+        if m and login(c) in ("gatekeeper", HUMAN, OWNER_OF.get(repo)):
+            s["done"], s["what"] = c["created_at"], f"{repo}#{n} was released in {m[1]}"
+            return s
+    if "upstream" in labels:
+        mine = [c for c in comments if login(c) == HUMAN]
+        s["human"] = mine[-1] if mine else None
+    return s
 
 
-def check_stalls(repo, owner):
-    if paused():
+def blocked_rules(it):
+    """Rule 8: an issue whose Blocked-by: lines name only issues now closed or
+    released wakes its owner, once; and the human's comment on an upstream
+    issue it waits on, once per comment. Returns those, whether it is blocked
+    (None if it names nothing), when it last stopped being blocked, and what
+    it names."""
+    found = blockers(it)
+    if not found or not it.open or not it.owner:
+        return [], None, None, found
+    states = {b: blocker_state(*b) for b in found}
+    done = sorted((when(s["done"]), s["what"]) for s in states.values() if s["done"])
+    blocked = len(done) < len(found)
+    owed = []
+    if not blocked:
+        t, what = done[-1]
+        owed.append(Owed(it.owner, f"unblocked:{it.at}:{iso(t)}", f"{what}; {it.at} is blocked on it"))
+    for (r, k), at in found.items():
+        h = states[(r, k)]["human"]
+        if h and when(h["created_at"]) >= when(at):  # to the second, on another issue
+            owed.append(Owed(it.owner, f"upstream-comment:{it.at}:{h['id']}",
+                             f"{HUMAN} commented on upstream issue {r}#{k}; {it.at} is blocked on it"))
+    return owed, blocked, (done[-1][0] if done and not blocked else None), found
+
+
+def owner_rules(it, blocked, unblocked_at):
+    """What the repository's owner owes on an item in it."""
+    o, owner, at = [], it.owner, it.at
+    if not owner or not it.open:
+        return o
+    # 1. An untriaged request from someone else.
+    if (not it.is_pr and {"request", "new"} <= it.labels and it.author in TRUSTED and it.author != owner):
+        since = it.label_event("new") or it.issue["created_at"]
+        o.append(Owed(owner, f"request:{at}:{since}", f"untriaged request {at}"))
+    # 2. A comment or review from someone else that wants a reply, newer than
+    #    anything the owner has done here. An approval asks nothing, whatever
+    #    it says; a request for changes always asks.
+    #    Timestamps are to the second, so ties go by the timeline's order.
+    order = lambda e, i: (when(e["created_at"]), i)
+    placed = lambda r: (when(r["submitted_at"]), next(
+        (i for i, e in enumerate(it.events) if e.get("type") == "review" and login(e) == login(r)
+         and e["created_at"] == r["submitted_at"]), -1))
+    asks = [(order(c, i), f"comment:{at}:{c['id']}", f"comment on {it.kind} {at}")
+            for i, c in enumerate(it.events) if c.get("type") == "comment"
+            and login(c) in TRUSTED and login(c) != owner and wants_reply(c.get("body"))]
+    asks += [(placed(r), f"review:{at}:{r['id']}",
+              f"{'changes requested on' if r['state'] == 'REQUEST_CHANGES' else 'review on'} pull request {at}")
+             for r in it.reviews if login(r) in TRUSTED and login(r) != owner and r.get("submitted_at")
+             and (r.get("state") == "REQUEST_CHANGES" or (r.get("state") == "COMMENT" and wants_reply(r.get("body"))))]
+    if asks:
+        t, key, what = max(asks)
+        acted = max([order(e, i) for i, e in enumerate(it.events) if login(e) == owner]
+                    + [placed(r) for r in it.reviews if login(r) == owner and r.get("submitted_at")]
+                    or [(0, 0)])
+        if t > acted:
+            o.append(Owed(owner, key, what))
+    if it.is_pr and it.author == owner:
+        head = it.head[:12]
+        # 3. CI failed on its head.
+        if it.ci() == "failure":
+            o.append(Owed(owner, f"ci-failed:{at}:{head}", f"CI failed on pull request {at}"))
+        # 4. It conflicts with main. One merely behind merges as it is.
+        if it.pr.get("mergeable") is False:
+            o.append(Owed(owner, f"conflicts:{at}:{head}:{main_of(it.repo)['id'][:12]}",
+                          f"pull request {at} conflicts with main"))
+        # 5. No merge scheduled, so it would never merge.
+        if not wip(it.pr.get("title")) and not it.merge_scheduled():
+            o.append(Owed(owner, f"unscheduled:{at}:{head}",
+                          f"your pull request {at} has no merge scheduled, so it won't merge: schedule it "
+                          "(`forge pr automerge`), or close it if it's no longer wanted"))
+    request = not it.is_pr and "request" in it.labels and not it.labels & {"ready-for-release", "verified"}
+    # Blocked by its Blocked-by: lines, or (naming none) by the label.
+    held = blocked if blocked is not None else "blocked" in it.labels
+    released = it.released()
+    if request and not released:
+        # Since it was last unblocked (or accepted): earlier work was only part of it.
+        since = (unblocked_at and iso(unblocked_at)) or it.label_event("blocked", False) \
+            or it.label_event("accepted") or it.issue["created_at"]
+        merged = [(p, refs) for p, refs in owner_prs(it.repo, owner, "merged")
+                  if it.n in refs and when(p["merged_at"]) > when(since)]
+        # 6. Merged work it still has to finish: CHANGELOG.md and ready-for-release.
+        if merged and not held:
+            p = max(merged, key=lambda m: m[0]["merged_at"])[0]
+            o.append(Owed(owner, f"merged:{it.repo}#{p['number']}:{it.n}",
+                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
+                          "not yet labelled ready-for-release"))
+        # 7. Accepted, nothing in its way and nothing under way, while the
+        #    owner has nothing to do: once each time it's unblocked.
+        if ("accepted" in it.labels and not held
+                and not it.labels & {"new", "needs-human", "counter-proposal"}
+                and not any(it.n in refs for _, refs in owner_prs(it.repo, owner, "open"))
+                and not merged):
+            o.append(Owed(owner, f"idle-request:{at}:{since}",
+                          f"your accepted request {at} isn't blocked and has no pull request under way: work on "
+                          "it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
+    return o
+
+
+def requester_rules(it):
+    """What an agent that filed a request on someone else's repository owes,
+    or should hear."""
+    o, req, at = [], it.author, it.at
+    if (it.is_pr or "request" not in it.labels or req not in AGENTS or not AGENTS[req]["own"]
+            or "verified" in it.labels):
+        return o
+    if it.open:
+        released = it.released()
+        # 10. Released: upgrade, check, verify; and again a day later. The
+        #     coordinator verifies its own requests in the run that released them.
+        if released:
+            c, tag = released[-1]
+            if not (req == COORDINATOR and login(c) == "gatekeeper"):
+                o.append(Owed(req, f"released:{at}:{tag}",
+                              f"your request {at} was released in {tag}: upgrade to it, check its acceptance "
+                              "criteria, and verify it"))
+            age = now() - when(c["created_at"])
+            if age > NUDGE:
+                o.append(Owed(req, f"unverified:{at}:{tag}",
+                              f"your request {at} was released in {tag} {int(age // 3600)} hours ago and you "
+                              "haven't verified it: upgrade, check its acceptance criteria and verify it, or say "
+                              "on the issue what stops you"))
+        # 11. Counter-proposed.
+        t = it.label_event("counter-proposal")
+        if t and "counter-proposal" in it.labels and req != it.owner:
+            o.append(Owed(req, f"answered:{at}:{t}", f"your request {at} has a counter-proposal"))
+    elif req != it.owner:
+        # 11. Closed without being verified, by someone else: rejected.
+        closes = [e for e in it.events if e.get("type") == "close"]
+        if closes and login(closes[-1]) != req:
+            o.append(Owed(req, f"answered:{at}:{closes[-1]['created_at']}",
+                          f"your request {at} was closed without being verified"))
+    return o
+
+
+def coordinator_rules(it):
+    """What the coordinator owes on any item."""
+    o, c, at = [], COORDINATOR, it.at
+    if not c:
+        return o
+    # 12. A request filed by someone else: check it's well formed and placed.
+    if it.open and not it.is_pr and "request" in it.labels and it.author in TRUSTED and it.author != c:
+        o.append(Owed(c, f"filed:{at}:", f"request filed: {at}"))
+    if it.is_pr and it.author in TRUSTED and it.author != c and (it.open or it.pr.get("merged")):
+        # 13. A pull request opened by someone else: check its scope. Held a
+        #     while, or until CI has finished, so that a review requested of
+        #     the coordinator (14) shares the run.
+        settled = not it.open or not has_ci(it.repo) or it.ci() in ("success", "failure")
+        o.append(Owed(c, f"pr-opened:{at}:", f"pull request opened: {at}",
+                      None if settled else when(it.pr["created_at"]) + OPENED_HOLD))
+    if it.is_pr and it.open and c in {u["login"] for u in it.pr.get("requested_reviewers") or []}:
+        # 14. Its review is requested (at level 3, API.lock), CI passed on the
+        #     head, and it hasn't approved that head.
+        approved = any(login(r) == c and r.get("state") == "APPROVED" and r.get("commit_id") == it.head
+                       and not r.get("dismissed") for r in it.reviews)
+        if not approved and (not has_ci(it.repo) or it.ci() == "success"):
+            o.append(Owed(c, f"review-requested:{at}:{it.head[:12]}",
+                          f"review requested from you on pull request {at}, whose CI passed at {it.head[:12]}"))
+    if it.open and "ready-for-release" in it.labels:
+        # 15. Ready for release, and it hasn't looked since the label was
+        #     added or main last changed (an owner may fix what a refused
+        #     release asked for and leave the label on).
+        labelled = it.label_event("ready-for-release") or it.issue["created_at"]
+        main = main_of(it.repo)
+        changed = max(when(labelled), when(main["timestamp"]))
+        looked = it.by(c, ("comment", "label"))
+        if looked < changed:
+            what = (f"ready-for-release added to {it.kind} {at}" if looked < when(labelled) else
+                    f"{at} is still labelled ready-for-release, and main has changed since you last looked at it")
+            o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}", what))
+    # 16. needs-human added or removed by someone else (not the kit), and it
+    #     hasn't looked since.
+    nh = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == "needs-human"]
+    if nh and login(nh[-1]) not in (c, "dispatcher") and it.by(c, ("comment", "label")) < when(nh[-1]["created_at"]):
+        added = (nh[-1].get("body") or "") == "1"
+        o.append(Owed(c, f"nh:{at}:{nh[-1]['created_at']}",
+                      f"needs-human {'added to' if added else 'removed from'} {it.kind} {at}"))
+    return o
+
+
+def reviewer_rules(it):
+    """What conformance and the milestone reviewers owe."""
+    o, at = [], it.at
+    if REVIEWER in AGENTS and it.is_pr and it.open and not wip(it.pr.get("title")):
+        head = it.head
+        # 19. A head that passed CI (or a repository without it) and that it
+        #     hasn't reviewed, once the head has settled: at once if the author
+        #     is an agent that can't push any more, else SETTLE after the last push.
+        if (not has_ci(it.repo) or it.ci() == "success") and \
+                not any(login(r) == REVIEWER and r.get("commit_id") == head for r in it.reviews):
+            settled = it.author in AGENTS and not may_push(it.author)
+            pushes = [e["created_at"] for e in it.events if e.get("type") == "pull_push"]
+            pushed = when(pushes[-1] if pushes else it.pr["created_at"])
+            o.append(Owed(REVIEWER, f"conf:{at}:{head[:12]}", f"review pull request {at} at {head[:12]}",
+                          None if settled else pushed + SETTLE))
+        # 20. The author answered its request for changes at this head in a
+        #     comment, without pushing.
+        mine = [r for r in it.reviews if login(r) == REVIEWER]
+        if mine and mine[-1].get("state") == "REQUEST_CHANGES" and mine[-1].get("commit_id") == head:
+            replies = [c for c in it.comments() if login(c) == it.author and login(c) != REVIEWER
+                       and wants_reply(c.get("body")) and when(c["created_at"]) > when(mine[-1]["submitted_at"])]
+            if replies:
+                o.append(Owed(REVIEWER, f"conf-reply:{at}:{replies[-1]['id']}",
+                              f"the author replied on pull request {at}, which you asked to change"))
+    if it.repo == COORDINATION and it.open and not it.is_pr:
+        # 21. A milestone review requested.
+        if "milestone-review" in it.labels:
+            o += [Owed(r, f"milestone:{at}:", f"milestone review requested on {at}")
+                  for r in MILESTONE_REVIEWERS if r in AGENTS]
+        # 22. A Lasm issue that blocks an agent.
+        if {"upstream", "upstream:lasm", "blocking"} <= it.labels and "lasm" in AGENTS:
+            o.append(Owed("lasm", f"lasm-blocking:{at}:", f"blocking Lasm issue {at}"))
+    return o
+
+
+def owed_on(it):
+    """Everything owed on an item, and whether it is blocked (None if it
+    names no blocker), with the issues it names."""
+    owed, blocked, unblocked_at, found = blocked_rules(it)
+    owed += owner_rules(it, blocked, unblocked_at)
+    owed += requester_rules(it)
+    owed += coordinator_rules(it)
+    owed += reviewer_rules(it)
+    return [o for o in owed if o.agent in AGENTS], blocked, found
+
+
+def repo_rules(repo):
+    """What is owed on a repository itself."""
+    o, owner = [], OWNER_OF.get(repo)
+    # 9. CI failed on main: two pull requests that passed apart may fail
+    #    together, since one behind main may merge, and main can't be released.
+    if owner and has_ci(repo):
+        main = main_of(repo)
+        if ci_state(repo, main["id"]) == "failure":
+            o.append(Owed(owner, f"main-failed:{repo}:{main['id'][:12]}",
+                          f"CI failed on main of {repo} at {main['id'][:12]}: fix it before anything else"))
+    # 17. A milestone with nothing left open.
+    if COORDINATOR:
+        for ms in forge_all(f"/repos/{ORG}/{repo}/milestones?state=open"):
+            if ms.get("open_issues") == 0 and ms.get("closed_issues", 0) > 0:
+                o.append(Owed(COORDINATOR, f"milestone-done:{repo}:{ms['id']}",
+                              f"the last open issue in milestone {ms.get('title')} on {repo} was closed"))
+    return o
+
+
+# --- Evaluation -------------------------------------------------------------------
+
+def queue(o, seed=False):
+    if seed and o.key.split(":")[0] in SEED_KINDS:
+        with LOCK:
+            if not DB.execute("SELECT 1 FROM triggers WHERE agent=? AND key=?", (o.agent, o.key)).fetchone():
+                DB.execute("INSERT INTO triggers (agent, key, description, created, run_id) VALUES (?,?,?,?,-1)",
+                           (o.agent, o.key, o.description, now()))
         return
-    if owner and not busy(owner):
-        check_unscheduled_merges(repo, owner)
-        check_idle_requests(repo, owner)
-    if COORDINATOR and not busy(COORDINATOR):
-        check_ready_for_release(repo)
+    if o.quiet and busy(o.agent):
+        return
+    add_trigger(o.agent, o.key, o.description, once=True, not_before=o.not_before)
 
 
-# --- Reconciliation -------------------------------------------------------------
+def set_blocked(it, blocked):
+    """Keep the `blocked` label in step with the Blocked-by: lines."""
+    if blocked is None or not it.open or blocked == ("blocked" in it.labels):
+        return
+    lid = label_id(it.repo, "blocked")
+    if lid is None:
+        return
+    if blocked:
+        forge("POST", f"/repos/{ORG}/{it.repo}/issues/{it.n}/labels", {"labels": [lid]})
+    else:
+        forge("DELETE", f"/repos/{ORG}/{it.repo}/issues/{it.n}/labels/{lid}")
+    log(f"{'labelled' if blocked else 'unlabelled'} {it.at} blocked")
 
-def reconcile():
-    """Catch what a missed webhook would have lost."""
-    for repo, owner in OWNER_OF.items():
+
+def evaluate(repo, n, dependents=True, seed=False):
+    """Queue what is owed on an item now, keep its `blocked` label and the
+    index of what it waits on, then do the same for the items waiting on it."""
+    try:
+        it = Item(repo, n)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return
+        raise
+    owed, blocked, found = owed_on(it)
+    with LOCK:
+        DB.execute("DELETE FROM blocked_by WHERE repo=? AND number=?", (repo, n))
+        DB.executemany("INSERT INTO blocked_by (repo, number, on_repo, on_number) VALUES (?,?,?,?)",
+                       [(repo, n, r, k) for r, k in found])
+    set_blocked(it, blocked)
+    for o in owed:
+        queue(o, seed)
+    if not dependents:
+        return
+    if it.is_pr:
+        # A pull request opened or merged changes what is owed on the
+        # requests it refers to (6, 7).
+        for state in ("open", "merged"):
+            _cache.pop(("prs", repo, state), None)
+        for k in pr_refs(repo, it.pr):
+            try:
+                evaluate(repo, k, dependents=False)
+            except Exception as e:
+                log(f"evaluating {repo}#{k} failed: {e!r}")
+    for d in q("SELECT repo, number FROM blocked_by WHERE on_repo=? AND on_number=?", repo, n):
         try:
-            for issue in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request,new"):
-                labels = {l["name"] for l in issue.get("labels") or []}
-                author = issue["user"]["login"]
-                if {"request", "new"} <= labels and author in TRUSTED and author != owner:
-                    add_trigger(owner, f"request:{repo}#{issue['number']}",
-                                f"untriaged request {repo}#{issue['number']}", recent=RECONCILE * 2)
-            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50") or {}
-            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
-            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-                if pr["user"]["login"] != owner:
-                    continue
-                sha = pr["head"]["sha"]
-                mine = [r for r in runs if (r.get("commit_sha") or r.get("head_sha")) == sha]
-                if mine and mine[0].get("status") == "failure":
-                    add_trigger(owner, f"ci-failed:{repo}#{pr['number']}:{sha[:12]}",
-                                f"CI failed on pull request {repo}#{pr['number']}", once=True)
-            # Merges a missed webhook would have lost.
-            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=closed&sort=recentupdate", limit=20):
-                merged = pr.get("merged_at")
-                if (pr.get("merged") and merged and pr["user"]["login"] == owner
-                        and now() - datetime.fromisoformat(merged.replace("Z", "+00:00")).timestamp() < RECONCILE * 2):
-                    wake_after_merge(repo, owner, pr)
-            check_main(repo)
-            check_released_requests(repo)
-            check_stalls(repo, owner)
+            evaluate(d["repo"], d["number"], dependents=False)
+        except Exception as e:
+            log(f"evaluating {d['repo']}#{d['number']} failed: {e!r}")
+
+
+def evaluate_repo(repo, items=False, seed=False):
+    for o in repo_rules(repo):
+        queue(o, seed)
+    if items:
+        for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all"):
+            try:
+                evaluate(repo, i["number"], dependents=False, seed=seed)
+            except Exception as e:
+                log(f"evaluating {repo}#{i['number']} failed: {e!r}")
+
+
+def no_longer_owed(rows):
+    """The ids of queued triggers, among those a rule queued, that their
+    item no longer owes: the pull request merged meanwhile, the comment was
+    answered, the head moved on."""
+    items, stale = {}, []
+    for r in rows:
+        m = RULE_KEY.match(r["key"])
+        if m and m[1] in RULE_KINDS:
+            items.setdefault((m[2], int(m[3])), []).append(r)
+    for (repo, n), rs in items.items():
+        try:
+            keys = {o.key for o in owed_on(Item(repo, n))[0]}
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                continue
+            keys = set()
+        except Exception as e:
+            log(f"couldn't check {repo}#{n} is still owed: {e!r}")
+            continue
+        stale += [r["id"] for r in rs if r["key"] not in keys]
+    return stale
+
+
+def forge_missing(repo):
+    """Whether a repository, or its main, doesn't exist (yet)."""
+    for path in (f"/repos/{ORG}/{repo}", f"/repos/{ORG}/{repo}/branches/main"):
+        try:
+            forge("GET", path)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return True
+            raise
+    return False
+
+
+def sweep(seed=False):
+    """Every repository and every open issue and pull request evaluated, and
+    issues closed lately (a rejected request): what a missed webhook would
+    have lost, and what no webhook brings."""
+    since = iso(max(float(kv_get("reconciled", 0)) - RECONCILE, now() - 86400))
+    ok = True
+    for repo in OWNER_OF:
+        try:
+            evaluate_repo(repo, items=True, seed=seed)
+            for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}"):
+                evaluate(repo, i["number"], dependents=False, seed=seed)
+            check_unverified_stalls(repo)
             # What waits on the human but isn't assigned to them: from before
             # assignment, or a missed webhook. Forgejo ignores a label filter
             # naming a label the repository lacks, so check each item's own.
@@ -1038,24 +1136,28 @@ def reconcile():
                 for item in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&labels={labels}"):
                     if waits_on_human({l["name"] for l in item.get("labels") or []}):
                         set_assigned(repo, item["number"], item, True)
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and forge_missing(repo):
+                log(f"{repo} is in agents.conf but not in Forgejo (or has no main): skipped")
+                continue
+            ok = False
+            log(f"sweeping {repo} failed: {e!r}")
         except Exception as e:
-            log(f"reconciling {repo} failed: {e!r}")
-    # Pull requests whose head passed CI (or that have no CI) but which
-    # conformance hasn't reviewed, or the coordinator hasn't approved when
-    # its review is requested.
-    for repo in OWNER_OF:
-        try:
-            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?limit=50") or {}
-            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
-            for pr in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-                sha = pr["head"]["sha"]
-                mine = [r for r in runs if (r.get("commit_sha") or r.get("head_sha")) == sha]
-                if not has_ci(repo) or (mine and mine[0].get("status") == "success"):
-                    queue_conformance(repo, pr["number"], sha)
-                    queue_coordinator_review(repo, pr["number"], sha)
-        except Exception as e:
-            log(f"reconciling {repo}'s reviews failed: {e!r}")
+            ok = False
+            log(f"sweeping {repo} failed: {e!r}")
     kv_set("reconciled", now())
+    return ok
+
+
+def reconcile():
+    """The first sweep on a ledger from before the rules records what they
+    find as handled where the old triggers covered it (SEED_KINDS)."""
+    if not kv_get("rules-seeded"):
+        if sweep(seed=True):
+            kv_set("rules-seeded", now())
+            log("the rules' first sweep is done: from now on they queue work")
+    else:
+        sweep()
 
 
 # --- Idle summaries -------------------------------------------------------------
@@ -1185,6 +1287,24 @@ def agent_state(agent):
 
 
 def claim(agent):
+    """A run for the agent if its work is due, after checking that each
+    item behind it still owes that work: dropped (and renamed, so the same
+    state can queue it again should it come back) if not."""
+    if not due(agent):
+        return None
+    rows = q("SELECT id, key FROM triggers WHERE agent=? AND run_id IS NULL", agent)
+    stale = no_longer_owed(rows)
+    if stale:
+        q(f"UPDATE triggers SET run_id=-1, key = key || ':stale:' || CAST(? AS INTEGER) "
+          f"WHERE run_id IS NULL AND id IN ({','.join('?' * len(stale))})", now(), *stale)
+        log(f"dropped {len(stale)} trigger(s) for {agent} that are no longer owed")
+    return due(agent, grant=True)
+
+
+def due(agent, grant=False):
+    """Whether the agent's work is due: no run, not paused, under its caps,
+    and its newest trigger settled for DEBOUNCE (or its oldest waited
+    MAX_DELAY). With grant, the run is started and returned."""
     with LOCK:
         if DB.execute("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", (agent,)).fetchone():
             return None
@@ -1213,6 +1333,8 @@ def claim(agent):
         t = now()
         if t - rows[-1]["created"] < DEBOUNCE and t - rows[0]["created"] < MAX_DELAY:
             return None
+        if not grant:
+            return True
         descs = list(dict.fromkeys(r["description"] for r in rows))
         cur = DB.execute("INSERT INTO runs (agent, triggers, claimed) VALUES (?,?,?)",
                          (agent, json.dumps(descs), t))

@@ -104,18 +104,39 @@ s4_events() {
 
 The kit's stage 4 test: a request from $HUMAN_USER.")"
   echo "REQ $req"
+  # scale's own comment first: one after the question would answer it.
+  say scale "$S4_DEP" "$req" "scale's own comment (stage 4 test)."
   say consumer-metrics "$S4_DEP" "$req" "A question from consumer-metrics: does this need a reply? (stage 4 test)"
   say consumer-metrics "$S4_DEP" "$req" "(no reply needed)
 
 consumer-metrics acknowledges (stage 4 test)."
-  say scale "$S4_DEP" "$req" "scale's own comment (stage 4 test)."
   say "$S4_STRANGER" "$S4_DEP" "$req" "An untrusted comment (stage 4 test)."
   new_issue "$S4_STRANGER" "$S4_DEP" "Stage 4 test: an untrusted request" request,new "From an untrusted account." >/dev/null
   # needs-human on a core issue: a notice for the human, work for the coordinator.
   local nh
   nh="$(new_issue core "$S4_LIB" "Stage 4 test: needs the human" needs-human "(no reply needed)
 
-The kit's stage 4 test.")"
+The kit's stage 4 test.
+
+## Question
+
+Nothing to decide: a test.
+
+## Options
+
+None.
+
+## Recommendation
+
+Close it.
+
+## If you say go ahead
+
+Nothing.
+
+## Blocked on this
+
+Nothing.")"
   echo "NH $nh"
   # A review request for the coordinator, and a review of core's pull request.
   as human call 201 POST "/repos/$ORG/$S4_LIB/pulls/$pr/requested_reviewers" '{"reviewers":["coordinator"]}' >/dev/null
@@ -131,6 +152,10 @@ Blocked-by: $ORG/$COORDINATION#$up")"
   echo "UP $up"
   echo "BLOCKED $blocked"
   say human "$COORDINATION" "$up" "The human comments on the upstream issue (stage 4 test)."
+  # CI failing on core's pull request: a commit status, as branch protection
+  # sees it (the webhook below only says where to look).
+  as human call 201 POST "/repos/$ORG/$S4_LIB/statuses/$(as human call 200 GET "/repos/$ORG/$S4_LIB/pulls/$pr" | jq -r .head.sha)" \
+    '{"state":"failure","context":"checks / stage4 (pull_request)","description":"stage 4 test"}' >/dev/null
   # Events a test can't cause without changing main or publishing a release.
   fake_hook release "$(jq -nc --argjson r "$(repo_json "$S4_DEP")" --arg h "$HUMAN_USER" --arg t "$S4_TAG" \
     '{action: "published", release: {tag_name: $t}, repository: $r, sender: {login: $h}}')"
@@ -168,7 +193,7 @@ s4_check_triggers() {
     || s4_fail "scale has work from an untrusted request"
   expect coordinator "^needs-human added to issue $S4_LIB#$nh$" "needs-human added"
   expect coordinator "^pull request opened: $S4_LIB#$pr$" "a pull request opened"
-  expect coordinator "^review requested from you on pull request $S4_LIB#$pr$" "a review requested from it"
+  expect_not coordinator "^review requested from you on pull request $S4_LIB#$pr," "a review requested from it while CI fails"
   expect core "^review on pull request $S4_LIB#$pr$" "a review of its pull request"
   expect core "^CI failed on pull request $S4_LIB#$pr$" "a failed Actions run on its pull request"
   expect_not core "^pull request $S4_LIB#$pr (is behind|conflicts with) main" "its pull request behind main but not conflicting"

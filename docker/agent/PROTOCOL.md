@@ -60,7 +60,7 @@ If a library you depend on is missing something, or is wrong, do **not** reimple
 
 1. If it is one of this project's libraries, open an issue on its repository using the request template, with labels `request` and `new`: `tea issue create --repo {{ORG}}/<library> --labels request,new --title ... --description ...`.
 2. If it is outside this project (Lasm, Lean, Mathlib or any other), open an issue on `{{ORG}}/inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a minimal reproduction. If it stops you working, add `blocking` too: that tells the human.
-3. Mark your own task as blocked on that issue: add the `blocked` label to your task's issue, and a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment. A run starts for you when that issue is closed, when its repository publishes a release, or when the human comments on it if it is an upstream issue. Only a `Blocked-by:` line wakes you: an @-mention does not, so name the issue that must close. Remove `blocked` once you are no longer waiting.
+3. Mark your own task as blocked on that issue: add a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment, one line for each issue it waits on. The dispatcher keeps the `blocked` label in step with these lines, so don't set it yourself: it's on while any issue they name is open and unreleased. A run starts for you once every issue they name is closed or released (a `Released in` comment on it), and when the human comments on an upstream issue among them. Only a `Blocked-by:` line wakes you: an @-mention does not, so name the issue that must close. If you stop waiting on one before it closes, edit its line out.
 4. Move to other work.
 
 ## Handling requests on your repository
@@ -73,6 +73,8 @@ Requests are open issues labelled `request` and `new`. For each one, remove `new
 - **Escalate**: when the decision is the human's, put it to them as described under "Decisions for the human": a question or trade-off that needs their judgement; a change to `CLAUDE.md`, `.forgejo/`, `lean-toolchain` or `REQUIREMENTS.md`; or, below autonomy level 3, a change to `API.lock`.
 
 When the work is merged and `CHANGELOG.md` on `main` has its entry for the next release (see Definition of done), add `ready-for-release` and comment with the pull request's link. Your run usually ends before an auto-merge lands; a run starts for you when a pull request of yours merges while a request it names with `Refs` is still open without `ready-for-release`, so do this step then. At autonomy level 3 the coordinator releases it through the gatekeeper, which comments `Released in vX.Y.Z` on the issue. Below level 3 the human releases it; if no `Released in vX.Y.Z` comment follows, add one yourself, starting a line with exactly that.
+
+A run also starts for the requester when you counter-propose its request (`counter-proposal`) or close it unverified, so it hears your answer.
 
 That comment starts a run for the requester. Upgrade to the release, check the acceptance criteria, then add `verified` and close the issue. If you can't (the upgrade breaks your build, or a criterion isn't met), say so on the issue instead, and file what blocks you as usual. If it's still unverified a day after the release, you're woken again; after two days it becomes the human's problem.
 

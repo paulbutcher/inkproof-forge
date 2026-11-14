@@ -39,7 +39,10 @@ phase() {
 key() { awk -v k="$1" '$1 == k { print $2 }' "$keys"; }
 keys="$(mktemp)"
 exec 3>>"$keys"
-runs_of() { status | jqt -r --arg a "$1" '[.runs[] | select(.agent == $a)] | length'; }
+# runs_of AGENT [AFTER]: its runs with an id above AFTER (status lists only the
+# last 50 runs of all agents, so count from a run id, not from the list's length).
+runs_of() { status | jqt -r --arg a "$1" --argjson n "${2:-0}" '[.runs[] | select(.agent == $a and .id > $n)] | length'; }
+last_run() { status | jqt -r '[.runs[].id] | max // 0'; }
 
 echo "== Preconditions"
 for a in coordinator devtools float core scale consumer-metrics; do
@@ -96,7 +99,7 @@ bash "$(dirname "$0")/resume.sh" >/dev/null 2>&1
 phase check-resumed "$pr"
 
 echo "== A burst becomes one run; a cap stops runs and tells you"
-before="$(runs_of scale)"
+before="$(last_run)"
 cap=$(( $(status | jqt -r '.agents.scale.runs_today') + 1 ))
 # Put the dispatcher back to its own cap however the test ends.
 trap 'docker compose up -d --no-deps dispatcher >/dev/null 2>&1' EXIT
@@ -104,13 +107,13 @@ MAX_RUNS_PER_DAY="$cap" docker compose up -d --no-deps dispatcher >/dev/null 2>&
 sleep 5
 kit test-stage4 burst "$(key REQ)" >/dev/null || fail "couldn't make the burst"
 deadline=$(( $(date +%s) + 1200 ))
-until [ "$(status | jqt -r '[.runs[] | select(.agent == "scale" and .ended != null)] | length')" -gt "$before" ] \
+until [ "$(status | jqt -r --argjson n "$before" '[.runs[] | select(.agent == "scale" and .ended != null and .id > $n)] | length')" -gt 0 ] \
       || [ "$(date +%s)" -gt "$deadline" ]; do sleep 15; done
-[ "$(runs_of scale)" = $(( before + 1 )) ] && pass "three comments in a burst started one run" \
-  || fail "the burst started $(( $(runs_of scale) - before )) runs"
+[ "$(runs_of scale "$before")" = 1 ] && pass "three comments in a burst started one run" \
+  || fail "the burst started $(runs_of scale "$before") runs"
 kit test-stage4 poke "$(key REQ)" >/dev/null || fail "couldn't comment after the burst"
 sleep 90
-[ "$(runs_of scale)" = $(( before + 1 )) ] && pass "at its cap, scale started no more runs" || fail "scale went past its cap"
+[ "$(runs_of scale "$before")" = 1 ] && pass "at its cap, scale started no more runs" || fail "scale went past its cap"
 status | jqt -e '.agents.scale.state == "capped"' >/dev/null && pass "status shows scale capped" || fail "status doesn't show scale capped"
 status | jqt -e '[.notices[] | select(.kind == "cap" and .repo == "inkproof-scale" and .posted == 1)] | length > 0' >/dev/null \
   && pass "the cap is a notice, posted to you on scale's Kit notices issue" || fail "no posted cap notice"
