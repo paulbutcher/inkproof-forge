@@ -117,8 +117,8 @@ class Forge:
                     and (kind == "all" or (kind == "issues") == (i["pr"] is None))
                     and want <= {l["name"] for l in i["labels"]}]
         if m := re.fullmatch(r"commits/(\w+)/status", rest):
-            return {"statuses": [{"context": "checks / build (pull_request)", "status": s}
-                                 for s in self.statuses.get(m[1], [])]}
+            return {"statuses": [{"context": "checks / build (pull_request)", "status": s if isinstance(s, str) else s[0],
+                                   "updated_at": at(0 if isinstance(s, str) else s[1])} for s in self.statuses.get(m[1], [])]}
         if rest == "branches/main":
             return {"commit": self.mains.get(repo, {"id": "m" * 40, "timestamp": at(86400)})}
         if rest == "milestones":
@@ -433,8 +433,8 @@ class CoordinatorRules(Case):
         self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(2000)}
         d.evaluate(CORE, 13)
         self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
-                         [f"{CORE}#13 is still labelled ready-for-release, and main has changed since you last "
-                          "looked at it"])
+                         [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has finished "
+                          "since you last looked at it"])
 
     def test_15_not_once_it_has_looked(self):
         self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
@@ -442,6 +442,39 @@ class CoordinatorRules(Case):
         self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(2000)}
         d.evaluate(CORE, 13)
         self.assertNotIn("rfr", self.queued("coordinator"))
+
+    def test_15_scale_38_refused_while_mains_ci_ran_then_it_passed(self):
+        """The coordinator looked while CI on main was running (the gatekeeper
+        refused), and main didn't change after: CI finishing is the change."""
+        self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"],
+                     events=[label("ready-for-release", True, 400, "core"),
+                             comment("coordinator", 300, "The gatekeeper declined: CI on main is running.")])
+        self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(420)}
+        self.f.statuses["n" * 40] = [("running", 410)]
+        d.evaluate(CORE, 13)
+        self.assertNotIn("rfr", self.queued("coordinator"))
+        self.f.statuses["n" * 40] = [("failure", 100)]
+        d._cache.clear()
+        d.evaluate(CORE, 13)
+        self.assertNotIn("rfr", self.queued("coordinator"))
+        self.f.statuses["n" * 40] = [("success", 100)]
+        d._cache.clear()
+        d.evaluate(CORE, 13)
+        self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
+                         [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has "
+                          "finished since you last looked at it"])
+
+    def test_15_not_while_mains_ci_runs(self):
+        self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"],
+                     events=[label("ready-for-release", True, 400, "core")])
+        self.f.statuses["m" * 40] = [("running", 410)]
+        d.evaluate(CORE, 13)
+        self.assertNotIn("rfr", self.queued("coordinator"))
+        self.f.statuses["m" * 40] = [("success", 100)]
+        d._cache.clear()
+        d.evaluate(CORE, 13)
+        self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
+                         [f"ready-for-release added to issue {CORE}#13"])
 
     def test_16_needs_human_added_but_not_once_refused(self):
         self.f.issue(CORE, 4, "core", ["needs-human"], events=[label("needs-human", True, 100)])
@@ -505,6 +538,75 @@ class ReviewerRules(Case):
         d.evaluate(COORD, 31)
         self.assertEqual(self.queued("architecture"), ["milestone"])
         self.assertEqual(self.queued("lasm"), ["milestone", "lasm-blocking"])
+
+
+class Stalls(Case):
+    """Once the kit is quiet, every open item must wait for something the kit
+    can see; whoever should move on one that doesn't is woken."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = d.now()
+        self.real_now = d.now
+        d.now = lambda: self.clock
+
+    def tearDown(self):
+        d.now = self.real_now
+
+    def spell(self):
+        """A quiet spell later: the stall check, its work then handled."""
+        self.clock += 3600
+        d._cache.clear()
+        n = d.check_stalls()
+        found = sorted((r["agent"], r["key"].split(":")[1]) for r in
+                       d.q("SELECT agent, key FROM triggers WHERE run_id IS NULL AND key LIKE 'stalled:%'"))
+        self.handled()
+        return n, found
+
+    def test_what_waits_visibly_and_what_doesnt(self):
+        approved = [{"id": 1, "user": {"login": "conformance"}, "state": "APPROVED", "commit_id": "a" * 40,
+                     "submitted_at": at(100)}]
+
+        def requested(*who):
+            return [{**event("review_request", "core", 4000), "assignee": {"login": w}} for w in who]
+
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])  # nothing moves it
+        self.f.issue(CORE, 2, "scale", ["request", "needs-human"])  # the human's
+        self.f.issue(CORE, 3, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-core#2")
+        self.f.issue(CORE, 5, "scale", ["request", "ready-for-release"])  # the coordinator's
+        self.f.issue(CORE, 6, "scale", ["request", "accepted"])  # its pull request #7 is checked instead
+        self.f.pull(CORE, 7, "core", body="Refs #6", events=requested("conformance"))  # conformance's
+        self.f.issue(CORE, 10, "scale", ["request", "blocked"])  # blocked, but naming nothing
+        self.f.pull(CORE, 11, "core", events=requested("conformance"), reviews=approved)  # approved, not merging
+        self.f.pull(CORE, 12, "core", events=requested("conformance", "human"), reviews=approved)  # the human's
+        self.f.issue(CORE, 13, "scale", ["request", "counter-proposal"])  # the requester's answer
+        self.f.issue(CORE, 14, "scale", ["request"], events=[comment("gatekeeper", 100, "Released in v1.0.0")])
+        self.f.issue(COORD, 9, "core", ["upstream", "upstream:lasm"])  # the world outside
+        n, found = self.spell()
+        self.assertEqual(found, sorted([("core", f"{CORE}#1"), ("coordinator", f"{CORE}#5"),
+                                        ("conformance", f"{CORE}#7"), ("core", f"{CORE}#10"),
+                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13")]))
+        self.assertEqual(n, 6)
+
+    def test_twice_without_moving_then_the_humans_and_a_fix_starts_again(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual(self.spell(), (0, []))
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices")], ["stalled"])
+        # Once it waits visibly, a later stall starts from nothing.
+        self.f.items[(CORE, 1)]["labels"].append({"name": "needs-human"})
+        self.assertEqual(self.spell(), (0, []))
+        self.f.items[(CORE, 1)]["labels"].pop()
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+
+    def test_a_capped_agent_isnt_woken_or_counted(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        for _ in range(d.CAP):
+            d.q("INSERT INTO runs (agent, triggers, claimed, ended) VALUES ('core', '[]', ?, ?)", self.clock + 3600,
+                self.clock + 3600)
+        self.assertEqual(self.spell(), (0, []))
+        self.assertIsNone(d.kv_get(f"stall:{CORE}#1"))
 
 
 class Mechanics(Case):
