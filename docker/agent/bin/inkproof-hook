@@ -6,7 +6,8 @@
   inkproof-hook prompt          a human prompt: the human is busy
   inkproof-hook stop            Claude stopped: a human is idle from now;
                                 a run may not stop with untriaged requests
-  inkproof-hook session-end     a human session closed: record it
+  inkproof-hook session-end     a human session closed: record it; the human
+                                is idle at once unless still here (see below)
 
 A session is the human's when CLAUDE_CODE_ENTRYPOINT is claude-vscode or
 cli and the runner didn't start it. The runner reads what these write in
@@ -20,6 +21,9 @@ import time
 import urllib.request
 
 STATE = "/workspace/.inkproof"
+GRACE = int(os.environ.get("HUMAN_GRACE_SECONDS", "600"))
+# Ends that hand straight over to another session of the human's.
+CONTINUING = ("clear", "resume")
 
 
 def human():
@@ -27,12 +31,39 @@ def human():
             and not os.environ.get("INKPROOF_RUN"))
 
 
-def write_activity(state):
+def write_activity(state, at=None):
     os.makedirs(STATE, exist_ok=True)
     tmp = f"{STATE}/activity.tmp"
     with open(tmp, "w") as f:
-        json.dump({"state": state, "at": int(time.time())}, f)
+        json.dump({"state": state, "at": int(time.time()) if at is None else at}, f)
     os.replace(tmp, f"{STATE}/activity")
+
+
+def other_session_live(ended):
+    """Whether the human has another session open here that was in use
+    within the grace period: started, not ended, and its transcript written
+    lately. A session that crashed without an end stops counting once its
+    transcript has been quiet that long, as its activity would have."""
+    last = {}
+    try:
+        with open(f"{STATE}/sessions.jsonl") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                last[e.get("session", "")] = e
+    except OSError:
+        return False
+    for sid, e in last.items():
+        if sid == ended or e.get("event") != "start":
+            continue
+        try:
+            if time.time() - os.path.getmtime(e.get("transcript") or "") < GRACE:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def record_session(event, data):
@@ -95,7 +126,12 @@ def main():
             write_activity("busy")
     elif event == "session-end":
         if human():
-            write_activity("idle")
+            # Closing the session means the human has gone: queued work may
+            # start now rather than after the grace period, unless the session
+            # was cleared or resumed into another, or another is still in use.
+            gone = (data.get("reason") not in CONTINUING
+                    and not other_session_live(data.get("session_id", "")))
+            write_activity("idle", 0 if gone else None)
             record_session("end", data)
     elif event == "stop":
         if human():
