@@ -42,7 +42,7 @@ exec 3>>"$keys"
 runs_of() { status | jqt -r --arg a "$1" '[.runs[] | select(.agent == $a)] | length'; }
 
 echo "== Preconditions"
-for a in coordinator core scale consumer-metrics; do
+for a in coordinator devtools float core scale consumer-metrics; do
   [ -n "$(docker compose ps -q "$a")" ] && pass "$a is running" || { fail "$a isn't running (scripts/up.sh)"; exit 1; }
 done
 [ ! -e "$STATE_DIR/control/paused" ] || { fail "the kit is already paused; run scripts/resume.sh first"; exit 1; }

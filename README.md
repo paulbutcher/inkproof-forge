@@ -93,6 +93,16 @@ Day to day:
 - **Activity.** `scripts/activity.sh` follows what's happening, a line each, in your time zone: pushes, pull requests, reviews, labels, CI results and releases from Forgejo, with who did them; work queued for an agent and why; runs starting and ending, with their outcome and cost; your sessions in agent containers, during which that agent starts no run; and notices. It shows the last 40 entries and then follows until Ctrl-C. `-n 200` shows more first, `--once` doesn't follow, and a word keeps only the lines containing it: `scripts/activity.sh scale`. Each issue and pull request it names, such as `inkproof-core#24`, links to Forgejo: Cmd-click it, in a terminal that supports hyperlinks (VS Code's and iTerm2 do). In one that doesn't, `--urls` prints the addresses at the end of each line instead.
 - **Reviews.** `scripts/reviews.sh` lists which reviews have taken place and their results, in your time zone. First, the reviews (conformance's, the coordinator's, the gatekeeper's and yours) on pull requests updated in the last 7 days, or `scripts/reviews.sh 30` for 30: who, when, the verdict, conformance's round and open findings, the gist, and whether the review is of an earlier commit or was dismissed. Then each milestone's architecture, process and Lasm reviews: whether each has reported, and each recommendation as accepted, declined or waiting on you. `scripts/reviews.sh --changes` shows only the reviews that asked for more work: those that requested changes, and milestone reviews that made recommendations.
 
+### Adding a library
+
+A new library starts in Forgejo, not on GitHub: `scripts/new-library.sh` creates its repository with a seed that builds and passes CI, and the push mirror then fills an empty GitHub repository.
+
+1. On GitHub, create an empty public repository `paulbutcher/<repository>`, with no README, and add it to the mirror token.
+2. Add the library's agent: a line in `agents.conf` (and the new repository in the reads of every library that will depend on it), `roles/<agent>.md`, and in `compose.yaml` and `scripts/up.sh` its service, volumes and name everywhere the other agents' names are listed.
+3. `scripts/new-library.sh <repository> <Name>`, for example `scripts/new-library.sh inkproof-float Float`, creates the repository and commits its seed to `main`: a Lake package for `Inkproof.<Name>` with a test package, from `templates/library/`, and `CLAUDE.md`, `LICENSE`, `.gitignore`, `lean-toolchain` and the manifests' format from `inkproof-core` (`SEED_FROM` names another). It then gives the teams the repository and creates its labels. It never seeds over a repository with content.
+4. `scripts/mirrors.sh`, then `scripts/up.sh`, which starts the agent and gives the others their clone of the repository.
+5. `scripts/setup-repo.sh <repository> <level>`, and merge its pull request, as for any repository.
+
 ### Reviews
 
 Four reviewers run as agents of their own. They own no repository and never push; each reads every repository.

@@ -7,6 +7,7 @@
 #   kit mirrors [--rotate]  push-mirror them to GitHub
 #   kit mirror-status  each push mirror's last sync and error
 #   kit setup-repo REPO LEVEL  apply an autonomy level to a repository
+#   kit new-library REPO NAME  create a library's repository and commit its seed
 #   kit pause, kit resume  the human's brake (scripts/pause.sh, resume.sh)
 #   kit project-status  requests, pull requests and needs-human items
 #   kit reviews DAYS   which reviews have taken place, and their results
@@ -64,6 +65,7 @@ case "${1:-}" in
   migrate) cmd_migrate ;;
   mirrors) shift; cmd_mirrors "$@" ;;
   setup-repo) shift; cmd_setup_repo "$@" ;;
+  new-library) shift; cmd_new_library "$@" ;;
   pause) cmd_pause ;;
   resume) cmd_resume ;;
   project-status) cmd_project_status ;;
