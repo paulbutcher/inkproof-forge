@@ -377,7 +377,8 @@ For an existing issue, the dispatcher comments as `dispatcher`, mentioning the h
 
 - **The upstream tracker.** When an agent finds a bug or limitation in a dependency outside the `inkproof-` repositories (Lasm, Lean, Mathlib or any other), it doesn't work around it. It files an issue on `inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a reproduction. If it can't continue, it marks its own task `blocked` with a `Blocked-by:` line naming that issue. A blocker also gets `blocking`, which notifies the human.
 - **Unblocking.** Nothing polls GitHub, so an upstream fix can't wake blocked agents by itself. The human closes the upstream issue, or comments on it, once a fix is available, and that is the trigger.
-- **Fetching.** Lasm and other third-party packages are fetched by Lake from GitHub through the proxies, as git reads. They are not in Forgejo.
+- **Fetching.** Third-party Lean packages are fetched by Lake from GitHub through the proxies, as git reads. Lasm is an npm package (`@lasm/cli`), which repositories pin in `test/package.json` and fetch from npm, also through the proxies; its browser bindings (`Lasm.Web`, `Lasm.UI`, `Lasm.JS`) come with it, not from Lake. None of these is in Forgejo.
+- **Browsers.** The agent and CI images include headless Chromium for browser tests, installed by Playwright when the images are built, at one pinned version (`PLAYWRIGHT_VERSION`, 1.64.1). Neither agents nor CI can download browsers, since no proxy allows Playwright's download host, so a repository pins `playwright` at exactly that version, and an upgrade changes the images and the pins together. Its WebGL is software, which is enough for functional tests, not for golden images across real GPUs (VAL-7).
 
 ## Agents' command line
 

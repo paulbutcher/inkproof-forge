@@ -273,3 +273,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 | `scripts/test-stage6.sh` | Level 2: the gatekeeper approves only on a real Actions run. |
 | `scripts/test-stage7.sh` | Level 3: the coordinator gates `API.lock`, and releases go through the gatekeeper. |
 | `scripts/test-stage8.sh` | Backups, pruning and restore-test. |
+
+### Upgrading Playwright
+
+The agent and CI images include headless Chromium for browser tests, installed by Playwright when they're built. Each Playwright release expects one browser build, and neither agents nor CI can download browsers, so repositories pin `playwright` at exactly the images' version. To upgrade, change `PLAYWRIGHT_VERSION` in both [docker/agent/Dockerfile](docker/agent/Dockerfile) and [docker/ci/image/Dockerfile](docker/ci/image/Dockerfile), run `scripts/up.sh` to rebuild, and ask the coordinator to file a request on each repository with browser tests to move its pin to the same version.

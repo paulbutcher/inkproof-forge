@@ -1,8 +1,9 @@
 # The image every agent container runs: Claude Code, tea, git, Node (for
-# Lasm), Python (for the runner and lean-lsp-mcp), and the kit's policy and
-# helpers, which the agent can read but not change. Each agent gets its own
-# small final stage, which bakes in its managed CLAUDE.md (role, then
-# protocol) and the git rules that send this project's GitHub URLs to Forgejo.
+# Lasm), headless Chromium (for browser tests), Python (for the runner and
+# lean-lsp-mcp), and the kit's policy and helpers, which the agent can read but
+# not change. Each agent gets its own small final stage, which bakes in its
+# managed CLAUDE.md (role, then protocol) and the git rules that send this
+# project's GitHub URLs to Forgejo.
 #
 # Versions are pinned: every agent runs the same tools during an experiment.
 FROM node:24.18.1-trixie-slim AS base
@@ -36,6 +37,15 @@ RUN case "$TARGETARCH" in \
  && chmod 0755 /usr/local/bin/tea
 
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force
+# Headless Chromium for browser tests (Inkproof.Web), with its system
+# libraries. Each Playwright release expects one browser build, and agents
+# can't download browsers (the proxy refuses), so repositories pin `playwright`
+# at exactly this version. Change both together.
+ARG PLAYWRIGHT_VERSION=1.64.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps --only-shell chromium \
+ && chmod -R a+rX /opt/ms-playwright \
+ && rm -rf /root/.npm /var/lib/apt/lists/*
 
 # The agent's user, with the host user's IDs so it can read its secrets.
 # -o allows IDs the base image already uses (macOS's GID 20, node's 1000).

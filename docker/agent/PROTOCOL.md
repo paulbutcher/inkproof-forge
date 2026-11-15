@@ -15,6 +15,7 @@ If your role says you own no repository (the reviewers), the sections on working
 - `tea` for issues, labels, comments and pull requests. It is logged in as you; name another repository with `--repo {{ORG}}/<repo>`.
 - `forge` for what `tea` lacks: `forge pr automerge <n>`, `forge pr merge <n>`, `forge ci <repo> <pr|main>`, which gives CI's result and, with `--log`, the log of each failed job, and `forge reviews <repo> <n>`, which shows a pull request's reviews and their findings (`tea` shows its comments but not its reviews). Run `forge` with no arguments for details.
 - `git` with your repository's remote; credentials are configured for you.
+- Headless Chromium, for browser tests through Playwright (`PLAYWRIGHT_BROWSERS_PATH` is set). Pin `playwright` in `test/package.json` at exactly 1.64.1, the version installed here and in CI, and never run `playwright install`: browsers can't be downloaded.
 - Some commands are denied by policy: `tea api`, `tea login`, `tea` release, approval and merge commands, `curl`, `wget`, `git tag`, `git config` and force pushes. Use `forge` instead where it offers the operation; never work round a denial.
 
 ## Working in your repository
