@@ -679,7 +679,7 @@ Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(No
 RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "merged",
               "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
-              "review-requested", "rfr", "nh", "conf", "conf-reply", "milestone", "lasm-blocking"}
+              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking"}
 # Kinds whose state, when the rules first run on an existing ledger, was
 # already acted on under the old event-driven triggers, or only reports what
 # happened: recorded as handled rather than queued. The others are work still
@@ -1007,6 +1007,19 @@ def coordinator_rules(it):
         added = (nh[-1].get("body") or "") == "1"
         o.append(Owed(c, f"nh:{at}:{nh[-1]['created_at']}",
                       f"needs-human {'added to' if added else 'removed from'} {it.kind} {at}"))
+    # 24. An open milestone issue on which every milestone review has reported
+    #     since it was labelled, and the coordinator hasn't commented since the
+    #     last report: their reports want no reply, so nothing else wakes it
+    #     to accept the milestone.
+    if it.repo == COORDINATION and it.open and not it.is_pr and "milestone-review" in it.labels:
+        labelled = when(it.label_event("milestone-review") or it.issue["created_at"])
+        reviewers = [r for r in MILESTONE_REVIEWERS if r in AGENTS]
+        reported = [it.by(r, ("comment",)) for r in reviewers]
+        if reviewers and min(reported) > labelled and it.by(c, ("comment",)) < max(reported):
+            o.append(Owed(c, f"reviewed:{at}:{iso(max(reported))}",
+                          f"every milestone review has reported on {at}: accept the milestone (say what you "
+                          "checked, close the issue and its Forgejo milestones, record it in ROADMAP.md), or say "
+                          "on it what it waits for"))
     return o
 
 

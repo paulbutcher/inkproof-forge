@@ -585,6 +585,22 @@ class ReviewerRules(Case):
         self.assertEqual(self.queued("architecture"), ["milestone"])
         self.assertEqual(self.queued("lasm"), ["milestone", "lasm-blocking"])
 
+    def test_24_every_review_reported_on_an_open_milestone_issue_coordination_82(self):
+        events = [label("milestone-review", True, 600, "coordinator"),
+                  comment("lasm", 500, "(no reply needed)\nNo findings.")]
+        events = self.f.issue(COORD, 82, "coordinator", ["milestone-review"], events=events)["events"]
+        d.evaluate(COORD, 82)
+        self.assertNotIn("reviewed", self.queued("coordinator"), "architecture hasn't reported")
+        events.append(comment("architecture", 400, "(no reply needed)\nReport."))
+        d.evaluate(COORD, 82)
+        self.assertEqual(self.descriptions("coordinator")[-1],
+                         f"every milestone review has reported on {COORD}#82: accept the milestone (say what you "
+                         "checked, close the issue and its Forgejo milestones, record it in ROADMAP.md), or say "
+                         "on it what it waits for")
+        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'reviewed:%' AND run_id IS NULL")
+        events.append(comment("coordinator", 100, "(no reply needed)\nWaiting on #85."))
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "it has looked since")
+
     def test_21_the_coordinator_accepted_and_closed_it_at_once_coordination_73(self):
         self.f.issue(COORD, 73, "coordinator", ["milestone-review"], state="closed", closed=60, events=[
             label("milestone-review", True, 70, "coordinator"), comment("coordinator", 60, "(no reply needed)\nAccepted."),
