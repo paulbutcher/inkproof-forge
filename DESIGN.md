@@ -243,7 +243,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 - **(15)** An item labelled `ready-for-release`, once CI on `main` has finished and passed, that it hasn't commented on or labelled since the label went on, since `main` last changed, or since CI on `main` finished.
 - **(16)** `needs-human` added or removed by anyone but itself and the dispatcher, if it hasn't commented or labelled since.
 - **(17)** An open milestone with closed issues and none open.
-- **(23)** Every milestone on every repository closed. It fires once for the milestone closed last, and not while the coordinator runs, so that what comes next is always someone's work: the next milestone drafted, what it needs put to the human, or the project recorded as finished.
+- **(23)** No milestone on any repository with an open issue, so a milestone left open once its work is done doesn't hold it back. It fires once for the newest milestone that had work (by creation, so closing leftover or empty milestones doesn't fire it again), and not while the coordinator runs or has work queued, so that what comes next is always someone's work: the next milestone drafted, what it needs put to the human, or the project recorded as finished.
 - **(24)** An open milestone issue on which every milestone review has reported since `milestone-review` went on, if it hasn't commented since the last report.
 - **(18)** A release published by anyone but the gatekeeper and itself.
 - **The idle summary.** The kit going quiet, once per quiet spell, with nothing stalled (see Stalls). Quiet means:

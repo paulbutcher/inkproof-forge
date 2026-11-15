@@ -589,24 +589,38 @@ class CoordinatorRules(Case):
         self.assertEqual(self.descriptions("coordinator"),
                          [f"the last open issue in milestone Float library on {CORE} was closed"])
 
-    def test_23_every_milestone_closed_float_library(self):
-        def ms(i, title, state, closed=None):
-            return {"id": i, "title": title, "state": state, "open_issues": 0, "closed_issues": 2,
+    def test_23_no_milestone_with_open_work_review_follow_ups_5(self):
+        def ms(i, title, state, created, open_=0, closed_issues=2, closed=None):
+            return {"id": i, "title": title, "state": state, "open_issues": open_, "closed_issues": closed_issues,
+                    "created_at": at(created), "updated_at": at(closed if closed is not None else 100),
                     "closed_at": at(closed) if closed is not None else None}
-        self.f.milestones[CORE] = [ms(1, "Milestone 2", "closed", 90000), ms(3, "Float library", "open")]
-        self.f.milestones[COORD] = [ms(2, "Float library", "closed", 100)]
+        self.f.milestones[CORE] = [ms(1, "Milestone 2", "closed", 99000, closed=90000),
+                                   ms(3, "Follow-ups", "open", 3000, open_=1, closed_issues=1)]
+        self.f.milestones[COORD] = [ms(2, "Milestone 5", "closed", 9000, closed=6000),
+                                    ms(4, "Milestone 5", "open", 2000, closed_issues=0)]  # an empty duplicate
         d.evaluate_repo(COORD)
-        self.assertEqual(self.queued("coordinator"), [])
-        self.f.milestones[CORE][1] = ms(3, "Float library", "closed", 50)
+        self.assertEqual(self.queued("coordinator"), [], "Core's follow-ups still have open work")
+        # Its last issue closes; the milestone is left open.
+        self.f.milestones[CORE][1] = ms(3, "Follow-ups", "open", 3000, closed_issues=2)
         run = self.running("coordinator")
         d.evaluate_repo(COORD)
         self.assertEqual(self.queued("coordinator"), [], "not while it runs: it may be drafting the next one")
         d.end_run("coordinator", run, {"outcome": "completed"})
         d.evaluate_repo(COORD)
         self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL")[0]["key"], f"next-milestone:{CORE}:3")
+        self.assertIn("close out any milestone left open", self.descriptions("coordinator")[0])
         self.handled()
+        # Closing what was left open, the empty duplicate included, doesn't wake it again.
+        self.f.milestones[CORE][1] = ms(3, "Follow-ups", "closed", 3000, closed=50)
+        self.f.milestones[COORD][1] = ms(4, "Milestone 5", "closed", 2000, closed_issues=0, closed=40)
         d.evaluate_repo(COORD)
-        self.assertEqual(self.queued("coordinator"), [], "once per milestone closed")
+        self.assertEqual(self.queued("coordinator"), [], "once per milestone finished")
+        # The next milestone's work, once done, is due in its own right.
+        self.f.milestones[COORD].append(ms(5, "Milestone 6", "open", 30, closed_issues=3))
+        d.evaluate_repo(COORD)
+        self.handled()  # rule 17 for it comes first; 23 waits until the coordinator has nothing queued
+        d.evaluate_repo(COORD)
+        self.assertIn(f"next-milestone:{COORD}:5", [r["key"] for r in d.q("SELECT key FROM triggers WHERE run_id IS NULL")])
 
 
 class ReviewerRules(Case):

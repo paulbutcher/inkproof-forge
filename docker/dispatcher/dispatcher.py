@@ -1154,23 +1154,28 @@ def repo_rules(repo):
             if ms.get("open_issues") == 0 and ms.get("closed_issues", 0) > 0:
                 o.append(Owed(COORDINATOR, f"milestone-done:{repo}:{ms['id']}",
                               f"the last open issue in milestone {ms.get('title')} on {repo} was closed"))
-    # 23. Every milestone on every repository closed: nothing in the kit says
-    #     what comes next, so the coordinator must, once per milestone closed.
-    #     Not while it runs, since it may be drafting the next one.
+    # 23. No milestone on any repository with an open issue: nothing in the
+    #     kit says what comes next, so the coordinator must, once per
+    #     milestone finished. A milestone left open with its work done
+    #     doesn't hold it back. Not while it runs, since it may be drafting
+    #     the next one.
     if COORDINATOR and repo == COORDINATION:
         last = next_milestone_due()
         if last:
             o.append(Owed(COORDINATOR, f"next-milestone:{last[0]}:{last[1]['id']}",
-                          f"every milestone is closed, the last {last[1].get('title')} on {last[0]}: draft the next "
-                          "one, or put to the human what it needs first (a repository, an agent, a decision), "
-                          "or record in ROADMAP.md that the project is finished", quiet=True))
+                          f"no milestone has open work, the newest {last[1].get('title')} on {last[0]}: close "
+                          "out any milestone left open (its milestone issue and reviews, or close it if that's "
+                          "done), then draft the next one, or put to the human what it needs first (a repository, "
+                          "an agent, a decision), or record in ROADMAP.md that the project is finished", quiet=True))
     return o
 
 
 def next_milestone_due():
-    """The (repository, milestone) closed last, if no milestone is open
-    anywhere; None otherwise, or if there has never been one."""
-    closed = []
+    """The newest (repository, milestone) that had work, if no milestone
+    anywhere has an open issue; None otherwise, or if none ever had work.
+    Newest by creation, so that closing milestones left open, or empty ones,
+    doesn't make it due again."""
+    done = []
     for repo in OWNER_OF:
         try:
             ms = forge_all(f"/repos/{ORG}/{repo}/milestones?state=all")
@@ -1178,12 +1183,12 @@ def next_milestone_due():
             if e.code == 404:
                 continue
             raise
-        if any(m.get("state") == "open" for m in ms):
+        if any(m.get("open_issues", 0) > 0 for m in ms):
             return None
-        closed += [(when(m["closed_at"]), repo, m) for m in ms if m.get("closed_at")]
-    if not closed:
+        done += [(when(m["created_at"]), m["id"], repo, m) for m in ms if m.get("closed_issues", 0) > 0]
+    if not done:
         return None
-    _, repo, m = max(closed, key=lambda c: c[0])
+    _, _, repo, m = max(done, key=lambda c: c[:2])
     return repo, m
 
 
