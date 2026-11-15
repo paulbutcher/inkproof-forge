@@ -239,7 +239,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 - **(12)** An open request filed by someone else.
 - **(13)** A pull request opened by someone else, open or merged. The trigger is held until CI finishes on the pull request, or for `PR_OPENED_HOLD_SECONDS` at most (default 10 minutes), so that a review requested from the coordinator shares the run.
-- **(14)** A pull request requesting its review, whose head passed CI and which it hasn't approved at that head.
+- **(14)** A pull request requesting its review, whose head passed CI and which it hasn't approved at that head. The trigger says whether the coordinator's is the review the pull request waits for: it is when CODEOWNERS on the repository's `main` gives `API.lock` to the coordinator (level 3), read from Forgejo, since a clone made before the setup pull request merged has no CODEOWNERS.
 - **(15)** An item labelled `ready-for-release`, once CI on `main` has finished and passed, that it hasn't commented on or labelled since the label went on, since `main` last changed, or since CI on `main` finished.
 - **(16)** `needs-human` added or removed by anyone but itself and the dispatcher, if it hasn't commented or labelled since.
 - **(17)** An open milestone with closed issues and none open.
@@ -270,6 +270,10 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 ### `lasm`, also
 
 - **(22)** An open issue on `inkproof-coordination` labelled `upstream`, `upstream:lasm` and `blocking`.
+
+### Any agent, when the human mentions it
+
+- **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). An agent's @-mentions wake no one.
 
 ### Stalls
 

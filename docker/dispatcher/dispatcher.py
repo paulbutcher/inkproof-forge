@@ -45,6 +45,7 @@ it is the human's. With nothing stalled, it wakes the coordinator to tell the
 human what it needs from them. Once per quiet spell.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -379,6 +380,23 @@ def ci_settled(repo, sha):
     return ("success" if states <= {"success", "warning"} else "running"), at
 
 
+def at_level_3(repo):
+    """Whether repo's .forgejo/CODEOWNERS on main gives API.lock to the
+    coordinator: the coordinator's approval is then the one its API changes
+    need. Read from main each time (cached briefly), never from a clone."""
+    def read():
+        try:
+            f = forge("GET", f"/repos/{ORG}/{repo}/contents/.forgejo/CODEOWNERS?ref=main") or {}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            raise
+        text = base64.b64decode(f.get("content") or "").decode(errors="replace")
+        return any(l.split()[:1] == ["API\\.lock"] and f"@{COORDINATOR}" in l.split()[1:]
+                   for l in text.splitlines())
+    return cached(("level3", repo), 300, read)
+
+
 def label_id(repo, name):
     labels = cached(("labels", repo), 3600, lambda: forge_all(f"/repos/{ORG}/{repo}/labels"))
     return next((l["id"] for l in labels if l["name"] == name), None)
@@ -683,7 +701,7 @@ Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(No
 RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci", "merged",
               "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
-              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking"}
+              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention"}
 # Kinds whose state, when the rules first run on an existing ledger, was
 # already acted on under the old event-driven triggers, or only reports what
 # happened: recorded as handled rather than queued. The others are work still
@@ -1003,8 +1021,15 @@ def coordinator_rules(it):
         approved = any(login(r) == c and r.get("state") == "APPROVED" and r.get("commit_id") == it.head
                        and not r.get("dismissed") for r in it.reviews)
         if not approved and (not has_ci(it.repo) or it.ci() == "success"):
+            # Said outright, from CODEOWNERS on main, since a stale clone
+            # (from before the setup pull request merged) suggests otherwise.
+            whose = (f"{it.repo} is at level 3: CODEOWNERS on main gives `API.lock` to you, so this pull request "
+                     "waits for your review. Approve it, request changes, or put a trade-off to the human as a "
+                     "decision; a comment alone leaves it waiting" if at_level_3(it.repo) else
+                     f"{it.repo} is below level 3, so the human approves its `API.lock`; your review is advisory")
             o.append(Owed(c, f"review-requested:{at}:{it.head[:12]}",
-                          f"review requested from you on pull request {at}, whose CI passed at {it.head[:12]}"))
+                          f"review requested from you on pull request {at}, whose CI passed at {it.head[:12]}. "
+                          f"{whose}"))
     if it.open and "ready-for-release" in it.labels:
         # 15. Ready for release, CI on main finished and passed (the
         #     gatekeeper releases nothing else), and it hasn't looked since
@@ -1082,6 +1107,25 @@ def reviewer_rules(it):
     return o
 
 
+MENTION = re.compile(r"(?<![\w@/.-])@([\w.-]+)")
+
+
+def mention_rules(it):
+    """What the human's @-mentions ask of agents other than the owner."""
+    o, at = [], it.at
+    # 26. A comment by the human that @-mentions an agent, which that agent
+    #     hasn't commented on or acted on the item since: the human's way to
+    #     reach an agent other than the owner, whom any comment wakes (2).
+    #     An agent's mentions wake no one.
+    for c in it.comments():
+        if login(c) != HUMAN:
+            continue
+        for name in dict.fromkeys(MENTION.findall(c.get("body") or "")):
+            if name in AGENTS and name != it.owner and it.by(name) < when(c["created_at"]):
+                o.append(Owed(name, f"mention:{at}:{c['id']}", f"the human mentioned you on {it.kind} {at}"))
+    return o
+
+
 def owed_on(it):
     """Everything owed on an item, and whether it is blocked (None if it
     names no blocker), with the issues it names."""
@@ -1090,6 +1134,7 @@ def owed_on(it):
     owed += requester_rules(it)
     owed += coordinator_rules(it)
     owed += reviewer_rules(it)
+    owed += mention_rules(it)
     return [o for o in owed if o.agent in AGENTS], blocked, found
 
 

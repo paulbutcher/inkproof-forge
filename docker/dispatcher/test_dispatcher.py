@@ -3,6 +3,7 @@ serves issues and pull requests as they really look. Run by
 scripts/test-dispatcher.sh, in the dispatcher's image.
 
 The rules' numbers are those in the dispatcher's Rules section."""
+import base64
 import os
 import re
 import tempfile
@@ -57,6 +58,7 @@ class Forge:
 
     def __init__(self):
         self.items, self.statuses, self.mains, self.milestones, self.writes = {}, {}, {}, {}, []
+        self.codeowners = {}
 
     def issue(self, repo, n, author, labels=(), state="open", body="", created=7200, events=(), closed=None):
         self.items[(repo, n)] = {"number": n, "state": state, "user": {"login": author}, "body": body,
@@ -125,6 +127,10 @@ class Forge:
                                    "updated_at": at(0 if isinstance(s, str) else s[1])} for s in self.statuses.get(m[1], [])]}
         if rest == "branches/main":
             return {"commit": self.mains.get(repo, {"id": "m" * 40, "timestamp": at(86400)})}
+        if rest == ".forgejo/CODEOWNERS" or rest == "contents/.forgejo/CODEOWNERS":
+            if repo not in self.codeowners:
+                raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            return {"content": base64.b64encode(self.codeowners[repo].encode()).decode()}
         if rest == "milestones":
             return [m for m in self.milestones.get(repo, []) if args.get("state", "open") in ("all", m.get("state", "open"))]
         if rest == "labels":
@@ -194,6 +200,21 @@ class OwnerRules(Case):
         rows = d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")
         self.f.items[(CORE, 9)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
         self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once triaged")
+
+    def test_26_the_humans_mention_wakes_that_agent_gpu_9(self):
+        asks = comment("human", 300, "@coordinator inkproof-core is at level 3; decide. cc @scale @core @stranger "
+                                     "(not mail@lasm.org)")
+        self.f.pull(CORE, 9, "core", events=[asks, comment("scale", 200, "(no reply needed)\nSeen.")])
+        self.f.pull(CORE, 10, "core", sha="b" * 40, events=[comment("scale", 100, "@coordinator please look")])
+        d.evaluate(CORE, 9)
+        d.evaluate(CORE, 10)
+        self.assertEqual(sorted(k for k in self.queued() if k[1] == "mention"), [("coordinator", "mention")],
+                         "scale has acted since; core is the owner, whom any comment wakes; an agent's mention "
+                         "wakes no one")
+        self.assertIn(f"the human mentioned you on pull request {CORE}#9", self.descriptions("coordinator"))
+        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'mention:%'")
+        self.f.items[(CORE, 9)]["events"].append(comment("coordinator", 50, "(no reply needed)\nApproved."))
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
 
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
         self.f.issue(CORE, 1, "core", events=[comment("scale", 300)])
@@ -490,6 +511,18 @@ class CoordinatorRules(Case):
                                                    "commit_id": "a" * 40, "submitted_at": at(10)})
         d.evaluate(CORE, 7)
         self.assertNotIn("review-requested", self.queued("coordinator"))
+
+    def test_14_says_whether_its_review_is_the_one_needed_gpu_9(self):
+        self.f.codeowners[SCALE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
+        for repo, owner in ((SCALE, "scale"), (CORE, "core")):  # Core has no CODEOWNERS on main
+            self.f.pull(repo, 9, owner, requested=["coordinator"], ci="success")
+            d.evaluate(repo, 9)
+        level3, below = [r["description"] for r in d.q(
+            "SELECT description FROM triggers WHERE key LIKE 'review-requested:%' ORDER BY key DESC")]
+        self.assertIn(f"{SCALE} is at level 3: CODEOWNERS on main gives `API.lock` to you, so this pull request "
+                      "waits for your review", level3)
+        self.assertIn("a comment alone leaves it waiting", level3)
+        self.assertIn(f"{CORE} is below level 3, so the human approves its `API.lock`", below)
 
     def test_15_consumer_metrics_13_fixed_with_the_label_left_on(self):
         self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],

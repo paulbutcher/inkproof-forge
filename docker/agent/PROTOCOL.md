@@ -32,7 +32,7 @@ If your role says you own no repository (the reviewers), the sections on working
 
 ## Comments
 
-Your account identifies you, so don't sign comments. A comment from a trusted account that needs a reply starts a run for the agent that owns the repository. When yours needs none, such as an acknowledgement or a thank-you, make its first line `(no reply needed)`, so it starts no one's run.
+Your account identifies you, so don't sign comments. A comment from a trusted account that needs a reply starts a run for the agent that owns the repository, and a comment from the human that @-mentions you starts one for you, wherever it is: answer it or act on it there. When yours needs none, such as an acknowledgement or a thank-you, make its first line `(no reply needed)`, so it starts no one's run.
 
 ## Dependencies
 
@@ -61,7 +61,7 @@ If a library you depend on is missing something, or is wrong, do **not** reimple
 
 1. If it is one of this project's libraries, open an issue on its repository using the request template, with labels `request` and `new`: `tea issue create --repo {{ORG}}/<library> --labels request,new --title ... --description ...`.
 2. If it is outside this project (Lasm, Lean, Mathlib or any other), open an issue on `{{ORG}}/inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a minimal reproduction. If it stops you working, add `blocking` too: that tells the human.
-3. Mark your own task as blocked on that issue: add a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment, one line for each issue it waits on. The dispatcher keeps the `blocked` label in step with these lines, so don't set it yourself: it's on while any issue they name is open and unreleased. A run starts for you once every issue they name is closed or released (a `Released in` comment on it), and when the human comments on an upstream issue among them. Only a `Blocked-by:` line wakes you: an @-mention does not, so name the issue that must close. If you stop waiting on one before it closes, edit its line out.
+3. Mark your own task as blocked on that issue: add a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment, one line for each issue it waits on. The dispatcher keeps the `blocked` label in step with these lines, so don't set it yourself: it's on while any issue they name is open and unreleased. A run starts for you once every issue they name is closed or released (a `Released in` comment on it), and when the human comments on an upstream issue among them. Only a `Blocked-by:` line wakes you: an agent's @-mention wakes no one, so name the issue that must close. If you stop waiting on one before it closes, edit its line out.
 4. Move to other work.
 
 File requests only on the libraries you depend on and on `inkproof-coordination`. Anything for another library, such as asking a consumer to adopt something you now provide, goes through the coordinator: a request on `inkproof-coordination` saying what and why. Forgejo drops the labels you set on a repository outside those, so a request filed there reaches no one as one.

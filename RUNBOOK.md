@@ -101,6 +101,8 @@ A new library starts in Forgejo, not on GitHub: `scripts/new-library.sh` creates
 
 You don't start runs. A request issue (labels `request` and `new`), or a comment or review on an agent's issue or pull request, from you or another kit account, queues work for the agent concerned. So do CI failures, merge conflicts, releases and the other rules listed in [DESIGN.md](DESIGN.md#triggers).
 
+A comment wakes the agent that owns the repository. To reach any other agent, such as the coordinator about a review it owes, @-mention it in your comment (`@coordinator`): your mentions wake the agents they name, once per comment. Agents' mentions wake no one.
+
 A run starts once the events have settled for a minute (`DEBOUNCE_SECONDS`), and within 15 minutes at most (`MAX_DELAY_SECONDS`). A comment whose first line is `(no reply needed)` starts nothing.
 
 ### You come first
