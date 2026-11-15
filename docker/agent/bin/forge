@@ -9,8 +9,13 @@ follow a rule tea can't enforce. Uses the agent's own token.
   forge pr merge <n>              merge your pull request #n now, or say why
                                   Forgejo won't: for a scheduled merge that
                                   hasn't gone through
-  forge ci <repo> <pr>            the Actions run for the pull request's head
-                                  commit: success, failure, running or none
+  forge ci <repo> <pr|main>       the Actions run for the pull request's head
+                                  commit (or main's): success, failure, running
+                                  or none
+  forge ci <repo> <pr|main> --log [all]
+                                  the log of each failed job in that run (each
+                                  job's, if none failed): its last 200 lines,
+                                  or all of them
   forge pr approve <repo> <n> <message>
                                   (coordinator) approve, only if the Actions run
                                   for the head commit succeeded
@@ -39,6 +44,7 @@ follow a rule tea can't enforce. Uses the agent's own token.
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -79,6 +85,18 @@ def api(method, path, body=None):
             return e.code, {"message": raw.decode(errors="replace")[:500]}
 
 
+def api_text(method, path):
+    """A GET whose answer is plain text, such as a job's log."""
+    with open("/run/secrets/forgejo_token") as f:
+        token = f.read().strip()
+    req = urllib.request.Request(FORGE + path, method=method, headers={"Authorization": f"token {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:500]
+
+
 def merge_call(n, body):
     """Ask Forgejo to merge #n. For a few seconds after a pull request is
     opened or pushed to, Forgejo is still checking that it merges cleanly
@@ -105,16 +123,61 @@ def repo_name(s):
     return s
 
 
-def ci_state(repo, pr):
+def head_of(repo, pr):
+    """The commit CI runs on: a pull request's head, or main's."""
+    if pr == "main":
+        s, b = api("GET", f"/repos/{ORG}/{repo}/branches/main")
+        if s != 200:
+            die(f"can't read {repo}'s main: {(b or {}).get('message', s)}")
+        return b["commit"]["id"]
     s, p = api("GET", f"/repos/{ORG}/{repo}/pulls/{pr}")
     if s != 200:
         die(f"can't read {repo}#{pr}: {p.get('message', s)}")
-    sha = p["head"]["sha"]
+    return p["head"]["sha"]
+
+
+def runs_for(repo, sha):
+    """The Actions runs for a commit, newest first."""
     s, runs = api("GET", f"/repos/{ORG}/{repo}/actions/runs?head_sha={sha}")
     if s != 200:
         die(f"can't read {repo}'s Actions runs: {(runs or {}).get('message', s)}")
     runs = runs.get("workflow_runs", runs) if isinstance(runs, dict) else runs
     mine = [r for r in runs or [] if (r.get("commit_sha") or r.get("head_sha")) == sha]
+    return sorted(mine, key=lambda r: r.get("id", 0), reverse=True)
+
+
+LOG_LINES = 200
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ")
+
+
+def ci_logs(repo, sha, everything):
+    """Print the log of each failed job of the newest run for sha (each job's,
+    if none failed): the last LOG_LINES lines, or all of them."""
+    runs = runs_for(repo, sha)
+    if not runs:
+        die(f"no Actions run for {sha[:12]} in {repo}")
+    run = runs[0]
+    s, jobs = api("GET", f"/repos/{ORG}/{repo}/actions/runs/{run['id']}/jobs")
+    if s != 200:
+        die(f"can't read run {run['id']}'s jobs: {(jobs or {}).get('message', s)}")
+    jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs or []
+    shown = [j for j in jobs if j.get("status") == "failure"] or jobs
+    for j in shown:
+        s, log = api_text("GET", f"/repos/{ORG}/{repo}/actions/jobs/{j['id']}/logs")
+        if s != 200:
+            die(f"can't read job {j.get('name')}'s log ({s})")
+        lines = [STAMP.sub("", l) for l in log.splitlines()]
+        print(f"=== {repo} run {run.get('index_in_repo', run['id'])}, job {j.get('name')}: {j.get('status')} "
+              f"({sha[:12]})")
+        if not everything and len(lines) > LOG_LINES:
+            print(f"(the first {len(lines) - LOG_LINES} lines are left out; --log all shows them)")
+            lines = lines[-LOG_LINES:]
+        print("\n".join(lines))
+
+
+def ci_state(repo, pr):
+    sha = head_of(repo, pr)
+    mine = runs_for(repo, sha)
     if not mine:
         return sha, "none"
     states = {r.get("status") for r in mine}
@@ -250,7 +313,13 @@ def main(argv):
                 die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
             print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
     elif len(argv) >= 3 and argv[0] == "ci":
-        sha, state = ci_state(repo_name(argv[1]), number(argv[2]))
+        repo, target = repo_name(argv[1]), argv[2] if argv[2] == "main" else number(argv[2])
+        if argv[3:4] == ["--log"]:
+            if argv[4:] not in ([], ["all"]):
+                die("usage: forge ci <repo> <pr|main> --log [all]")
+            ci_logs(repo, head_of(repo, target), argv[4:] == ["all"])
+            return
+        sha, state = ci_state(repo, target)
         print(f"{state} ({sha[:12]})")
         sys.exit(0 if state == "success" else 1)
     elif len(argv) == 4 and argv[0] == "review":

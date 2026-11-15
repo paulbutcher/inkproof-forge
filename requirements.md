@@ -167,7 +167,7 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 
 - `forge pr automerge <n>`: merge now if nothing stands in the way, else schedule "merge when checks succeed" (Forgejo acts on a schedule only when a review or CI status arrives after it, so one made once everything passed would never fire);
 - `forge pr merge <n>`: merge now, or say why Forgejo won't;
-- `forge ci <repo> <pr>`: the Actions run's result for the pull request's head commit;
+- `forge ci <repo> <pr|main>`: the Actions run's result for the pull request's head commit, or for `main`'s; with `--log`, the log of each failed job in that run (the last 200 lines, or `--log all`), so an agent can find out why CI failed without the human;
 - `forge pr approve <repo> <n>` (coordinator): approve only if the Actions run for the head commit succeeded;
 - `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI passed, and after the rounds limit label the pull request `needs-human` instead;
 - `forge reviews <repo> <n>`: a pull request's reviews and their findings, which `tea` doesn't show;
