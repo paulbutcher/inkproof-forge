@@ -1148,12 +1148,18 @@ def repo_rules(repo):
         if ci_state(repo, main["id"]) == "failure":
             o.append(Owed(owner, f"main-failed:{repo}:{main['id'][:12]}",
                           f"CI failed on main of {repo} at {main['id'][:12]}: fix it before anything else"))
-    # 17. A milestone with nothing left open.
+    # 17. A milestone with nothing left open on any repository it spans:
+    #     once per milestone, not once per namesake, since until the last
+    #     namesake's work is done there is nothing to close out.
     if COORDINATOR:
         for ms in forge_all(f"/repos/{ORG}/{repo}/milestones?state=open"):
             if ms.get("open_issues") == 0 and ms.get("closed_issues", 0) > 0:
-                o.append(Owed(COORDINATOR, f"milestone-done:{repo}:{ms['id']}",
-                              f"the last open issue in milestone {ms.get('title')} on {repo} was closed"))
+                spans = finished_namesakes(ms["title"])
+                if spans:
+                    newest = max(m["id"] for _, m in spans)
+                    o.append(Owed(COORDINATOR, f"milestone-done:{ms['title']}:{newest}",
+                                  f"the last open issue in milestone {ms['title']} was closed, on every repository it "
+                                  f"spans ({', '.join(sorted({r for r, _ in spans}))})"))
     # 23. No milestone on any repository with an open issue: nothing in the
     #     kit says what comes next, so the coordinator must, once per
     #     milestone finished. A milestone left open with its work done
@@ -1168,6 +1174,27 @@ def repo_rules(repo):
                           "done), then draft the next one, or put to the human what it needs first (a repository, "
                           "an agent, a decision), or record in ROADMAP.md that the project is finished", quiet=True))
     return o
+
+
+def finished_namesakes(title):
+    """The (repository, milestone) pairs named title that had work, if none
+    of its namesakes on any repository has an open issue; None otherwise."""
+    found = []
+    for repo in OWNER_OF:
+        try:
+            ms = forge_all(f"/repos/{ORG}/{repo}/milestones?state=all")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise
+        for m in ms:
+            if m.get("title") != title:
+                continue
+            if m.get("open_issues", 0) > 0:
+                return None
+            if m.get("closed_issues", 0) > 0:
+                found.append((repo, m))
+    return found or None
 
 
 def next_milestone_due():

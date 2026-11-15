@@ -587,7 +587,24 @@ class CoordinatorRules(Case):
                                    {"id": 4, "title": "Next", "open_issues": 0, "closed_issues": 0}]
         d.evaluate_repo(CORE)
         self.assertEqual(self.descriptions("coordinator"),
-                         [f"the last open issue in milestone Float library on {CORE} was closed"])
+                         [f"the last open issue in milestone Float library was closed, on every repository it "
+                          f"spans ({CORE})"])
+
+    def test_17_once_per_milestone_when_every_namesake_is_done_coordination_107(self):
+        def ms(i, open_, closed, state="open"):
+            return {"id": i, "title": "Milestone 5", "state": state, "open_issues": open_, "closed_issues": closed,
+                    "created_at": at(1000)}
+        self.f.milestones[SCALE] = [ms(7, 0, 1)]
+        self.f.milestones[CORE] = [ms(8, 2, 1)]
+        self.f.milestones[COORD] = [ms(6, 0, 0)]  # an empty namesake counts neither way
+        d.evaluate_repo(SCALE)
+        self.assertEqual(self.queued("coordinator"), [], "Core's namesake still has open issues")
+        self.f.milestones[CORE] = [ms(8, 0, 3)]
+        for repo in (SCALE, CORE, COORD):
+            d.evaluate_repo(repo)
+        self.assertEqual(d.q("SELECT key FROM triggers WHERE key LIKE 'milestone-done:%'")[0]["key"],
+                         "milestone-done:Milestone 5:8")
+        self.assertEqual(self.queued("coordinator").count("milestone-done"), 1, "once, from whichever repository")
 
     def test_23_no_milestone_with_open_work_review_follow_ups_5(self):
         def ms(i, title, state, created, open_=0, closed_issues=2, closed=None):

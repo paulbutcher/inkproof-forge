@@ -22,6 +22,8 @@ Every catch by the stall check is a gap in the kit's rules: work that sat waitin
 
 A trigger is the kit's, so changing it is the human's: name the trigger, what it should do instead, and the runs that show it. Before recommending, check that the ledger's most recent runs still show the pattern, since the kit may have changed since.
 
+Before recommending a change to a role or the protocol, read its current text: every role is at `/usr/local/share/inkproof/roles/`, and the protocol is in your instructions. Don't recommend what it already says. If it says so and your evidence predates the change, say that instead, and recommend only if newer runs show it isn't working.
+
 Before recommending anything, read the earlier recommendations labelled `review:process`, open and closed. A closed one labelled `declined` was rejected: don't raise it again unless you have new evidence, and if you do, say what is new.
 
 Report once:
