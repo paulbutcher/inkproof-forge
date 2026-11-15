@@ -39,6 +39,18 @@ There are also four reviewers. They own no repository, can't push, and read ever
 
   Each files its recommendations as issues for you to accept or decline. Reviewers propose changes but never make them.
 
+## Why many small repositories
+
+Inkproof is a set of small libraries, each in its own repository with its own agent, rather than one monorepo. This is deliberate, and it rests on a hypothesis.
+
+An agent, or a team of agents, that can change all the code is tempted to do whatever works to fix the issue in front of it: reach into another component, add a special case, couple things that should be separate. Each fix is reasonable on its own, and together they rot the architecture.
+
+So here, each agent writes only its own repository. It can read all the others, so that it reuses what exists rather than rebuilding it. But it can change another library only by filing a request with that library's owner, under strict rules about when a request is warranted. Libraries depend on each other only through released versions, so a library's published API is the only thing its neighbours can rely on. These rules are enforced by Forgejo's permissions, not just asked of the agents.
+
+Blocked from changing a neighbour, an agent might instead work around it inside its own library, which would rot that library the same way. The protocol forbids that: the agent files a request and waits. The architecture review at the end of each milestone also looks for workarounds, along with coupling between libraries, poor cohesion within one, and code duplicated across them. The hypothesis is that, together, these force a design with less coupling between components and better cohesion within each.
+
+The cost is friction: a change that crosses a boundary takes a request, a release and an upgrade rather than one commit. That friction is the point.
+
 ## Layout
 
 ```
