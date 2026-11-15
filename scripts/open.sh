@@ -16,7 +16,7 @@ command -v code >/dev/null || { echo "Put VS Code's 'code' command on your PATH 
 
 # The attach configuration Dev Containers uses for this container: the agent's
 # user, its workspace and the extensions. Turning off the host's git config
-# and credentials is a VS Code user setting (see README).
+# and credentials is a VS Code user setting (see RUNBOOK.md).
 case "$(uname)" in
   Darwin) cfg_dir="$HOME/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
   *) cfg_dir="$HOME/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;

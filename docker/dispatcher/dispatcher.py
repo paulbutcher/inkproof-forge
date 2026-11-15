@@ -675,7 +675,7 @@ def handle(event, payload):
 # (retry). Webhooks only say which items to look at again; the sweep looks at
 # all of them every RECONCILE seconds; and a claim looks again at the items
 # behind its triggers, dropping what is no longer owed. The numbers are the
-# rules' in requirements.md (Triggers).
+# rules' in DESIGN.md (Triggers).
 
 Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(None, False))
 

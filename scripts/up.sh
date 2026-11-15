@@ -52,7 +52,7 @@ fi
 # agent in agents.conf.
 claude_token="$STATE_DIR/secrets/claude/oauth-token"
 if [ ! -s "$claude_token" ]; then
-  echo "Not starting agents: put a token from \`claude setup-token\` in ${claude_token#./} first (see README)."
+  echo "Not starting agents: put a token from \`claude setup-token\` in ${claude_token#./} first (see RUNBOOK.md)."
 else
   ( umask 077; printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$(tr -d '[:space:]' < "$claude_token")" \
       > "$STATE_DIR/secrets/claude/agent.env" )
