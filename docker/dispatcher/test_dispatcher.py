@@ -122,7 +122,7 @@ class Forge:
         if rest == "branches/main":
             return {"commit": self.mains.get(repo, {"id": "m" * 40, "timestamp": at(86400)})}
         if rest == "milestones":
-            return self.milestones.get(repo, [])
+            return [m for m in self.milestones.get(repo, []) if args.get("state", "open") in ("all", m.get("state", "open"))]
         if rest == "labels":
             return [{"id": 1, "name": "blocked"}, {"id": 2, "name": "needs-human"}]
         raise AssertionError(f"unexpected call {method} {path}")
@@ -504,6 +504,25 @@ class CoordinatorRules(Case):
         self.assertEqual(self.descriptions("coordinator"),
                          [f"the last open issue in milestone Float library on {CORE} was closed"])
 
+    def test_23_every_milestone_closed_float_library(self):
+        def ms(i, title, state, closed=None):
+            return {"id": i, "title": title, "state": state, "open_issues": 0, "closed_issues": 2,
+                    "closed_at": at(closed) if closed is not None else None}
+        self.f.milestones[CORE] = [ms(1, "Milestone 2", "closed", 90000), ms(3, "Float library", "open")]
+        self.f.milestones[COORD] = [ms(2, "Float library", "closed", 100)]
+        d.evaluate_repo(COORD)
+        self.assertEqual(self.queued("coordinator"), [])
+        self.f.milestones[CORE][1] = ms(3, "Float library", "closed", 50)
+        run = self.running("coordinator")
+        d.evaluate_repo(COORD)
+        self.assertEqual(self.queued("coordinator"), [], "not while it runs: it may be drafting the next one")
+        d.end_run("coordinator", run, {"outcome": "completed"})
+        d.evaluate_repo(COORD)
+        self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL")[0]["key"], f"next-milestone:{CORE}:3")
+        self.handled()
+        d.evaluate_repo(COORD)
+        self.assertEqual(self.queued("coordinator"), [], "once per milestone closed")
+
 
 class ReviewerRules(Case):
     def conf(self):
@@ -550,6 +569,17 @@ class ReviewerRules(Case):
         d.evaluate(COORD, 31)
         self.assertEqual(self.queued("architecture"), ["milestone"])
         self.assertEqual(self.queued("lasm"), ["milestone", "lasm-blocking"])
+
+    def test_21_the_coordinator_accepted_and_closed_it_at_once_coordination_73(self):
+        self.f.issue(COORD, 73, "coordinator", ["milestone-review"], state="closed", closed=60, events=[
+            label("milestone-review", True, 70, "coordinator"), comment("coordinator", 60, "(no reply needed)\nAccepted."),
+            comment("lasm", 30, "(no reply needed)\nNo findings.")])
+        d.evaluate(COORD, 73)
+        self.assertEqual(self.queued(), [("architecture", "milestone")], "lasm has reported")
+        rows = d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")
+        self.assertEqual(d.no_longer_owed(rows), [], "a claim keeps it")
+        self.f.items[(COORD, 73)]["events"].append(comment("architecture", 10, "(no reply needed)\nReport."))
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "until it has reported")
 
 
 class Stalls(Case):

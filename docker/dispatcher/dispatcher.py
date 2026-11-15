@@ -1031,13 +1031,16 @@ def reviewer_rules(it):
             if replies:
                 o.append(Owed(REVIEWER, f"conf-reply:{at}:{replies[-1]['id']}",
                               f"the author replied on pull request {at}, which you asked to change"))
-    if it.repo == COORDINATION and it.open and not it.is_pr:
-        # 21. A milestone review requested.
+    if it.repo == COORDINATION and not it.is_pr:
+        # 21. A milestone review requested that a reviewer hasn't reported on
+        #     since, open or closed: the coordinator accepts a milestone and
+        #     closes its issue without waiting for the reviews.
         if "milestone-review" in it.labels:
-            o += [Owed(r, f"milestone:{at}:", f"milestone review requested on {at}")
-                  for r in MILESTONE_REVIEWERS if r in AGENTS]
+            labelled = it.label_event("milestone-review") or it.issue["created_at"]
+            o += [Owed(r, f"milestone:{at}:{labelled}", f"milestone review requested on {at}")
+                  for r in MILESTONE_REVIEWERS if r in AGENTS and it.by(r, ("comment",)) < when(labelled)]
         # 22. A Lasm issue that blocks an agent.
-        if {"upstream", "upstream:lasm", "blocking"} <= it.labels and "lasm" in AGENTS:
+        if it.open and {"upstream", "upstream:lasm", "blocking"} <= it.labels and "lasm" in AGENTS:
             o.append(Owed("lasm", f"lasm-blocking:{at}:", f"blocking Lasm issue {at}"))
     return o
 
@@ -1069,7 +1072,37 @@ def repo_rules(repo):
             if ms.get("open_issues") == 0 and ms.get("closed_issues", 0) > 0:
                 o.append(Owed(COORDINATOR, f"milestone-done:{repo}:{ms['id']}",
                               f"the last open issue in milestone {ms.get('title')} on {repo} was closed"))
+    # 23. Every milestone on every repository closed: nothing in the kit says
+    #     what comes next, so the coordinator must, once per milestone closed.
+    #     Not while it runs, since it may be drafting the next one.
+    if COORDINATOR and repo == COORDINATION:
+        last = next_milestone_due()
+        if last:
+            o.append(Owed(COORDINATOR, f"next-milestone:{last[0]}:{last[1]['id']}",
+                          f"every milestone is closed, the last {last[1].get('title')} on {last[0]}: draft the next "
+                          "one, or put to the human what it needs first (a repository, an agent, a decision), "
+                          "or record in ROADMAP.md that the project is finished", quiet=True))
     return o
+
+
+def next_milestone_due():
+    """The (repository, milestone) closed last, if no milestone is open
+    anywhere; None otherwise, or if there has never been one."""
+    closed = []
+    for repo in OWNER_OF:
+        try:
+            ms = forge_all(f"/repos/{ORG}/{repo}/milestones?state=all")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise
+        if any(m.get("state") == "open" for m in ms):
+            return None
+        closed += [(when(m["closed_at"]), repo, m) for m in ms if m.get("closed_at")]
+    if not closed:
+        return None
+    _, repo, m = max(closed, key=lambda c: c[0])
+    return repo, m
 
 
 # --- Evaluation -------------------------------------------------------------------
