@@ -18,6 +18,8 @@ Work that isn't needed includes runs the kit started for nothing. Group the ledg
 - runs woken by something that asked nothing of the agent, such as an approval, or about a pull request already merged or closed by the time it ran;
 - an agent reaching its daily cap (the ledger's `cap` notices): what its runs that day were for, and how many it needed.
 
+Every catch by the stall check is a gap in the kit's rules: work that sat waiting for nothing the kit can see, until the stall check woke someone. The ledger's `stall` notices list them, and the runs they started have triggers beginning "the kit is quiet and nothing is moving". For each one, find out why no rule woke anyone: an agent that skipped a step, a rule that doesn't cover the case, or the kit itself, as when Forgejo dropped a request's labels. Then recommend the change that would have moved it on without the stall check: a protocol or role line, or a new rule. Say which catches you looked at, even when you recommend nothing. The aim is that the stall check never fires.
+
 A trigger is the kit's, so changing it is the human's: name the trigger, what it should do instead, and the runs that show it. Before recommending, check that the ledger's most recent runs still show the pattern, since the kit may have changed since.
 
 Before recommending anything, read the earlier recommendations labelled `review:process`, open and closed. A closed one labelled `declined` was rejected: don't raise it again unless you have new evidence, and if you do, say what is new.

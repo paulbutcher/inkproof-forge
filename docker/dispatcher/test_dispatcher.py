@@ -707,12 +707,18 @@ class Stalls(Case):
         self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
         self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
         self.assertEqual(self.spell(), (0, []))
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices")], ["stalled"])
-        # Once it waits visibly, a later stall starts from nothing.
+        # The human hears of the gap once, when it is first caught, then of the stall.
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stalled"])
+        caught = [b["body"] for m, p, b in self.f.writes if p == f"/repos/org/{CORE}/issues/1/comments"]
+        self.assertEqual(len(caught), 1)
+        self.assertIn("the stall check woke core for this issue", caught[0])
+        # Once it waits visibly, a later stall starts from nothing, and is a gap of its own.
         self.f.items[(CORE, 1)]["labels"].append({"name": "needs-human"})
         self.assertEqual(self.spell(), (0, []))
         self.f.items[(CORE, 1)]["labels"].pop()
         self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")],
+                         ["stall", "stalled", "stall"])
 
     def test_a_capped_agent_isnt_woken_or_counted(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])

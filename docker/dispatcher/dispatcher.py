@@ -1433,6 +1433,13 @@ def check_stalls():
             woke = True
         if woke:
             kv_set(key, json.dumps([rounds + 1, first or spell]))
+            # No rule woke anyone for it, so the rules have a gap: the human
+            # hears of each one, once, and the process review looks into it.
+            names = ", ".join(sorted({a for a, _ in owners if not capped(a)}))
+            notify(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
+                   f"the stall check woke {names} for this {it.kind}: it waited for nothing the kit can see "
+                   f"({'; '.join(why for _, why in owners)}), and no rule had woken anyone for it. That is a gap "
+                   "in the kit's rules; the process review looks into each one at the milestone's end.")
     return queued
 
 
