@@ -181,6 +181,20 @@ class OwnerRules(Case):
             d.evaluate(CORE, n)
         self.assertEqual(self.descriptions("core"), [f"untriaged request {CORE}#1"])
 
+    def test_1_an_issue_filed_without_labels_viewport_9(self):
+        self.f.issue(CORE, 9, "scale")  # its labels dropped, as Forgejo does for anyone without write access
+        self.f.issue(CORE, 10, "scale", events=[comment("core", 100, "On it.")])  # the owner has looked
+        self.f.issue(CORE, 11, "scale", ["question"])  # labelled, so not this rule
+        self.f.issue(CORE, 12, "stranger")
+        for n in (9, 10, 11, 12):
+            d.evaluate(CORE, n)
+        self.assertEqual(self.descriptions("core"),
+                         [f"untriaged issue {CORE}#9, filed without labels: if it's a request, add `request` and "
+                          "`new` and handle it as one; otherwise answer it or close it"])
+        rows = d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")
+        self.f.items[(CORE, 9)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once triaged")
+
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
         self.f.issue(CORE, 1, "core", events=[comment("scale", 300)])
         self.f.issue(CORE, 2, "core", events=[comment("scale", 300), comment("core", 200, "Answered.")])

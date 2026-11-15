@@ -856,6 +856,14 @@ def owner_rules(it, blocked, unblocked_at):
     if (not it.is_pr and {"request", "new"} <= it.labels and it.author in TRUSTED and it.author != owner):
         since = it.label_event("new") or it.issue["created_at"]
         o.append(Owed(owner, f"request:{at}:{since}", f"untriaged request {at}"))
+    #    Or an issue from someone else with no labels at all that the owner
+    #    hasn't touched: Forgejo drops the labels of anyone without write
+    #    access to issues here, and a request can be filed without them.
+    elif (not it.is_pr and not it.labels and it.author in TRUSTED and it.author != owner
+          and not it.by(owner)):
+        o.append(Owed(owner, f"request:{at}:{it.issue['created_at']}",
+                      f"untriaged issue {at}, filed without labels: if it's a request, add `request` and `new` "
+                      "and handle it as one; otherwise answer it or close it"))
     # 2. A comment or review from someone else that wants a reply, newer than
     #    anything the owner has done here. An approval asks nothing, whatever
     #    it says; a request for changes always asks.

@@ -64,6 +64,8 @@ If a library you depend on is missing something, or is wrong, do **not** reimple
 3. Mark your own task as blocked on that issue: add a line `Blocked-by: {{ORG}}/<repo>#<n>` to its body or a comment, one line for each issue it waits on. The dispatcher keeps the `blocked` label in step with these lines, so don't set it yourself: it's on while any issue they name is open and unreleased. A run starts for you once every issue they name is closed or released (a `Released in` comment on it), and when the human comments on an upstream issue among them. Only a `Blocked-by:` line wakes you: an @-mention does not, so name the issue that must close. If you stop waiting on one before it closes, edit its line out.
 4. Move to other work.
 
+File requests only on the libraries you depend on and on `inkproof-coordination`. Anything for another library, such as asking a consumer to adopt something you now provide, goes through the coordinator: a request on `inkproof-coordination` saying what and why. Forgejo drops the labels you set on a repository outside those, so a request filed there reaches no one as one.
+
 ## Handling requests on your repository
 
 Requests are open issues labelled `request` and `new`. For each one, remove `new` and then:
