@@ -6,13 +6,16 @@
 # The seed is templates/library/ with REPO, NAME and the source library's
 # copyright header filled in, and from the source library's main (SEED_FROM,
 # default inkproof-core), the files every library shares: CLAUDE.md, LICENSE,
-# .gitignore and lean-toolchain, and the Lake manifests' format.
+# .gitignore and lean-toolchain, and the Lake manifests' format. It also has
+# the CI workflow, check-pins.sh and the request template from templates/repo/,
+# exactly as scripts/setup-repo.sh would add them.
 #
 # Safe to re-run: a repository already seeded is left alone, and an empty one
 # (from a run that stopped part way) is seeded. One with other content is
 # refused, so the seed never lands on real work.
 
 SEED_TEMPLATES=/etc/kit/templates/library
+REPO_TEMPLATES=/etc/kit/templates/repo
 
 cmd_new_library() {
   local repo="${1:-}" name="${2:-}" src lib header ops
@@ -55,6 +58,12 @@ cmd_new_library() {
     text="${text//\{\{LIB\}\}/$lib}"
     add_op "$path" "$text"
   done < <(find "$SEED_TEMPLATES" -type f | sort)
+  # CI from the first commit, as scripts/setup-repo.sh would add it: a branch
+  # started before the setup pull request merges still has a workflow to run.
+  # CODEOWNERS depends on the autonomy level, so setup-repo.sh adds it.
+  for f in .forgejo/workflows/checks.yml scripts/check-pins.sh .forgejo/issue_template/request.md; do
+    add_op "$f" "$(cat "$REPO_TEMPLATES/$f")"
+  done
   for f in CLAUDE.md LICENSE .gitignore lean-toolchain; do
     text="$(src_file "$src" "$f")"
     add_op "$f" "$text"

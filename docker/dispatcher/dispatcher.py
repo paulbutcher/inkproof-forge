@@ -86,6 +86,10 @@ SETTLE = int(os.environ.get("CONFORMANCE_SETTLE_SECONDS", "600"))
 # its owner is told to merge it: Forgejo acts on a schedule only when a review
 # or CI status arrives after it, so one made once everything passed never fires.
 STUCK = int(os.environ.get("MERGE_STUCK_SECONDS", "600"))
+# How long a pull request in a repository with CI may go with no run at all
+# for its head before its owner is woken: Forgejo creates a run (and a pending
+# status) as soon as a push arrives, so none means its branch has no workflow.
+NO_CI = int(os.environ.get("CI_MISSING_SECONDS", "600"))
 # A run that fails, times out or exits early is tried again this many times,
 # after RETRY_DELAY_SECONDS times the attempt; then it is the human's.
 RETRIES = int(os.environ.get("MAX_RUN_RETRIES", "2"))
@@ -676,7 +680,7 @@ def handle(event, payload):
 Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(None, False))
 
 # Kinds of trigger a rule queues, which a claim checks are still owed.
-RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "merged",
+RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci", "merged",
               "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
               "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking"}
@@ -879,6 +883,15 @@ def owner_rules(it, blocked, unblocked_at):
         # 3. CI failed on its head.
         if it.ci() == "failure":
             o.append(Owed(owner, f"ci-failed:{at}:{head}", f"CI failed on pull request {at}"))
+        # 25. No CI run at all for its head NO_CI after it was pushed: the
+        #     branch has no workflow, such as one started from a library's
+        #     seed before CI reached main, and nothing reviews it until CI passes.
+        if has_ci(it.repo) and it.ci() == "none":
+            pushes = [e["created_at"] for e in it.events if e.get("type") == "pull_push"]
+            pushed = when(pushes[-1] if pushes else it.pr["created_at"])
+            o.append(Owed(owner, f"no-ci:{at}:{head}",
+                          f"CI has never run on your pull request {at} at {head}, so nothing reviews it: its branch "
+                          "probably lacks `.forgejo/workflows/`. Merge `origin/main` into it and push", pushed + NO_CI))
         # 4. It conflicts with main. One merely behind merges as it is.
         if it.pr.get("mergeable") is False:
             o.append(Owed(owner, f"conflicts:{at}:{head}:{main_of(it.repo)['id'][:12]}",
@@ -1331,6 +1344,11 @@ def stall_owners(it, blocked):
         verdicts = it.verdicts()
         if any(r["state"] == "REQUEST_CHANGES" and r.get("commit_id") == it.head for r in verdicts.values()):
             return [(author, "changes were requested on its head")] if author else []
+        # Reviewers wait for CI to pass on the head, so until it does only the
+        # author can move it.
+        if has_ci(it.repo) and it.ci() in ("none", "failure"):
+            why = "CI has never run on its head" if it.ci() == "none" else "CI failed on its head"
+            return [(author, why)] if author else []
         pending = {who for who in it.requested() if not (who in verdicts and verdicts[who].get("commit_id") == it.head)}
         if HUMAN in pending or (author is None and it.author == HUMAN):
             return []

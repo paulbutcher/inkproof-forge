@@ -66,8 +66,12 @@ class Forge:
         return self.items[(repo, n)]
 
     def pull(self, repo, n, author, labels=(), sha="a" * 40, events=(), reviews=(), mergeable=True, title="Work",
-             body="", requested=(), merged=None, state="open", created=7200):
+             body="", requested=(), merged=None, state="open", created=7200, ci="pending"):
         i = self.issue(repo, n, author, labels, state, body, created, events)
+        # A head CI has started on, as Forgejo marks it at once, unless a test
+        # says otherwise: ci=None for a branch with no workflow.
+        if ci:
+            self.statuses.setdefault(sha, [ci])
         i["reviews"] = list(reviews)
         i["pr"] = {"number": n, "state": state, "user": {"login": author}, "head": {"sha": sha},
                    "mergeable": mergeable, "title": title, "body": body, "created_at": at(created),
@@ -259,6 +263,25 @@ class OwnerRules(Case):
         self.assertEqual(self.descriptions("core"),
                          [f"your pull request {CORE}#8 has no merge scheduled, so it won't merge: schedule it "
                           "(`forge pr automerge`), or close it if it's no longer wanted"])
+
+    def test_25_no_ci_run_for_its_head_export_4(self):
+        self.f.pull(CORE, 4, "core", ci=None, events=[event("pull_push", "core", 3000),
+                                                      event("pull_scheduled_merge", "core", 3000)])
+        self.f.pull(CORE, 5, "core", sha="b" * 40, ci=None, events=[event("pull_push", "core", 60),
+                                                                    event("pull_scheduled_merge", "core", 60)])
+        d.evaluate(CORE, 4)
+        d.evaluate(CORE, 5)
+        due = d.q("SELECT key, not_before FROM triggers WHERE key LIKE 'no-ci:%' ORDER BY key")
+        self.assertEqual([r["key"] for r in due], [f"no-ci:{CORE}#4:{'a' * 12}", f"no-ci:{CORE}#5:{'b' * 12}"])
+        self.assertLess(due[0]["not_before"], d.now(), "pushed long ago")
+        self.assertGreater(due[1]["not_before"], d.now() + 400, "pushed a minute ago: CI may yet start")
+        self.assertEqual(self.descriptions("core")[0],
+                         f"CI has never run on your pull request {CORE}#4 at {'a' * 12}, so nothing reviews it: its "
+                         "branch probably lacks `.forgejo/workflows/`. Merge `origin/main` into it and push")
+        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'no-ci:%' ORDER BY key")
+        self.f.statuses["b" * 40] = ["pending"]
+        d._cache.clear()
+        self.assertEqual(d.no_longer_owed(rows), [rows[1]["id"]], "a claim drops it once CI has started")
 
     def test_5_a_scheduled_merge_that_never_fired_scale_43(self):
         """Approved by everyone requested and CI passed before the merge was
@@ -655,11 +678,15 @@ class Stalls(Case):
         self.f.issue(CORE, 13, "scale", ["request", "counter-proposal"])  # the requester's answer
         self.f.issue(CORE, 14, "scale", ["request"], events=[comment("gatekeeper", 100, "Released in v1.0.0")])
         self.f.issue(COORD, 9, "core", ["upstream", "upstream:lasm"])  # the world outside
+        # Its reviewers wait for CI, so only its author can move it (export#4).
+        self.f.pull(CORE, 15, "core", sha="f" * 40, ci=None, events=requested("conformance"))
+        self.f.pull(CORE, 16, "core", sha="e" * 40, ci="failure", events=requested("conformance"))
         n, found = self.spell()
         self.assertEqual(found, sorted([("core", f"{CORE}#1"), ("coordinator", f"{CORE}#5"),
                                         ("conformance", f"{CORE}#7"), ("core", f"{CORE}#10"),
-                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13")]))
-        self.assertEqual(n, 6)
+                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13"),
+                                        ("core", f"{CORE}#15"), ("core", f"{CORE}#16")]))
+        self.assertEqual(n, 8)
 
     def test_twice_without_moving_then_the_humans_and_a_fix_starts_again(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])
