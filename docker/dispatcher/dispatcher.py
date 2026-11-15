@@ -883,12 +883,15 @@ def owner_rules(it, blocked, unblocked_at):
         if it.pr.get("mergeable") is False:
             o.append(Owed(owner, f"conflicts:{at}:{head}:{main_of(it.repo)['id'][:12]}",
                           f"pull request {at} conflicts with main"))
-        # 5. No merge scheduled, so it would never merge; or one scheduled
-        #    that hasn't gone through STUCK after nothing stood in its way.
+        # 5. No merge scheduled, so it would never merge, once the owner can
+        #    no longer schedule it (looked at again when its run ends); or one
+        #    scheduled that hasn't gone through STUCK after nothing stood in
+        #    its way.
         if not wip(it.pr.get("title")) and not it.merge_scheduled():
-            o.append(Owed(owner, f"unscheduled:{at}:{head}",
-                          f"your pull request {at} has no merge scheduled, so it won't merge: schedule it "
-                          "(`forge pr automerge`), or close it if it's no longer wanted"))
+            if not may_push(owner):
+                o.append(Owed(owner, f"unscheduled:{at}:{head}",
+                              f"your pull request {at} has no merge scheduled, so it won't merge: schedule it "
+                              "(`forge pr automerge`), or close it if it's no longer wanted"))
         elif (not wip(it.pr.get("title")) and it.merge_scheduled()
               and (ready := it.ready_since()) and now() >= ready + STUCK):
             o.append(Owed(owner, f"stuck-merge:{at}:{head}:{iso(ready)}",
@@ -1178,6 +1181,20 @@ def evaluate_repo(repo, items=False, seed=False):
                 evaluate(repo, i["number"], dependents=False, seed=seed)
             except Exception as e:
                 log(f"evaluating {repo}#{i['number']} failed: {e!r}")
+
+
+def evaluate_own_prs(agent):
+    """An agent's run has ended: what it left its open pull requests owing
+    (5) was held while it could still act on them."""
+    repo = AGENTS.get(agent, {}).get("own")
+    if repo not in OWNER_OF or may_push(agent):
+        return
+    _cache.pop(("prs", repo, "open"), None)
+    for p, _ in owner_prs(repo, agent, "open"):
+        try:
+            evaluate(repo, p["number"], dependents=False)
+        except Exception as e:
+            log(f"evaluating {repo}#{p['number']} failed: {e!r}")
 
 
 def evaluate_labelled(repo, name):
@@ -1627,6 +1644,7 @@ def end_run(agent, run_id, r):
         # Done; or stopped by the human, who may continue it; or given up on.
         # A retried run may still push, so its reviews wait for that.
         release_reviews(agent)
+        later(evaluate_own_prs, agent)
     if not r.get("in_extension") and r.get("session_id"):
         sid = r.get("session_id")
         notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",

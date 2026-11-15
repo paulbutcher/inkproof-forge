@@ -245,6 +245,21 @@ class OwnerRules(Case):
                          [f"your pull request {CORE}#{n} has no merge scheduled, so it won't merge: schedule it "
                           "(`forge pr automerge`), or close it if it's no longer wanted" for n in (7, 9)])
 
+    def test_5_not_while_its_owner_runs_viewport_5(self):
+        later = d.later
+        self.addCleanup(setattr, d, "later", later)
+        d.later = lambda fn, *args, delay=30: fn(*args)
+        self.f.pull(CORE, 7, "core")
+        self.f.pull(CORE, 8, "core")
+        run = self.running("core")
+        d.evaluate(CORE, 7)
+        self.assertEqual(self.queued("core"), [], "it may yet schedule it")
+        self.f.items[(CORE, 7)]["events"].append(event("pull_scheduled_merge", "core", 5))
+        d.end_run("core", run, {"outcome": "completed"})
+        self.assertEqual(self.descriptions("core"),
+                         [f"your pull request {CORE}#8 has no merge scheduled, so it won't merge: schedule it "
+                          "(`forge pr automerge`), or close it if it's no longer wanted"])
+
     def test_5_a_scheduled_merge_that_never_fired_scale_43(self):
         """Approved by everyone requested and CI passed before the merge was
         scheduled, so Forgejo never acted on the schedule."""

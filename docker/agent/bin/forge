@@ -40,6 +40,7 @@ follow a rule tea can't enforce. Uses the agent's own token.
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -76,6 +77,18 @@ def api(method, path, body=None):
             return e.code, json.loads(raw)
         except Exception:
             return e.code, {"message": raw.decode(errors="replace")[:500]}
+
+
+def merge_call(n, body):
+    """Ask Forgejo to merge #n. For a few seconds after a pull request is
+    opened or pushed to, Forgejo is still checking that it merges cleanly
+    and answers every merge, scheduled or not, with 405 "try again later":
+    wait that out, for about a minute at most."""
+    for wait in (2, 4, 8, 15, 30, 0):
+        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge", body)
+        if not (s == 405 and "try again later" in ((p or {}).get("message") or "").lower()) or not wait:
+            return s, p
+        time.sleep(wait)
 
 
 def number(s):
@@ -226,13 +239,13 @@ def main(argv):
         # Forgejo acts on a scheduled merge only when a review or CI status
         # arrives after it, so one scheduled once everything passed would
         # never fire: merge directly when it can.
-        s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge", merge)
+        s, p = merge_call(n, merge)
         if s // 100 == 2:
             print(f"#{n} merged.")
         elif argv[1] == "merge":
             die(f"#{n} didn't merge ({s}): {(p or {}).get('message', '')}")
         else:
-            s, p = api("POST", f"/repos/{ORG}/{OWN}/pulls/{n}/merge", {**merge, "merge_when_checks_succeed": True})
+            s, p = merge_call(n, {**merge, "merge_when_checks_succeed": True})
             if s // 100 != 2:
                 die(f"couldn't schedule the merge of #{n} ({s}): {(p or {}).get('message', '')}")
             print(f"#{n} will merge once its checks succeed and it has the approvals it needs.")
