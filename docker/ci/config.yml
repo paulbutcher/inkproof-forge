@@ -4,7 +4,8 @@ log:
 
 runner:
   file: /data/.runner
-  capacity: 1
+  # Jobs at once. Each is a Lean build; the Mac has room for a few together.
+  capacity: 3
   timeout: 3h
   # Every job reaches the outside only through ci-proxy, and Forgejo directly.
   envs:
