@@ -228,7 +228,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
 - **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 
-The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is open and unreleased. Agents write only the `Blocked-by:` lines.
+The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is open and unreleased. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
 
 ### Every agent, on a request it filed
 
@@ -375,7 +375,10 @@ For an existing issue, the dispatcher comments as `dispatcher`, mentioning the h
 
 ## Dependencies we don't control
 
-- **The upstream tracker.** When an agent finds a bug or limitation in a dependency outside the `inkproof-` repositories (Lasm, Lean, Mathlib or any other), it doesn't work around it. It files an issue on `inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a reproduction. If it can't continue, it marks its own task `blocked` with a `Blocked-by:` line naming that issue. A blocker also gets `blocking`, which notifies the human.
+- **The upstream tracker.** When an agent finds a bug or limitation in a dependency outside the `inkproof-` repositories (Lasm, Lean, Mathlib or any other), it doesn't work around it. It files an issue on `inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a reproduction. If it can't continue, it marks its own task `blocked` with a `Blocked-by:` line naming that issue.
+- **Lasm's missing bindings don't block.** We don't control Lasm, so a browser API it has no typed binding for is bound in Lean by the library that needs it (Lasm.JS's `@[js]` attribute, or `Value.get` and `callMethod`). A shim is used only for what Lean can't express, such as a class. The upstream issue stays as a request for Lasm.
+- **The tracker is our record.** The human takes upstream issues to their projects when they choose: for Lasm, once something running on it shows why they matter. Until then they stay open, and nothing in the kit reports them.
+- **Blocking.** An open upstream issue that an open item's `Blocked-by:` line names waits on the human. The dispatcher keeps its `blocking` label in step with those lines, which assigns it to the human and notifies them; agents never set the label.
 - **Unblocking.** Nothing polls GitHub, so an upstream fix can't wake blocked agents by itself. The human closes the upstream issue, or comments on it, once a fix is available, and that is the trigger.
 - **Fetching.** Third-party Lean packages are fetched by Lake from GitHub through the proxies, as git reads. Lasm is an npm package (`@lasm/cli`), which repositories pin in `test/package.json` and fetch from npm, also through the proxies; its browser bindings (`Lasm.Web`, `Lasm.UI`, `Lasm.JS`) come with it, not from Lake. None of these is in Forgejo.
 - **Browsers.** The agent and CI images include headless Chromium for browser tests, installed by Playwright when the images are built, at one pinned version (`PLAYWRIGHT_VERSION`, 1.64.1). Neither agents nor CI can download browsers, since no proxy allows Playwright's download host, so a repository pins `playwright` at exactly that version, and an upgrade changes the images and the pins together. Its WebGL is software, which is enough for functional tests, not for golden images across real GPUs (VAL-7).

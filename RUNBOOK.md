@@ -121,7 +121,7 @@ While you're using Claude in an agent's container, through the extension or a te
 
 Everything that waits on you is in Forgejo's dashboards: issues assigned to you, and pull requests requesting your review.
 
-The dispatcher assigns you to anything labelled `needs-human`, and to blocking upstream issues. Each such item states its decision under the headings Question, Options, Recommendation, If you say go ahead, and Blocked on this.
+The dispatcher assigns you to anything labelled `needs-human`, and to blocking upstream issues: those an agent's `Blocked-by:` line names, which it labels `blocking` itself. Upstream issues that nothing waits on are the project's record of what to ask other projects for, and wait for you only when you choose to take them upstream. Each such item states its decision under the headings Question, Options, Recommendation, If you say go ahead, and Blocked on this.
 
 The kit files its own decisions the same way:
 - a reached cap, saying what's waiting and how to raise the cap;

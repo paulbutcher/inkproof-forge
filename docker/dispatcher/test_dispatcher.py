@@ -134,7 +134,7 @@ class Forge:
         if rest == "milestones":
             return [m for m in self.milestones.get(repo, []) if args.get("state", "open") in ("all", m.get("state", "open"))]
         if rest == "labels":
-            return [{"id": 1, "name": "blocked"}, {"id": 2, "name": "needs-human"}]
+            return [{"id": 1, "name": "blocked"}, {"id": 2, "name": "needs-human"}, {"id": 3, "name": "blocking"}]
         raise AssertionError(f"unexpected call {method} {path}")
 
 
@@ -439,6 +439,32 @@ class OwnerRules(Case):
         d.evaluate(CORE, 3)
         self.assertEqual(self.descriptions("core"),
                          [f"human commented on upstream issue {COORD}#9; {CORE}#3 is blocked on it"])
+
+    def test_8_an_upstream_issue_an_agent_waits_on_is_blocking_web_2(self):
+        # web filed coordination#116 without `blocking` and marked its task
+        # blocked on it: nothing told the human, and the kit went quiet.
+        self.f.issue(COORD, 116, "core", ["upstream", "upstream:lasm"])
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-coordination#116")
+        d.evaluate(CORE, 2)
+        self.assertIn(("POST", f"/repos/org/{COORD}/issues/116/labels", {"labels": [3]}), self.f.writes)
+        # Once nothing open waits on it, it no longer waits on the human.
+        self.f.items[(COORD, 116)]["labels"].append({"name": "blocking"})
+        self.f.items[(CORE, 2)]["state"] = "closed"
+        self.f.writes.clear()
+        d.evaluate(CORE, 2)
+        self.assertEqual([w for w in self.f.writes if "/issues/116/" in w[1]],
+                         [("DELETE", f"/repos/org/{COORD}/issues/116/labels/3", None)])
+
+    def test_8_blocking_follows_the_lines_not_who_set_it(self):
+        # Kept by the sweep too: an upstream issue labelled `blocking` that
+        # nothing names loses it; an issue that isn't upstream never gets it.
+        self.f.issue(COORD, 9, "core", ["upstream", "blocking"])
+        self.f.issue(SCALE, 4, "scale", ["request"])
+        self.f.issue(CORE, 3, "core", ["request", "accepted"], body="Blocked-by: org/inkproof-scale#4")
+        d.sweep()
+        writes = [w for w in self.f.writes if "/labels" in w[1] and not w[1].endswith("/labels/1")
+                  and not (w[0] == "POST" and w[2] == {"labels": [1]})]
+        self.assertEqual(writes, [("DELETE", f"/repos/org/{COORD}/issues/9/labels/3", None)])
 
     def test_9_ci_failing_on_main(self):
         self.f.statuses["m" * 40] = ["failure"]

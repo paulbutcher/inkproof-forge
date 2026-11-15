@@ -1247,6 +1247,36 @@ def set_blocked(it, blocked):
     log(f"{'labelled' if blocked else 'unlabelled'} {it.at} blocked")
 
 
+def keep_blocking(repo, n):
+    """Keep `blocking` on an open upstream issue in step with the open items
+    whose Blocked-by: lines name it: an agent waits on it, so it waits on the
+    human. The label assigns it to them and tells them (and, for Lasm, wakes
+    the lasm review)."""
+    issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+    labels = {l["name"] for l in issue.get("labels") or []}
+    if issue.get("state") != "open" or "upstream" not in labels:
+        return
+    want = False
+    for d in q("SELECT repo, number FROM blocked_by WHERE on_repo=? AND on_number=?", repo, n):
+        try:
+            if forge("GET", f"/repos/{ORG}/{d['repo']}/issues/{d['number']}").get("state") == "open":
+                want = True
+                break
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+    if want == ("blocking" in labels):
+        return
+    lid = label_id(repo, "blocking")
+    if lid is None:
+        return
+    if want:
+        forge("POST", f"/repos/{ORG}/{repo}/issues/{n}/labels", {"labels": [lid]})
+    else:
+        forge("DELETE", f"/repos/{ORG}/{repo}/issues/{n}/labels/{lid}")
+    log(f"{'labelled' if want else 'unlabelled'} {repo}#{n} blocking")
+
+
 def evaluate(repo, n, dependents=True, seed=False):
     """Queue what is owed on an item now, keep its `blocked` label and the
     index of what it waits on, then do the same for the items waiting on it."""
@@ -1257,11 +1287,20 @@ def evaluate(repo, n, dependents=True, seed=False):
             return
         raise
     owed, blocked, found = owed_on(it)
+    # Only an open item waits: a closed one's lines block nothing.
+    now_on = set(found) if it.open else set()
     with LOCK:
+        was_on = {(d["on_repo"], d["on_number"]) for d in
+                  DB.execute("SELECT on_repo, on_number FROM blocked_by WHERE repo=? AND number=?", (repo, n))}
         DB.execute("DELETE FROM blocked_by WHERE repo=? AND number=?", (repo, n))
         DB.executemany("INSERT INTO blocked_by (repo, number, on_repo, on_number) VALUES (?,?,?,?)",
-                       [(repo, n, r, k) for r, k in found])
+                       [(repo, n, r, k) for r, k in now_on])
     set_blocked(it, blocked)
+    for r, k in was_on ^ now_on:
+        try:
+            keep_blocking(r, k)
+        except Exception as e:
+            log(f"keeping blocking on {r}#{k} failed: {e!r}")
     for o in owed:
         queue(o, seed)
     if not dependents:
@@ -1363,6 +1402,10 @@ def sweep(seed=False):
             for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}"):
                 evaluate(repo, i["number"], dependents=False, seed=seed)
             check_unverified_stalls(repo)
+            # Upstream issues, once every item's Blocked-by: lines are read.
+            for item in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=upstream"):
+                if "upstream" in {l["name"] for l in item.get("labels") or []}:
+                    keep_blocking(repo, item["number"])
             # What waits on the human but isn't assigned to them: from before
             # assignment, or a missed webhook. Forgejo ignores a label filter
             # naming a label the repository lacks, so check each item's own.
