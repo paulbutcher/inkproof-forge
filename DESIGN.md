@@ -221,10 +221,10 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
 - **(6)** An open request it hasn't labelled `ready-for-release`, not blocked, that one of its pull requests, merged since the request was last unblocked, refers to with `Refs`.
 - **(7)** An accepted request that:
   - isn't blocked;
-  - has no open pull request referring to it, and nothing merged for it since it was last unblocked;
+  - has no open pull request referring to it;
   - isn't ready for release or released.
 
-  This rule applies only while the agent has nothing running or queued, and fires once each time the request is unblocked.
+  This rule applies only while the agent has nothing running or queued. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
 - **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 

@@ -407,6 +407,20 @@ class OwnerRules(Case):
         d.evaluate(CORE, 5)
         self.assertEqual(self.queued("core"), [])
 
+    def test_7_after_a_merge_that_left_part_of_it_to_do_demo_3(self):
+        self.f.issue(CORE, 3, "coordinator", ["request", "accepted"], created=9000,
+                     events=[label("accepted", True, 8000)])
+        self.f.pull(CORE, 11, "core", body="Refs #3", state="closed", merged=2000)
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.queued("core"), ["merged"])
+        self.handled()
+        # Its run left it open, with the rest still to do.
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.queued("core"), ["idle-request"])
+        self.handled()
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.queued("core"), [])
+
     def test_7_not_while_the_owner_is_busy_or_a_pull_request_is_under_way(self):
         self.f.issue(CORE, 5, "coordinator", ["request", "accepted"])
         self.running("core")

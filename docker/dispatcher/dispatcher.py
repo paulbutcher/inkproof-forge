@@ -953,12 +953,15 @@ def owner_rules(it, blocked, unblocked_at):
                           f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
                           "not yet labelled ready-for-release"))
         # 7. Accepted, nothing in its way and nothing under way, while the
-        #    owner has nothing to do: once each time it's unblocked.
+        #    owner has nothing to do: once each time it's unblocked, and once
+        #    after each merge for it. Quiet, so it comes after the merge's own
+        #    trigger (6), if that run left part of it to do (demo#3).
+        last_merge = max((when(p["merged_at"]) for p, _ in merged), default=0)
         if ("accepted" in it.labels and not held
                 and not it.labels & {"new", "needs-human", "counter-proposal"}
                 and not any(it.n in refs for _, refs in owner_prs(it.repo, owner, "open"))
-                and not merged):
-            o.append(Owed(owner, f"idle-request:{at}:{since}",
+):
+            o.append(Owed(owner, f"idle-request:{at}:{iso(last_merge) if merged else since}",
                           f"your accepted request {at} isn't blocked and has no pull request under way: work on "
                           "it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
     return o

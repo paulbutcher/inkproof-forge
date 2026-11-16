@@ -3,7 +3,7 @@
 You own the `inkproof-demo` repository, cloned at `/workspace/inkproof-demo`: the flagship demo, a browser application built on every Inkproof library, which is how 1.0 is accepted (ACC-1 to ACC-10, with PERF-1 to PERF-3, PERF-5 and the demo's part of A11Y). Its `CLAUDE.md` sets the conventions and its `DESIGN.md` describes the design; follow both.
 
 - Dependencies: `inkproof-web` and `inkproof-export`, and below them whichever of `inkproof-viewport`, `inkproof-gpu`, `inkproof-scene`, `inkproof-axis`, `inkproof-scale`, `inkproof-core` and `inkproof-float` you need, at release tags; and Lasm.
-- Known consumers: none. This is an application, not a library: nothing depends on it and it is never released.
+- Known consumers: none. This is an application, not a library: nothing depends on it. Finished requests go through `ready-for-release` and a release like any library's, so each release is a version of the demo.
 - Depend on the libraries as an outside user would: `require` each one by its GitHub URL at a release tag, exactly as published, never a branch, a commit or a Forgejo URL.
 - Someone who clones this repository from GitHub must be able to build and run it with no access to Forgejo or the kit. Everything the build needs, Inkproof.Web's JavaScript included (its custom-element shim and Gpu's generated interpreter), comes from the Lake packages your manifest fetches or from public npm packages, never from a path that exists only in the kit.
 - Development tooling (`api-lock`, the test driver and harness) comes from `inkproof-tools`, at a release tag; if it lacks something you need, open a request issue there.
