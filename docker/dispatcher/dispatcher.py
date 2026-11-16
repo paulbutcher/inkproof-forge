@@ -404,23 +404,26 @@ def label_id(repo, name):
 
 REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
 REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
+# "Part of #2", as agents write it in titles and descriptions when they forget
+# the Refs line (demo#2).
+PART_OF = re.compile(r"(?i)\bpart of\s+((?:[\w.-]+/[\w.-]+)?#\d+)")
 
 
 def pr_refs(repo, pr):
-    """The issues on repo a pull request refers to with `Refs`, in its
-    description or its commits."""
+    """The issues on repo a pull request refers to with `Refs` (or "part
+    of"), in its title, its description or its commits."""
     def read():
-        texts = [pr.get("body") or ""]
+        texts = [pr.get("title") or "", pr.get("body") or ""]
         texts += [(c.get("commit") or {}).get("message") or ""
                   for c in forge_all(f"/repos/{ORG}/{repo}/pulls/{pr['number']}/commits")]
         found = set()
         for text in texts:
-            for line in REFS.findall(text):
+            for line in REFS.findall(text) + PART_OF.findall(text):
                 for org, r, k in REF.findall(line):
                     if (not org or (org.lower() == ORG.lower() and r == repo)) and int(k) != pr["number"]:
                         found.add(int(k))
         return found
-    return cached(("refs", repo, pr["number"], pr["head"]["sha"], pr.get("body")), 3600, read)
+    return cached(("refs", repo, pr["number"], pr["head"]["sha"], pr.get("title"), pr.get("body")), 3600, read)
 
 
 def owner_prs(repo, owner, state):

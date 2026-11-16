@@ -421,6 +421,17 @@ class OwnerRules(Case):
         d.evaluate(CORE, 3)
         self.assertEqual(self.queued("core"), [])
 
+    def test_6_part_of_counts_as_refs_demo_28(self):
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                     events=[label("accepted", True, 8000)])
+        self.f.pull(CORE, 28, "core", title="Tile build from real files (part of #2)",
+                    body="Part of #2, second step.", state="closed", merged=100)
+        self.f.pull(CORE, 29, "core", title="Decode in place (part of tentenths/inkproof-scale#2)",
+                    body="Prior art: none found.", state="closed", merged=50)
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.descriptions("core")[:1],
+                         [f"your pull request {CORE}#28 merged; it answers {CORE}#2, not yet labelled ready-for-release"])
+
     def test_7_as_soon_as_the_run_that_left_it_ends_demo_2(self):
         # Its pull request merged as its run was ending: nothing else looks
         # at the request again until the sweep.
