@@ -421,6 +421,22 @@ class OwnerRules(Case):
         d.evaluate(CORE, 3)
         self.assertEqual(self.queued("core"), [])
 
+    def test_7_as_soon_as_the_run_that_left_it_ends_demo_2(self):
+        # Its pull request merged as its run was ending: nothing else looks
+        # at the request again until the sweep.
+        later = d.later
+        self.addCleanup(setattr, d, "later", later)
+        d.later = lambda fn, *args, delay=30: fn(*args)
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                     events=[label("accepted", True, 8000)])
+        self.f.pull(CORE, 21, "core", body="Refs #2", state="closed", merged=100)
+        run = self.running("core")
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), ["merged"])
+        self.handled()
+        d.end_run("core", run, {"outcome": "completed"})
+        self.assertEqual(self.queued("core"), ["idle-request"])
+
     def test_7_not_while_the_owner_is_busy_or_a_pull_request_is_under_way(self):
         self.f.issue(CORE, 5, "coordinator", ["request", "accepted"])
         self.running("core")

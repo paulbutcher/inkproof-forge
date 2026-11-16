@@ -1343,18 +1343,23 @@ def evaluate_repo(repo, items=False, seed=False):
                 log(f"evaluating {repo}#{i['number']} failed: {e!r}")
 
 
-def evaluate_own_prs(agent):
+def evaluate_after_run(agent):
     """An agent's run has ended: what it left its open pull requests owing
-    (5) was held while it could still act on them."""
+    (5) was held while it could still act on them, and its accepted requests
+    (7) while it was busy. Without this, they wait for the sweep."""
     repo = AGENTS.get(agent, {}).get("own")
     if repo not in OWNER_OF or may_push(agent):
         return
     _cache.pop(("prs", repo, "open"), None)
-    for p, _ in owner_prs(repo, agent, "open"):
+    _cache.pop(("prs", repo, "merged"), None)
+    items = [p["number"] for p, _ in owner_prs(repo, agent, "open")]
+    items += [i["number"] for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=accepted")
+              if "accepted" in {l["name"] for l in i.get("labels") or []}]
+    for n in items:
         try:
-            evaluate(repo, p["number"], dependents=False)
+            evaluate(repo, n, dependents=False)
         except Exception as e:
-            log(f"evaluating {repo}#{p['number']} failed: {e!r}")
+            log(f"evaluating {repo}#{n} failed: {e!r}")
 
 
 def evaluate_labelled(repo, name):
@@ -1820,7 +1825,7 @@ def end_run(agent, run_id, r):
         # Done; or stopped by the human, who may continue it; or given up on.
         # A retried run may still push, so its reviews wait for that.
         release_reviews(agent)
-        later(evaluate_own_prs, agent)
+        later(evaluate_after_run, agent)
     if not r.get("in_extension") and r.get("session_id"):
         sid = r.get("session_id")
         notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",

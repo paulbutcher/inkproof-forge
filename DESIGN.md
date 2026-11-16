@@ -224,7 +224,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   - has no open pull request referring to it;
   - isn't ready for release or released.
 
-  This rule applies only while the agent has nothing running or queued. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
+  This rule applies only while the agent has nothing running or queued, and its accepted requests are looked at again when its run ends. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
 - **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 
