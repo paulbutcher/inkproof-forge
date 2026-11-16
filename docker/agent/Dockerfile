@@ -60,6 +60,8 @@ COPY --chmod=0755 bin/ /usr/local/bin/
 COPY --chmod=0644 managed-settings.json /etc/claude-code/managed-settings.json
 COPY --chmod=0644 PROTOCOL.md /usr/local/share/inkproof/PROTOCOL.md
 COPY --from=roles --chmod=0644 . /usr/local/share/inkproof/roles/
+# --chmod sets the directory's mode too: let agents into it (the reviewers read every role).
+RUN chmod 0755 /usr/local/share/inkproof/roles
 
 ENV PATH=/home/agent/.elan/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude \

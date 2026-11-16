@@ -1015,7 +1015,11 @@ def coordinator_rules(it):
         settled = not it.open or not has_ci(it.repo) or it.ci() in ("success", "failure")
         o.append(Owed(c, f"pr-opened:{at}:", f"pull request opened: {at}",
                       None if settled else when(it.pr["created_at"]) + OPENED_HOLD))
-    if it.is_pr and it.open and c in {u["login"] for u in it.pr.get("requested_reviewers") or []}:
+    # Forgejo lists a reviewer as requested only until it reviews, and a push
+    # that dismisses its approval doesn't request it again: the timeline's
+    # requests still stand (web#8).
+    requested = it.requested() | {u["login"] for u in it.pr.get("requested_reviewers") or []} if it.is_pr else set()
+    if it.is_pr and it.open and c in requested:
         # 14. Its review is requested (at level 3, API.lock), CI passed on the
         #     head, and it hasn't approved that head.
         approved = any(login(r) == c and r.get("state") == "APPROVED" and r.get("commit_id") == it.head
@@ -1047,9 +1051,12 @@ def coordinator_rules(it):
                     "since you last looked at it")
             o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}:{ci}", what))
     # 16. needs-human added or removed by someone else (not the kit), and it
-    #     hasn't looked since.
+    #     hasn't looked since. Not on a process or Lasm recommendation: those
+    #     change the kit or go upstream, which is the human's, never its own
+    #     remit (coordination#128).
     nh = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == "needs-human"]
-    if nh and login(nh[-1]) not in (c, "dispatcher") and it.by(c, ("comment", "label")) < when(nh[-1]["created_at"]):
+    theirs = "recommendation" in it.labels and it.labels & {"review:process", "review:lasm"}
+    if nh and not theirs and login(nh[-1]) not in (c, "dispatcher") and it.by(c, ("comment", "label")) < when(nh[-1]["created_at"]):
         added = (nh[-1].get("body") or "") == "1"
         o.append(Owed(c, f"nh:{at}:{nh[-1]['created_at']}",
                       f"needs-human {'added to' if added else 'removed from'} {it.kind} {at}"))

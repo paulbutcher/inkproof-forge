@@ -550,6 +550,19 @@ class CoordinatorRules(Case):
         self.assertIn("a comment alone leaves it waiting", level3)
         self.assertIn(f"{CORE} is below level 3, so the human approves its `API.lock`", below)
 
+    def test_14_after_a_push_dismissed_its_approval_web_8(self):
+        # Forgejo stops listing it as requested once it reviews; the push
+        # dismissed its approval and requested no one again.
+        self.f.pull(SCALE, 8, "scale", sha="b" * 40, ci="success", events=[
+            event("pull_push", "scale", 3000),
+            {"type": "review_request", "user": {"login": "scale"}, "assignee": {"login": "coordinator"},
+             "created_at": at(3000)},
+            event("pull_push", "scale", 1000)],
+            reviews=[{"id": 1, "user": {"login": "coordinator"}, "state": "APPROVED", "commit_id": "a" * 40,
+                      "submitted_at": at(2000), "dismissed": True}])
+        d.evaluate(SCALE, 8)
+        self.assertIn("review-requested", self.queued("coordinator"))
+
     def test_15_consumer_metrics_13_fixed_with_the_label_left_on(self):
         self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
                      events=[label("ready-for-release", True, 4000), comment("coordinator", 3900, "Refused: ...")])
@@ -607,6 +620,14 @@ class CoordinatorRules(Case):
         d.evaluate(CORE, 5)
         self.assertEqual([x for x in self.descriptions("coordinator") if "needs-human" in x],
                          [f"needs-human added to issue {CORE}#4"])
+
+    def test_16_not_on_process_or_lasm_recommendations_coordination_128(self):
+        for n, review in ((107, "review:process"), (117, "review:lasm"), (120, "review:architecture")):
+            self.f.issue(COORD, n, "process", ["needs-human", "recommendation", review],
+                         events=[label("needs-human", True, 100, "process")])
+            d.evaluate(COORD, n)
+        self.assertEqual([x for x in self.descriptions("coordinator") if "needs-human" in x],
+                         [f"needs-human added to issue {COORD}#120"])
 
     def test_17_a_milestone_with_nothing_left_open(self):
         self.f.milestones[CORE] = [{"id": 3, "title": "Float library", "open_issues": 0, "closed_issues": 4},
