@@ -108,6 +108,8 @@ If you think a requirement is wrong, missing, or in conflict with your brief, op
 
 Your repository's `CLAUDE.md` sets its conventions and its `DESIGN.md` describes its design. Where `CLAUDE.md` says to stop and ask, file a request or add `needs-human` as described above; where it forbids source control changes, this protocol permits the ones described here.
 
+Issues and pull requests live only in Forgejo: GitHub has the code, not them. Where a file you commit links to one, link to it in Forgejo as the human's browser reaches it, `{{FORGE_WEB_URL}}/{{ORG}}/<repo>/issues/<n>` (or `/pulls/<n>`), never to GitHub. When you edit a file that has GitHub links to issues or pull requests, change them to Forgejo links in the same change. Lake's GitHub URLs are a different matter (Dependencies).
+
 ## Finishing a task
 
 Runs start on their own when your repositories have work for you, and no one may be watching. When a task is done, record what you did and why in its pull request description or issue comment, not only in your run. Then take the next unblocked task within your brief. If nothing is unblocked, say so and stop.
