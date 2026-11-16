@@ -23,3 +23,9 @@ vscode.download.prss.microsoft.com
 marketplace.visualstudio.com
 .gallerycdn.vsassets.io
 .vscode-cdn.net
+
+# Public seismic data for the demo (inkproof-demo#2): recordings from
+# EarthScope's FDSN services and the USGS earthquake catalogue. Read-only,
+# no credential. CI is deliberately not given them: tests use fixtures.
+service.earthscope.org
+earthquake.usgs.gov

@@ -30,6 +30,14 @@ allows  "an agent reaches github.com through the proxy" p curl -fsS -m 20 -o /de
 allows  "an agent reaches Anthropic through the proxy" p curl -sS -m 20 -o /dev/null https://api.anthropic.com
 refuses "an agent can't reach api.github.com" p curl -fsS -m 20 -o /dev/null https://api.github.com
 refuses "an agent can't reach an unlisted domain" p curl -fsS -m 20 -o /dev/null https://example.com
+allows  "an agent reaches EarthScope's seismic data through the proxy" p curl -fsS -m 30 -o /dev/null https://service.earthscope.org/fdsnws/dataselect/1/version
+allows  "an agent reaches the USGS earthquake catalogue through the proxy" p curl -fsS -m 30 -o /dev/null https://earthquake.usgs.gov/fdsnws/event/1/version
+refuses "an agent can't reach EarthScope's old IRIS host" p curl -fsS -m 20 -o /dev/null https://service.iris.edu/fdsnws/dataselect/1/version
+if docker compose exec -T coordinator true >/dev/null 2>&1; then
+  allows "Node's fetch goes through the proxy in an agent's container" docker compose exec -T coordinator node -e "fetch('https://earthquake.usgs.gov/fdsnws/event/1/version').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+else
+  echo "SKIP: Node's fetch through the proxy (no agent running yet)"
+fi
 refuses "an agent has no direct route out" p curl -fsS -m 10 --noproxy '*' -o /dev/null https://github.com
 allows  "an agent reaches Forgejo directly" p curl -fsS -m 10 -o /dev/null http://forgejo:3000/api/healthz
 allows  "an agent reaches the dispatcher directly" p curl -fsS -m 10 -o /dev/null http://dispatcher:8080/healthz
@@ -46,6 +54,7 @@ j() { docker compose exec -T ci-docker docker run --rm --network host inkproof-c
 refuses "a job has no direct route out" j curl -fsS -m 10 -o /dev/null https://github.com
 allows  "a job reaches github.com through ci-proxy" j curl -fsS -m 20 -x http://ci-proxy:3128 -o /dev/null https://github.com
 refuses "a job can't reach an unlisted domain" j curl -fsS -m 20 -x http://ci-proxy:3128 -o /dev/null https://example.com
+refuses "a job can't reach EarthScope's seismic data (tests use fixtures)" j curl -fsS -m 20 -x http://ci-proxy:3128 -o /dev/null https://service.earthscope.org/fdsnws/dataselect/1/version
 allows  "a job reaches Forgejo" j curl -fsS -m 10 -o /dev/null http://forgejo:3000/api/healthz
 refuses "a job can't reach the agents' network" j curl -fsS -m 10 -o /dev/null http://dispatcher:8080/healthz
 refuses "a job can't use the CI engine's API (plain)" j curl -fsS -m 5 http://127.0.0.1:2375/version

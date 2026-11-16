@@ -274,6 +274,12 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 | `scripts/test-stage7.sh` | Level 3: the coordinator gates `API.lock`, and releases go through the gatekeeper. |
 | `scripts/test-stage8.sh` | Backups, pruning and restore-test. |
 
+### Changing an allowlist
+
+The proxies' allowlists are in [docker/proxy/](docker/proxy/): `allow-agents.txt` for agents, `allow-ci.txt` for CI jobs and `allow-forge.txt` for Forgejo. Each is mounted into its proxy, and squid reads it only when it starts, so after editing one, restart that proxy: `docker compose restart proxy` (or `ci-proxy`, or `forge-proxy`). A restart cuts off downloads in progress, so pick a moment when no agent is fetching anything big. `scripts/test-stage1.sh` checks what each network can and can't reach; update it with the list.
+
+The agents' list includes the demo's seismic data. The demo agent keeps the downloads in its workspace volume, inside Docker Desktop's disk image. A year of 100 Hz recordings is about 2.7 GB per station-channel before tiles, so check that the disk image has room (Docker Desktop's Settings, Resources) before the demo fetches its full data set.
+
 ### Upgrading Playwright
 
 The agent and CI images include headless Chromium for browser tests, installed by Playwright when they're built. Each Playwright release expects one browser build, and neither agents nor CI can download browsers, so repositories pin `playwright` at exactly the images' version. To upgrade, change `PLAYWRIGHT_VERSION` in both [docker/agent/Dockerfile](docker/agent/Dockerfile) and [docker/ci/image/Dockerfile](docker/ci/image/Dockerfile), run `scripts/up.sh` to rebuild, and ask the coordinator to file a request on each repository with browser tests to move its pin to the same version.

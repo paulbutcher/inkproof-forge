@@ -10,7 +10,7 @@ This isn't a product you can pick up and run. It's tied to Inkproof throughout: 
 
 Everything runs on one Mac, in Docker. A local [Forgejo](https://forgejo.org/) holds the canonical repositories, issues, pull requests, reviews and CI. The Inkproof repositories on GitHub are push mirrors of it: they're how the work is published, and nothing reads from them. Issues and pull requests exist only in Forgejo.
 
-The only traffic out is to Claude's API for the agents, git reads of Lean toolchains and third-party packages, and the mirror pushes to GitHub. Every container reaches the outside only through an allowlisting proxy, and nothing in the kit holds a GitHub API credential.
+The only traffic out is to Claude's API for the agents, git reads of Lean toolchains and third-party packages, public seismic data for the demo, and the mirror pushes to GitHub. Every container reaches the outside only through an allowlisting proxy, and nothing in the kit holds a GitHub API credential.
 
 ## How it works
 
