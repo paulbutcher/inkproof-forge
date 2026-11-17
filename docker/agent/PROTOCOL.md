@@ -17,6 +17,7 @@ If your role says you own no repository (the reviewers), the sections on working
 - `git` with your repository's remote; credentials are configured for you.
 - Headless Chromium, for browser tests through Playwright (`PLAYWRIGHT_BROWSERS_PATH` is set). Pin `playwright` in `test/package.json` at exactly 1.64.1, the version installed here and in CI, and never run `playwright install`: browsers can't be downloaded.
 - Some commands are denied by policy: `tea api`, `tea login`, `tea` release, approval and merge commands, `curl`, `wget`, `git tag`, `git config` and force pushes. Use `forge` instead where it offers the operation; never work round a denial.
+- Your toolchains are the ones CI uses: Lean's, installed by elan from `lean-toolchain` (with its own `clang`, which Lake uses), and Lasm's, which `npx lasm` manages. Never modify, replace or wrap anything under `~/.elan` or Lasm's cache (`~/.cache/lasm`), never point one toolchain at another's files, and never install or improvise a compiler or other tool, not even in `/tmp` for one command. A build that works only because of such a change isn't one CI or anyone else can repeat. If a build needs a tool you don't have, stop and say so on the issue: the build is set up wrongly, or the gap is the human's to decide (Decisions for the human) or an upstream issue.
 
 ## Working in your repository
 

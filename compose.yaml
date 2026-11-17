@@ -28,6 +28,8 @@ services:
   forgejo:
     image: codeberg.org/forgejo/forgejo:17.0.1-rootless
     restart: unless-stopped
+    # Everything depends on it: the last the kernel's OOM killer picks.
+    oom_score_adj: -500
     networks: [agents, ci, forge-out, forge-web, gate]
     environment:
       FORGEJO__database__DB_TYPE: sqlite3
@@ -120,6 +122,11 @@ services:
     image: docker:29.9.3-dind
     restart: unless-stopped
     privileged: true
+    # Every CI job runs inside this container, so these bound them all together.
+    mem_limit: ${CI_MEMORY:-24g}
+    memswap_limit: ${CI_MEMORY:-24g}
+    cpus: ${CI_CPUS:-8}
+    oom_score_adj: 500
     hostname: ci-docker
     networks: [ci]
     environment:
@@ -155,6 +162,7 @@ services:
   dispatcher:
     build: ./docker/dispatcher
     restart: unless-stopped
+    oom_score_adj: -500
     networks: [agents, forge-web]
     environment:
       FORGE_URL: http://forgejo:3000
@@ -193,6 +201,7 @@ services:
   gatekeeper:
     build: ./docker/gatekeeper
     restart: unless-stopped
+    oom_score_adj: -500
     networks: [gate, gate-coord]
     depends_on: [forgejo]
     cap_drop: [ALL]

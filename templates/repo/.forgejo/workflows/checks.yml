@@ -57,19 +57,25 @@ jobs:
             exit 1
           fi
 
-      # Lasm tests run where the test subproject pins Lasm in test/package-lock.json.
+      # Lasm and browser tests run where an npm project pins them: the test
+      # subproject (test/package-lock.json) or an application's app/
+      # (app/package-lock.json). Its packages may come from Lake's (file:
+      # paths into .lake/packages), so this runs after the build.
       - name: Install Lasm
         run: |
-          if [ -f test/package-lock.json ]; then
-            (cd test && npm ci --no-fund --no-audit)
-          else
-            echo "No test/package-lock.json; Lasm tests are skipped."
-          fi
+          found=
+          for d in test app; do
+            if [ -f "$d/package-lock.json" ]; then
+              (cd "$d" && npm ci --no-fund --no-audit)
+              found=1
+            fi
+          done
+          [ -n "$found" ] || echo "No test/ or app/ package-lock.json; Lasm tests are skipped."
 
       - name: Tests
         run: |
           # Fail, rather than skip with a warning, if Lasm is pinned but missing.
-          if [ -f test/package-lock.json ]; then export INKPROOF_REQUIRE_LASM=1; fi
+          if [ -f test/package-lock.json ] || [ -f app/package-lock.json ]; then export INKPROOF_REQUIRE_LASM=1; fi
           lake test
 
       - name: API lock is up to date

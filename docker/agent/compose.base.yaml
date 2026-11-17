@@ -49,6 +49,15 @@ x-agent: &agent
     dispatcher: { condition: service_started }
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
+  # Each agent's share of the Mac: a run that runs away (demo, 2026-11-17: 90
+  # GiB and 15,000 threads) fails in its own container, not in Forgejo or the
+  # Mac. No swap beyond the limit, and the agents are the first the kernel's
+  # OOM killer picks.
+  mem_limit: ${AGENT_MEMORY:-16g}
+  memswap_limit: ${AGENT_MEMORY:-16g}
+  pids_limit: ${AGENT_PIDS:-4096}
+  cpus: ${AGENT_CPUS:-6}
+  oom_score_adj: 500
   working_dir: /workspace
   # CLAUDE_CODE_OAUTH_TOKEN, from secrets/claude/oauth-token (scripts/up.sh).
   env_file:
