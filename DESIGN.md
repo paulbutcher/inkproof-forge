@@ -213,7 +213,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
 ### Every library agent and the coordinator, on its own repository
 
 - **(1)** An open request labelled `request` and `new` by someone else, or an open issue by someone else with no labels at all that it hasn't touched. (Forgejo drops the labels of anyone without write access to the repository's issues.)
-- **(2)** A comment, or a review that isn't an approval, by someone else on one of its open issues or pull requests, that wants a reply and is newer than anything it has done there. A request for changes always wants a reply.
+- **(2)** A comment, or a review that isn't an approval, by someone else on one of its open issues or pull requests, that wants a reply and is newer than anything it has done there. What it does in a run that started before the comment doesn't count, since that run was briefed without it. A request for changes always wants a reply.
 - On one of its open pull requests:
   - **(3)** CI failing on the head.
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.

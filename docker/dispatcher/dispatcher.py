@@ -868,6 +868,14 @@ def blocked_rules(it):
     return owed, blocked, (done[-1][0] if done and not blocked else None), found
 
 
+def acted_in_earlier_run(agent, asked, acted):
+    """Whether the agent's action at `acted` came from a run that started
+    before `asked`: a run under way when a comment arrived was briefed
+    without it, so what it did afterwards doesn't answer it."""
+    return bool(q("SELECT 1 FROM runs WHERE agent=? AND claimed<=? AND (ended IS NULL OR ended>=?)",
+                  agent, asked, acted))
+
+
 def owner_rules(it, blocked, unblocked_at):
     """What the repository's owner owes on an item in it."""
     o, owner, at = [], it.owner, it.at
@@ -886,8 +894,9 @@ def owner_rules(it, blocked, unblocked_at):
                       f"untriaged issue {at}, filed without labels: if it's a request, add `request` and `new` "
                       "and handle it as one; otherwise answer it or close it"))
     # 2. A comment or review from someone else that wants a reply, newer than
-    #    anything the owner has done here. An approval asks nothing, whatever
-    #    it says; a request for changes always asks.
+    #    anything the owner has done here, or answered only by a run that
+    #    started before it, which never saw it (coordination#140). An approval
+    #    asks nothing, whatever it says; a request for changes always asks.
     #    Timestamps are to the second, so ties go by the timeline's order.
     order = lambda e, i: (when(e["created_at"]), i)
     placed = lambda r: (when(r["submitted_at"]), next(
@@ -905,7 +914,7 @@ def owner_rules(it, blocked, unblocked_at):
         acted = max([order(e, i) for i, e in enumerate(it.events) if login(e) == owner]
                     + [placed(r) for r in it.reviews if login(r) == owner and r.get("submitted_at")]
                     or [(0, 0)])
-        if t > acted:
+        if t > acted or acted_in_earlier_run(owner, t[0], acted[0]):
             o.append(Owed(owner, key, what))
     if it.is_pr and it.author == owner:
         head = it.head[:12]

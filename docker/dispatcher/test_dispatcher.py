@@ -242,6 +242,25 @@ class OwnerRules(Case):
         d.evaluate(CORE, 1)
         self.assertEqual(self.queued("core"), ["comment"])
 
+    def test_2_not_answered_by_a_run_that_started_before_it_coordination_140(self):
+        # The human commented while the owner was mid-run on a review; the
+        # run's later comment and push answered the review, not the human.
+        self.f.issue(CORE, 1, "core", events=[comment("human", 300, "Follow the latest release."),
+                                              comment("core", 200, "Shortened the bullets.")])
+        run = d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?) RETURNING id",
+                  d.now() - 360)[0]["id"]
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.queued("core"), ["comment"])
+        # Still owed once that run has ended, so the next run is woken for it.
+        d.q("UPDATE runs SET ended=? WHERE id=?", d.now() - 150, run)
+        self.assertEqual(d.no_longer_owed(d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")), [])
+        # A run that started after the comment answers it.
+        self.handled()
+        d.q("INSERT INTO runs (agent, triggers, claimed, ended) VALUES ('core', '[]', ?, ?)", d.now() - 100, d.now() - 40)
+        self.f.items[(CORE, 1)]["events"].append(comment("core", 50, "Reworded to follow the latest release."))
+        d.evaluate(CORE, 1)
+        self.assertEqual(d.no_longer_owed(d.q("SELECT id, key FROM triggers WHERE run_id=1")), [d.q("SELECT id FROM triggers WHERE run_id=1")[0]["id"]])
+
     def test_2_reviews_that_ask_and_one_that_doesnt(self):
         self.f.pull(CORE, 7, "core", reviews=[
             {"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "body": "(no reply needed)",
