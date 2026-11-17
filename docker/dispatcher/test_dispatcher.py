@@ -468,6 +468,43 @@ class OwnerRules(Case):
         d.end_run("core", run, {"outcome": "completed"})
         self.assertEqual(self.queued("core"), ["idle-request"])
 
+    def test_7_a_run_that_worked_on_it_and_stopped_short_demo_2(self):
+        accepted = [label("accepted", True, 8000)]
+        progress = lambda ago: comment("core", ago, "(no reply needed) Progress: half done.")
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000, events=accepted)
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), ["idle-request"])
+        self.handled()
+        # Its run worked on it, reported progress and ended with nothing merged.
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                     events=accepted + [progress(5000)])
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.descriptions("core"), [
+            f"your accepted request {CORE}#2 isn't finished: you last acted on it at {at(5000)}, and it has no "
+            "pull request under way. Carry on with it, or say on it what it waits for (a `Blocked-by:` line, "
+            "or `needs-human`)"])
+        self.handled()
+        # A run that looks and does nothing isn't woken again.
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), [])
+        # At most FOLLOW_UPS runs that act without merging anything for it.
+        for ago in (4000, 3000, 2000):
+            self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                         events=accepted + [progress(5000), progress(ago)])
+            d.evaluate(CORE, 2)
+            self.handled()
+        self.assertEqual(len(d.q("SELECT 1 FROM triggers WHERE key LIKE 'idle-request:%'")), 1 + d.FOLLOW_UPS)
+        # A merge for it starts the count again.
+        self.f.pull(CORE, 21, "core", body="Refs #2", state="closed", merged=1000)
+        d._cache.clear()
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                     events=accepted + [progress(500)])
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), ["merged"])
+        self.handled()
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), ["idle-request"])
+
     def test_7_not_while_the_owner_is_busy_or_a_pull_request_is_under_way(self):
         self.f.issue(CORE, 5, "coordinator", ["request", "accepted"])
         self.running("core")

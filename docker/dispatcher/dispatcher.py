@@ -95,6 +95,11 @@ NO_CI = int(os.environ.get("CI_MISSING_SECONDS", "600"))
 # after RETRY_DELAY_SECONDS times the attempt; then it is the human's.
 RETRIES = int(os.environ.get("MAX_RUN_RETRIES", "2"))
 RETRY_DELAY = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))
+# An accepted request its owner worked on and left unfinished, with nothing
+# merged for it, wakes the owner again when its run ends, at most this many
+# times since the last merge for it or its unblocking (7); after that, the
+# stall check takes it (demo#2).
+FOLLOW_UPS = int(os.environ.get("FOLLOW_UP_RUNS", "3"))
 REVIEWER = "conformance"
 MILESTONE_REVIEWERS = ("architecture", "process", "lasm")
 KEEP_PAYLOADS = 500
@@ -899,6 +904,13 @@ def acted_in_earlier_run(agent, asked, acted):
                   agent, asked, acted))
 
 
+def follow_ups(agent, base):
+    """How many follow-ups (7) were ever queued after the same merge or unblocking."""
+    prefix = base + ":"
+    return q("SELECT COUNT(*) AS n FROM triggers WHERE agent=? AND substr(key, 1, ?)=?",
+             agent, len(prefix), prefix)[0]["n"]
+
+
 def owner_rules(it, blocked, unblocked_at):
     """What the repository's owner owes on an item in it."""
     o, owner, at = [], it.owner, it.at
@@ -990,15 +1002,27 @@ def owner_rules(it, blocked, unblocked_at):
         # 7. Accepted, nothing in its way and nothing under way, while the
         #    owner has nothing to do: once each time it's unblocked, and once
         #    after each merge for it. Quiet, so it comes after the merge's own
-        #    trigger (6), if that run left part of it to do (demo#3).
+        #    trigger (6), if that run left part of it to do (demo#3). And
+        #    again whenever the owner has acted on it since then, up to
+        #    FOLLOW_UPS times: a run that worked on it and stopped short, with
+        #    nothing merged for it, otherwise waits for the stall check
+        #    (demo#2). A run that looks and does nothing isn't woken again.
         last_merge = max((when(p["merged_at"]) for p, _ in merged), default=0)
         if ("accepted" in it.labels and not held
                 and not it.labels & {"new", "needs-human", "counter-proposal"}
                 and not any(it.n in refs for _, refs in owner_prs(it.repo, owner, "open"))
 ):
-            o.append(Owed(owner, f"idle-request:{at}:{iso(last_merge) if merged else since}",
-                          f"your accepted request {at} isn't blocked and has no pull request under way: work on "
-                          "it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
+            started = iso(last_merge) if merged else since
+            base, acted = f"idle-request:{at}:{started}", it.by(owner)
+            if acted <= when(started):
+                o.append(Owed(owner, base,
+                              f"your accepted request {at} isn't blocked and has no pull request under way: work "
+                              "on it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
+            elif follow_ups(owner, base) < FOLLOW_UPS:
+                o.append(Owed(owner, f"{base}:{iso(acted)}",
+                              f"your accepted request {at} isn't finished: you last acted on it at {iso(acted)}, "
+                              "and it has no pull request under way. Carry on with it, or say on it what it waits "
+                              "for (a `Blocked-by:` line, or `needs-human`)", quiet=True))
     return o
 
 
