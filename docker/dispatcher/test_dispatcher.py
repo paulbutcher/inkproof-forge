@@ -785,6 +785,18 @@ class ReviewerRules(Case):
         d.evaluate(CORE, 7)
         self.assertIn("conf-reply", self.queued("conformance"))
 
+    def test_20_not_while_the_pull_request_is_blocked_demo_35(self):
+        # The author agreed and will fix it in another pull request first:
+        # the head changes before there is anything to review again.
+        self.f.issue(CORE, 37, "core")
+        self.f.pull(CORE, 35, "core", ["blocked"], events=[
+            comment("core", 50, "#37 replaces the gate; I'll merge main in once it lands.\n\n"
+                                "Blocked-by: org/inkproof-core#37")], reviews=[
+            {"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "a" * 40,
+             "submitted_at": at(100)}])
+        d.evaluate(CORE, 35)
+        self.assertNotIn("conf-reply", self.queued("conformance"))
+
     def test_21_and_22_milestone_reviews_and_blocking_lasm_issues(self):
         self.f.issue(COORD, 30, "coordinator", ["milestone-review"])
         self.f.issue(COORD, 31, "core", ["upstream", "upstream:lasm", "blocking"])

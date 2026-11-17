@@ -1107,9 +1107,11 @@ def reviewer_rules(it):
             o.append(Owed(REVIEWER, f"conf:{at}:{head[:12]}", f"review pull request {at} at {head[:12]}",
                           None if settled else pushed + SETTLE))
         # 20. The author answered its request for changes at this head in a
-        #     comment, without pushing.
+        #     comment, without pushing; not while the pull request is
+        #     blocked, since its head will change first (demo#35).
         mine = [r for r in it.reviews if login(r) == REVIEWER]
-        if mine and mine[-1].get("state") == "REQUEST_CHANGES" and mine[-1].get("commit_id") == head:
+        if (mine and mine[-1].get("state") == "REQUEST_CHANGES" and mine[-1].get("commit_id") == head
+                and "blocked" not in it.labels):
             replies = [c for c in it.comments() if login(c) == it.author and login(c) != REVIEWER
                        and wants_reply(c.get("body")) and when(c["created_at"]) > when(mine[-1]["submitted_at"])]
             if replies:

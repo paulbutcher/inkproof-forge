@@ -262,7 +262,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
   - at once when the author is an agent with no run under way and the human isn't active in its container;
   - when that run ends;
   - otherwise, `CONFORMANCE_SETTLE_SECONDS` (default 10 minutes) after the last push.
-- **(20)** The author's reply, after its request for changes at the current head.
+- **(20)** The author's reply, after its request for changes at the current head. Not while the pull request is blocked, since its head will change first.
 
 ### `architecture`, `process` and `lasm`
 
