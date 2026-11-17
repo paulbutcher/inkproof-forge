@@ -1049,6 +1049,15 @@ class Summary(Case):
         s = d.kit_summary()
         self.assertTrue(s.startswith("Kit: stuck: 1 queued for core, whose runner hasn't called in for 40 minutes"), s)
 
+    def test_a_runner_running_a_run_isnt_stuck(self):
+        d.q("INSERT INTO runs (agent, triggers, claimed, started) VALUES ('core', '[\"some work\"]', ?, ?)",
+            d.now() - 360, d.now() - 360)
+        d.add_trigger("core", "work:2", "more work", once=True)
+        d.kv_set("seen:core", d.now() - 360)
+        s = d.kit_summary()
+        self.assertTrue(s.startswith("Kit: working: core running for 6 minutes"), s)
+        self.assertIn("1 queued for core", s)
+
     def test_queued_work_says_how_long_it_has_waited(self):
         d.add_trigger("core", "work:1", "some work", once=True)
         d.runner_seen("core")

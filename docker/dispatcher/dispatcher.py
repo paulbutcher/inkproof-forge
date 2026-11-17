@@ -1987,9 +1987,12 @@ def kit_summary():
         else:
             work.append(f"{r['agent']} starting a run")
     later_ids = {t["id"] for t in later}
+    busy_agents = {r["agent"] for r in runs}
     for agent in sorted({t["agent"] for t in queued}):
         mine = [t for t in queued if t["agent"] == agent]
-        silent = runner_silent_for(agent) if any(t["id"] not in later_ids for t in mine) else None
+        # A runner is silent while it runs one: only an idle one should call in.
+        silent = (runner_silent_for(agent) if agent not in busy_agents
+                  and any(t["id"] not in later_ids for t in mine) else None)
         if silent:
             stuck.append(f"{len(mine)} queued for {agent}, whose runner hasn't called in for {span(silent)}: "
                          f"restart its container")
