@@ -21,12 +21,15 @@ follow a rule tea can't enforce. Uses the agent's own token.
                                   for the head commit succeeded
   forge review <repo> <n> <findings.json>
                                   (conformance) review the pull request's head:
-                                  approves if no finding is open, requests
-                                  changes otherwise, and after the rounds limit
-                                  labels it needs-human instead. The file is
+                                  approves if no finding is open (new, kept or
+                                  agreed), requests changes otherwise, and after
+                                  the rounds limit puts the findings the author
+                                  disputes (kept) to the human instead, once per
+                                  head. The file is
                                   {"summary": "...", "findings": [{"section":
                                   "<CLAUDE.md or protocol section>", "finding":
-                                  "...", "status": "new|kept|fixed|withdrawn"}]}
+                                  "...", "status":
+                                  "new|kept|agreed|fixed|withdrawn"}]}
   forge reviews <repo> <n>        the pull request's reviews: who, verdict,
                                   commit and text, oldest first
   forge ledger [days]             (process) the run ledger for the last days
@@ -188,10 +191,12 @@ def ci_state(repo, pr):
     return sha, "running"
 
 
-STATUSES = ("new", "kept", "fixed", "withdrawn")
+# kept: the author disputes it; agreed: the author accepts it and hasn't fixed
+# it yet. Both stay open, but only a dispute is the human's to decide.
+STATUSES = ("new", "kept", "agreed", "fixed", "withdrawn")
 
 
-def render(summary, findings, round_no, rounds, escalated=False):
+def render(summary, findings, round_no, rounds, escalated=False, commit=None):
     lines = [summary.strip(), ""]
     if findings:
         lines.append(f"**Findings** (round {round_no} of {rounds}):")
@@ -201,6 +206,8 @@ def render(summary, findings, round_no, rounds, escalated=False):
         lines.append("No findings: this follows `CLAUDE.md` and the protocol.")
     record = {"round": round_no, "escalated": escalated,
               "findings": [{"section": f["section"], "status": f["status"]} for f in findings]}
+    if commit:
+        record["commit"] = commit
     lines += ["", f"<!-- conformance-findings: {json.dumps(record)} -->"]
     return "\n".join(lines)
 
@@ -227,16 +234,28 @@ def review(repo, n, path):
         die(f"not reviewing {repo}#{n}: the Actions run for {sha[:12]} is {state}; you'll be woken when it succeeds")
     s, reviews = api("GET", f"/repos/{ORG}/{repo}/pulls/{n}/reviews")
     asked = sum(1 for r in reviews or [] if r["user"]["login"] == ME and r.get("state") == "REQUEST_CHANGES")
-    open_findings = [f for f in findings if f["status"] in ("new", "kept")]
-    if open_findings and asked >= rounds:
-        for f in open_findings:
+    open_findings = [f for f in findings if f["status"] in ("new", "kept", "agreed")]
+    # Past the rounds limit only a dispute goes to the human: a finding the
+    # author agreed with, or hasn't seen yet, is theirs to fix, so it gets an
+    # ordinary request for changes. And a dispute goes once per head: with
+    # nothing new pushed, there's nothing new to decide (demo#35).
+    disputed = [f for f in findings if f["status"] == "kept"]
+    if disputed and asked >= rounds:
+        s, comments = api("GET", f"/repos/{ORG}/{repo}/issues/{n}/comments?limit=100")
+        before = [json.loads(m.group(1)) for c in comments or [] if c["user"]["login"] == ME
+                  for m in [re.search(r"<!-- conformance-findings: (\{.*?\}) -->", c.get("body") or "")] if m]
+        if any(r.get("escalated") and r.get("commit") == sha for r in before):
+            print(f"Already put to the human at {sha[:12]}; nothing new to review until the head changes.")
+            return
+        for f in disputed:
             f["status"] = "escalated"
-        listed = "\n".join(f"- **{f['section']}**: {f['finding'].strip()}" for f in open_findings)
+        open_findings = disputed
+        listed = "\n".join(f"- **{f['section']}**: {f['finding'].strip()}" for f in disputed)
         # The decision first, then the label: the dispatcher takes needs-human
         # off anything that doesn't state its decision.
-        body = ("(no reply needed)\n\n" + render(summary, findings, asked + 1, rounds, escalated=True)
+        body = ("(no reply needed)\n\n" + render(summary, findings, asked + 1, rounds, escalated=True, commit=sha)
                 + f"\n\nAfter {rounds} rounds these findings are still open, so you decide them.\n\n"
-                + "## Question\n\nDo these findings stand? The author disagrees with each:\n\n" + listed
+                + "## Question\n\nDo these findings stand? The author disputes each:\n\n" + listed
                 + "\n\n## Options\n\n- Uphold them: say which, and the author fixes them.\n"
                 + "- Overrule them: say so, and approve the pull request.\n"
                 + "\n## Recommendation\n\nUphold them: each names the rule it breaks. Read the author's replies "

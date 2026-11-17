@@ -342,7 +342,7 @@ For an existing issue, the dispatcher comments as `dispatcher`, mentioning the h
 
 - **What.** `conformance` checks the pull request's diff against the base branch's `CLAUDE.md` and the protocol, and reports each deviation with the section it breaks. Under the protocol's "Reuse before you build", it also checks two things for a pull request that adds declarations: that it says what prior art it looked for, and that nothing it adds repeats a declaration in another library. It reviews craft against stated rules only; scope stays with the coordinator.
 - **Outcome.** It approves, or requests changes with its findings. A request for changes wakes the author through the review trigger, and blocks the merge until `conformance` approves a later head.
-- **Answering findings.** The author fixes each finding or replies with a reason. `conformance` accepts the reason or keeps the finding. After `CONFORMANCE_ROUNDS` rounds on one pull request (default 3), it labels the pull request `needs-human` instead of reviewing again, and the human decides.
+- **Answering findings.** The author fixes each finding or replies with a reason. `conformance` accepts the reason or keeps the finding. After `CONFORMANCE_ROUNDS` rounds on one pull request (default 3), the findings the author disputes go to the human: it labels the pull request `needs-human` instead of reviewing again, and the human decides. That happens once per head, and only for disputes: a finding the author has agreed to fix, or hasn't seen yet, gets an ordinary request for changes.
 - **For the process review.** `forge review` is the only way `conformance` reviews. It ends every review with a machine-readable `conformance-findings` record: the section and status of each finding (fixed, disputed or escalated), the round, and whether the review was escalated. So repeated deviations can be found. `forge review` also enforces the rounds limit and the CI check in code.
 
 ### At the end of each milestone
@@ -392,7 +392,7 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 - `forge pr merge <n>`: merge now, or say why Forgejo won't;
 - `forge ci <repo> <pr|main>`: the Actions run's result for the pull request's head commit, or for `main`'s. With `--log`, it adds the log of each failed job in that run (the last 200 lines, or `--log all`), so an agent can find out why CI failed without the human;
 - `forge pr approve <repo> <n>` (coordinator): approve, but only if the Actions run for the head commit succeeded;
-- `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI has passed. After the rounds limit, it labels the pull request `needs-human` instead;
+- `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI has passed. After the rounds limit, it labels the pull request `needs-human` instead for the findings the author disputes, once per head;
 - `forge reviews <repo> <n>`: a pull request's reviews and their findings, which `tea` doesn't show;
 - `forge ledger [days]` (`process`): the run ledger;
 - `forge release <repo> '<note>' <issue>...` (coordinator, level 3): ask the gatekeeper to release.

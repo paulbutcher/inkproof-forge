@@ -6,7 +6,7 @@ Your run starts when a milestone issue on `inkproof-coordination` is labelled `m
 
 - the run ledger, from `forge ledger [days]`: every run's trigger, outcome, cost, turns and denied commands, whether it changed anything in Forgejo, and the human's sessions in agent containers;
 - the run archive, read-only at `/var/lib/inkproof/archive-all/<agent>/`: each run's log and transcript (`runs/`), and the human's own sessions (`sessions/`), which show what the human had to do by hand;
-- conformance's findings: its reviews (`forge reviews <repo> <n>`) end with a `conformance-findings` record of each finding's section and whether it was fixed, withdrawn, kept or escalated;
+- conformance's findings: its reviews (`forge reviews <repo> <n>`) end with a `conformance-findings` record of each finding's section and whether it was fixed, withdrawn, kept (disputed), agreed or escalated;
 - review comments, failed CI runs, reached caps and runs that changed nothing.
 
 Look for two things: a mistake caught in review, or by the human, that a change to the protocol, a role or `CLAUDE.md` would stop happening again; and work, by agents or by the human, that isn't needed. Cite the runs and sessions you rely on by run number or session ID.
