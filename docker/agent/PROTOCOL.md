@@ -31,6 +31,7 @@ If your role says you own no repository (the reviewers), the sections on working
 - When CI fails, read why with `forge ci <repo> <pr|main> --log` before anything else, and never ask the human for a log. If CI fails on `main`, a run starts for you: two pull requests that passed apart may fail together. Fix it first, through a pull request like any other change; nothing can be released until `main` passes.
 - `conformance` reviews every pull request against the base branch's `CLAUDE.md` and this protocol, once CI passes. When it requests changes, read its findings with `forge reviews <repo> <n>`, then fix each one, or reply on the pull request with your reason for keeping it. It looks again after your next push or reply. After a few rounds the human decides what is still disputed. If you agree with a finding, say so and how you'll fix it, so it isn't taken for a dispute.
 - Changes to `API.lock` (public declarations and theorem statements) need review: the human's at autonomy levels 1 and 2, the coordinator's at level 3. Say clearly in the pull request why the API must change, and which requirement each new or changed theorem statement meets.
+- Your `README.md` is how people find what your repository does: users who come across it on GitHub, and the other agents. Keep a `## What it does` section in it, with one line for each job its public API does, in the words someone looking for that job would use, naming the entry points. A pull request that adds, removes or changes what the public API does updates that list in the same change.
 - `CLAUDE.md`, `.forgejo/`, `lean-toolchain` and `REQUIREMENTS.md` are the human's: a pull request touching them waits for the human's review.
 
 ## Comments
@@ -46,21 +47,21 @@ Your account identifies you, so don't sign comments. A comment from a trusted ac
 
 Before designing anything new (a type, an algorithm, a group of lemmas), find out whether it already exists, in this order:
 
-1. this project's other libraries: every `inkproof-` repository's `API.lock`, and its source for private declarations, at `/workspace/<repo>`;
+1. this project's other libraries, at `/workspace/<repo>`: every `inkproof-` repository's `README.md`, which lists what the library does by job, then its `API.lock`, and its source for private declarations. Search for the job, not a name: the same job under another name is still a repeat;
 2. the catalogue of known libraries, `PRIOR-ART.md` in `inkproof-coordination`, which includes the human's own Lean libraries;
 3. Lean core, Std, Batteries and Mathlib: search them with Loogle (`https://loogle.lean-lang.org/json?q=<query>`) or by reading their source;
 4. other Lean packages, on Reservoir (`https://reservoir.lean-lang.org`).
 
-Say in the pull request what you checked and what you found, in a `Prior art:` line. "None found" is a fine answer.
+Say in the pull request, in a `Prior art:` line, what you looked for, where, and what you found: the job in a few words, and the libraries and modules you checked for it. "None found" is a fine conclusion, but not a whole line.
 
 - **In a library you depend on**: use it.
 - **In one of this project's libraries you don't depend on, or private in one you do**: don't write it again. If ARCH-1 lets you depend on that library, request that it be made public. If not, ask the coordinator, with a request on `inkproof-coordination`, to move it to the lowest library both can depend on. Either way, carry on as under "Never work around a dependency".
 - **Outside this project, in a library you don't depend on yet**: adding a dependency is the human's decision (Decisions for the human). Say what it provides, whether it works under Lasm (PLAT-3), and what it adds to every consumer's build. If you decide against it, record the reason in `DESIGN.md`.
-- **Nowhere**: build it, in the lowest library where it makes sense. Something with no knowledge of your library's domain belongs lower down, so say so in your pull request.
+- **Nowhere**: if it belongs to your repository's domain, build it. If it has no knowledge of that domain, so that another library or application would need it unchanged, don't build it here, however small: request it on the dependency it belongs in, or, if none of your dependencies fits, ask the coordinator with a request on `inkproof-coordination` where it should live (a new library is the human's decision). Either way, carry on as under "Never work around a dependency". What decides is whether it is general, not whether anything else needs it yet.
 
 ## Never work around a dependency
 
-If a library you depend on is missing something, or is wrong, do **not** reimplement it, copy its code, reach into its internals, or bend your design around the gap. Instead:
+If a library you depend on is missing something, general functionality it doesn't have yet included, or is wrong, do **not** reimplement it, copy its code, reach into its internals, or bend your design around the gap. Instead:
 
 1. If it is one of this project's libraries, open an issue on its repository using the request template, with labels `request` and `new`: `tea issue create --repo {{ORG}}/<library> --labels request,new --title ... --description ...`.
 2. If it is outside this project (Lasm, Lean, Mathlib or any other), open an issue on `{{ORG}}/inkproof-coordination` labelled `upstream` and `upstream:<project>`, with a minimal reproduction. The upstream tracker is this project's own record: the human takes its issues upstream when they choose, so don't ask them to. A browser API Lasm has no typed binding for doesn't stop you: write the binding in Lean in your own library, with Lasm.JS (`@[js "globalThis" "…"]`, or `Value.get` and `callMethod`), record it on the upstream issue, and carry on. Lean can't do everything JavaScript can, such as defining a class: only then does a shim, under your library's own rules for them, take the binding's place.

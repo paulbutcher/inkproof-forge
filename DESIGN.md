@@ -340,7 +340,7 @@ For an existing issue, the dispatcher comments as `dispatcher`, mentioning the h
 
 ### Conformance, on every pull request
 
-- **What.** `conformance` checks the pull request's diff against the base branch's `CLAUDE.md` and the protocol, and reports each deviation with the section it breaks. Under the protocol's "Reuse before you build", it also checks two things for a pull request that adds declarations: that it says what prior art it looked for, and that nothing it adds repeats a declaration in another library, by what the declaration does as well as by its name. It reviews craft against stated rules only; scope stays with the coordinator.
+- **What.** `conformance` checks the pull request's diff against the base branch's `CLAUDE.md` and the protocol, and reports each deviation with the section it breaks. Under the protocol's "Reuse before you build", it also checks two things for a pull request that adds declarations: that it says what prior art it looked for and where, and that nothing it adds repeats a declaration in another library, by what the declaration does as well as by its name. Under "Working in your repository", it checks that a pull request changing what the public API does updates the `## What it does` list in the repository's `README.md`, which is how outside users and the agents alike find what each library does. It reviews craft against stated rules only; scope stays with the coordinator.
 - **Outcome.** It approves, or requests changes with its findings. A request for changes wakes the author through the review trigger, and blocks the merge until `conformance` approves a later head.
 - **Answering findings.** The author fixes each finding or replies with a reason. `conformance` accepts the reason or keeps the finding. After `CONFORMANCE_ROUNDS` rounds on one pull request (default 3), the findings the author disputes go to the human: it labels the pull request `needs-human` instead of reviewing again, and the human decides. That happens once per head, and only for disputes: a finding the author has agreed to fix, or hasn't seen yet, gets an ordinary request for changes.
 - **For the process review.** `forge review` is the only way `conformance` reviews. It ends every review with a machine-readable `conformance-findings` record: the section and status of each finding (fixed, disputed or escalated), the round, and whether the review was escalated. So repeated deviations can be found. `forge review` also enforces the rounds limit and the CI check in code.
@@ -356,7 +356,8 @@ For an existing issue, the dispatcher comments as `dispatcher`, mentioning the h
   - Are the boundaries between libraries in the right place?
   - Is there too much coupling between libraries, or too little cohesion within one?
   - Are libraries working around limitations in dependencies, including ones we don't control, and should those be fixed instead?
-  - Is code duplicated between libraries, or does something general belong lower down?
+  - Is code duplicated between libraries, or does something general, in a library or an application such as the demo, belong lower down?
+  - Does each library's `README.md` list everything its `API.lock` does, by job?
   - Does a library build what an existing library already provides (`PRIOR-ART.md`, Lean core, Std, Batteries, Mathlib, Reservoir) without recording why?
 
   It reads every repository, the milestone's `API.lock` diff, requests and how they were resolved, and the upstream tracker.
