@@ -165,11 +165,12 @@ Open it with `scripts/open.sh coordinator`. It's the session named like "coordin
 
   It then shows your sessions, the notices, and the open requests, pull requests, recommendations and `needs-human` items across the project. It also shows whether the gatekeeper is running and its latest approvals.
 
-  Its last line says whether the kit will make progress by itself:
-  - "Kit: working", with what each run is for and how long it has run, how long queued work has waited, and CI;
-  - "Kit: stuck", with what can't move on by itself: queued work whose runner has stopped calling in (restart that agent's container: `docker compose restart <agent>`), or a run claimed but never started (closed by itself after 15 minutes, `CLAIM_START_SECONDS`, with its work queued again);
-  - "Kit: quiet, nothing happens until you act", with what waits on you;
-  - quiet with nothing waiting on you, in which case a stalled item or the coordinator's summary comes next.
+  It ends with the kit's state, on one line with how many items wait on you, then one indented line for each thing behind it:
+  - "Kit: working": each run, with what it is for and how long it has run; each agent's queued work, with how long the oldest has waited; and CI;
+  - "Kit: stuck": first, what can't move on by itself, marked "stuck:": queued work whose runner has stopped calling in (restart that agent's container: `docker compose restart <agent>`), or a run claimed but never started (closed by itself after 15 minutes, `CLAIM_START_SECONDS`, with its work queued again); then whatever else is working;
+  - "Kit: quiet, nothing happens until you act": what waits on you;
+  - "Kit: quiet" with nothing waiting on you, in which case a stalled item or the coordinator's summary comes next.
+- **`scripts/watch.sh`** keeps that last part on screen, redrawn every 15 seconds (`-n 60` for every minute) until Ctrl-C. Piped or redirected, it prints the state with the time whenever it changes, so `scripts/watch.sh > kit.log` keeps a record.
 - **`scripts/activity.sh`** follows what's happening, one line per entry, in your time zone. It covers pushes, pull requests, reviews, labels, CI results and releases, with who did them; work queued and why; runs starting and ending, with outcome and cost; your sessions; and notices.
 
   It shows the last 40 entries and then follows until Ctrl-C. `-n 200` shows more first, `--once` doesn't follow, and a word filters the lines: `scripts/activity.sh scale`. Issue references such as `inkproof-core#24` link to Forgejo in terminals that support hyperlinks; `--urls` prints the addresses instead.

@@ -1038,36 +1038,50 @@ class Summary(Case):
             self.addCleanup(setattr, d, name, getattr(d, name))
             setattr(d, name, value)
 
-    def test_says_what_each_run_is_for(self):
+    def lines(self):
+        return d.kit_summary().split("\n")
+
+    def test_says_what_each_run_is_for_one_line_each(self):
         d.q("INSERT INTO runs (agent, triggers, claimed, started) VALUES ('core', ?, ?, ?)",
             '["untriaged request inkproof-core#1", "comment on inkproof-core#2"]', d.now() - 600, d.now() - 600)
-        self.assertIn("core running for 10 minutes: untriaged request inkproof-core#1 (and 1 more)", d.kit_summary())
+        d.add_trigger("scale", "work:1", "some work", once=True)
+        d.runner_seen("scale")
+        self.assertEqual(self.lines(), [
+            "Kit: working; nothing waits on you",
+            "  - core running for 10 minutes: untriaged request inkproof-core#1 (and 1 more)",
+            "  - 1 queued for scale, the oldest for under a minute"])
 
     def test_a_runner_that_stopped_calling_in_is_stuck(self):
         d.add_trigger("core", "work:1", "some work", once=True)
         d.kv_set("seen:core", d.now() - 2400)
-        s = d.kit_summary()
-        self.assertTrue(s.startswith("Kit: stuck: 1 queued for core, whose runner hasn't called in for 40 minutes"), s)
+        self.assertEqual(self.lines(), [
+            "Kit: stuck; nothing waits on you",
+            "  - stuck: 1 queued for core, whose runner hasn't called in for 40 minutes: restart its container"])
 
     def test_a_runner_running_a_run_isnt_stuck(self):
         d.q("INSERT INTO runs (agent, triggers, claimed, started) VALUES ('core', '[\"some work\"]', ?, ?)",
             d.now() - 360, d.now() - 360)
         d.add_trigger("core", "work:2", "more work", once=True)
         d.kv_set("seen:core", d.now() - 360)
-        s = d.kit_summary()
-        self.assertTrue(s.startswith("Kit: working: core running for 6 minutes"), s)
-        self.assertIn("1 queued for core", s)
+        self.assertEqual(self.lines(), [
+            "Kit: working; nothing waits on you",
+            "  - core running for 6 minutes: some work",
+            "  - 1 queued for core, the oldest for under a minute"])
 
     def test_queued_work_says_how_long_it_has_waited(self):
         d.add_trigger("core", "work:1", "some work", once=True)
         d.runner_seen("core")
         d.q("UPDATE triggers SET created=?", d.now() - 300)
-        self.assertIn("1 queued for core, the oldest for 5 minutes", d.kit_summary())
+        self.assertIn("  - 1 queued for core, the oldest for 5 minutes", self.lines())
 
     def test_a_claim_that_never_started_is_stuck(self):
         d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?)", d.now() - 600)
-        self.assertIn("core's run", d.kit_summary())
-        self.assertTrue(d.kit_summary().startswith("Kit: stuck:"))
+        lines = self.lines()
+        self.assertEqual(lines[0], "Kit: stuck; nothing waits on you")
+        self.assertTrue(lines[1].startswith("  - stuck: core's run"), lines)
+
+    def test_quiet(self):
+        self.assertEqual(self.lines()[0], "Kit: quiet; nothing waits on you")
 
 
 class FailedRunsAreRetried(Case):

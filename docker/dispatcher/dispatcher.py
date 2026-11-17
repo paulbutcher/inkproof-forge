@@ -1956,9 +1956,10 @@ def clip_line(text, n):
 
 
 def kit_summary():
-    """One line: whether the kit will make progress by itself, is stuck, or
-    nothing happens until the human acts, and what each agent is doing. The
-    same test as check_idle, without its wait for quiet."""
+    """Whether the kit will make progress by itself, is stuck, or nothing
+    happens until the human acts, on its first line; then one indented line
+    for each thing it is doing or waiting on. The same test as check_idle,
+    without its wait for quiet."""
     try:
         waiting = waiting_on_human()
         ci = ci_running()
@@ -1972,7 +1973,7 @@ def kit_summary():
     queued = q("SELECT id, agent, created, not_before FROM triggers WHERE run_id IS NULL")
     capped_agents = sorted({t["agent"] for t in queued if capped(t["agent"])})
     queued = [t for t in queued if t["agent"] not in capped_agents]
-    later = [t for t in queued if t["not_before"] and t["not_before"] > now()]
+    later_ids = {t["id"] for t in queued if t["not_before"] and t["not_before"] > now()}
     yours = [a for a in AGENTS if human_active(a)]
     work, stuck = [], []
     for r in runs:
@@ -1980,13 +1981,12 @@ def kit_summary():
             triggers = json.loads(r["triggers"] or "[]")
             more = f" (and {len(triggers) - 1} more)" if len(triggers) > 1 else ""
             work.append(f"{r['agent']} running for {span(now() - r['started'])}: "
-                        f"{clip_line(triggers[0] if triggers else 'its work', 90)}{more}")
+                        f"{clip_line(triggers[0] if triggers else 'its work', 100)}{more}")
         elif now() - r["claimed"] > 120:
             stuck.append(f"{r['agent']}'s run {r['id']} was claimed {span(now() - r['claimed'])} ago and hasn't "
                          f"started (closed by itself after {CLAIM_START // 60} minutes, or restart its container)")
         else:
             work.append(f"{r['agent']} starting a run")
-    later_ids = {t["id"] for t in later}
     busy_agents = {r["agent"] for r in runs}
     for agent in sorted({t["agent"] for t in queued}):
         mine = [t for t in queued if t["agent"] == agent]
@@ -1998,26 +1998,28 @@ def kit_summary():
                          f"restart its container")
             continue
         held = sum(t["id"] in later_ids for t in mine)
-        held = f", {held} not yet due" if held else ""
+        held = f" ({held} not yet due)" if held else ""
         work.append(f"{len(mine)} queued for {agent}, the oldest for {span(now() - min(t['created'] for t in mine))}"
                     f"{held}")
     if ci:
         work.append("CI running")
-    if stuck:
-        return f"Kit: stuck: {'; '.join(stuck)}" + (f"; also working: {', '.join(work)}" if work else "") + f"; {wait}"
-    extra = []
+    notes = []
     if capped_agents:
-        extra.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
+        notes.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
     if yours:
-        extra.append(f"you're active in {', '.join(yours)}, whose runs wait for you")
-    tail = "".join(f"; {x}" for x in extra)
-    if work:
-        return f"Kit: working: {', '.join(work)}; {wait}{tail}"
-    if waiting or capped_agents:
-        return f"Kit: quiet, nothing happens until you act; {wait}{tail}"
-    return (f"Kit: quiet, and nothing waits on you: once it has been quiet for {IDLE // 60} minutes, whoever "
-            f"should move on any open item that is waiting for nothing is woken, or if there is none, the "
-            f"coordinator summarises{tail}")
+        notes.append(f"you're active in {', '.join(yours)}, whose runs wait for you")
+    if stuck:
+        head = "stuck"
+    elif work:
+        head = "working"
+    elif waiting or capped_agents:
+        head = "quiet, nothing happens until you act"
+    else:
+        head = "quiet"
+        notes.append(f"once it has been quiet for {IDLE // 60} minutes, whoever should move on any open item that "
+                     f"is waiting for nothing is woken, or if there is none, the coordinator summarises")
+    lines = [f"stuck: {s}" for s in stuck] + work + notes
+    return "\n".join([f"Kit: {head}; {wait}"] + [f"  - {line}" for line in lines])
 
 
 def notices_text(after):
