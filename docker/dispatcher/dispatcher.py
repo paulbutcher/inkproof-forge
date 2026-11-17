@@ -238,12 +238,18 @@ def add_trigger(agent, key, description, once=False, not_before=None):
 
 # --- Forgejo --------------------------------------------------------------------
 
+# At most this many requests to Forgejo at once, from all of the dispatcher's
+# threads: when Forgejo slows down, the rest wait here instead of piling more
+# work onto it.
+FORGE_SLOTS = threading.BoundedSemaphore(int(os.environ.get("FORGE_CONCURRENCY", "8")))
+
+
 def forge(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(FORGE + "/api/v1" + path, method=method, data=data, headers={
         "Authorization": f"token {secret('token')}", "Accept": "application/json",
         **({"Content-Type": "application/json"} if data else {})})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with FORGE_SLOTS, urllib.request.urlopen(req, timeout=30) as r:
         raw = r.read()
         return json.loads(raw) if raw.strip() else None
 
@@ -332,16 +338,33 @@ def when(stamp):
     return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
 
 
+MAX_PAGES = 200
+
+
 def forge_all(path):
-    """Every page of a list."""
+    """Every page of a list. Forgejo ignores `page` on some lists, issue
+    comments among them (forge_comments), and serves the same page again:
+    that ends the list rather than looping on it (inkproof-demo#2, at 50
+    comments, took the dispatcher to 82 GiB)."""
     sep = "&" if "?" in path else "?"
-    out, page = [], 1
+    out, page, last = [], 1, None
     while True:
         batch = forge("GET", f"{path}{sep}limit=50&page={page}") or []
+        if page > 1 and batch == last:
+            log(f"{path} ignores paging: served page 1 again as page {page}")
+            return out
         out += batch
         if len(batch) < 50:
             return out
-        page += 1
+        if page >= MAX_PAGES:
+            raise RuntimeError(f"{path} has more than {MAX_PAGES} pages")
+        last, page = batch, page + 1
+
+
+def forge_comments(repo, n):
+    """Every comment on an issue or pull request. Forgejo serves them all in
+    one response, with no paging."""
+    return forge("GET", f"/repos/{ORG}/{repo}/issues/{n}/comments") or []
 
 
 _cache = {}
@@ -507,7 +530,7 @@ def refuse_needs_human(repo, n, item, sender):
     if sender in (HUMAN, "dispatcher"):
         return False
     texts = [item.get("body") or ""] + [c.get("body") or ""
-                                        for c in forge_list(f"/repos/{ORG}/{repo}/issues/{n}/comments")]
+                                        for c in forge_comments(repo, n)]
     best = min((missing_sections(t) for t in texts), key=len)
     if not best:
         return False
@@ -574,7 +597,7 @@ def check_unverified_stalls(repo):
             continue
         n = issue["number"]
         released = [(c, RELEASED.search(c.get("body") or "")) for c in
-                    forge_all(f"/repos/{ORG}/{repo}/issues/{n}/comments")
+                    forge_comments(repo, n)
                     if login(c) in ("gatekeeper", HUMAN, OWNER_OF.get(repo))]
         released = [(c, m) for c, m in released if m]
         if not released:
@@ -826,7 +849,7 @@ def blocker_state(repo, n):
     """When an issue stopped blocking (closed, or released) and why, and for
     an open upstream issue, the human's latest comment on it."""
     issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
-    comments = forge_all(f"/repos/{ORG}/{repo}/issues/{n}/comments")
+    comments = forge_comments(repo, n)
     labels = {l["name"] for l in issue.get("labels") or []}
     s = {"done": None, "what": None, "human": None}
     if issue.get("state") == "closed":
@@ -1660,6 +1683,10 @@ def idler():
     while True:
         time.sleep(60)
         try:
+            abandon_unstarted()
+        except Exception as e:
+            log(f"closing unstarted runs failed: {e!r}")
+        try:
             check_idle()
         except Exception as e:
             log(f"checking for idleness failed: {e!r}")
@@ -1708,6 +1735,24 @@ def capped(agent):
 
 def human_active(agent):
     return now() - float(kv_get(f"human:{agent}", 0)) < 90
+
+
+# An idle runner asks for work every RUNNER_TICK_SECONDS (15): one silent this
+# long can't take the work queued for it.
+RUNNER_SILENT = 180
+
+
+def runner_seen(agent):
+    """Record that the agent's runner called in, at most every 30 seconds."""
+    if now() - float(kv_get(f"seen:{agent}", 0)) >= 30:
+        kv_set(f"seen:{agent}", now())
+
+
+def runner_silent_for(agent):
+    """How long since the agent's runner last called in, or None if it has
+    called lately or never has (since the dispatcher started recording)."""
+    seen = float(kv_get(f"seen:{agent}", 0))
+    return now() - seen if seen and now() - seen > RUNNER_SILENT else None
 
 
 def agent_state(agent):
@@ -1785,6 +1830,26 @@ def requeue(run_id):
     """The run's work is still to do, through no fault of the run (the runner
     restarted, or the kit was paused under it): queue it again as it was."""
     q("UPDATE triggers SET run_id=NULL WHERE run_id=?", run_id)
+
+
+# A claimed run whose runner hasn't reported its start by then never will: the
+# runner clones new repositories (up to ten minutes) before it starts one.
+CLAIM_START = int(os.environ.get("CLAIM_START_SECONDS", "900"))
+
+
+def undo_claim(run_id, why):
+    """A claim no runner will start: close it unstarted, and queue its work
+    again as it was, since while it is open the agent gets no other run."""
+    q("UPDATE runs SET ended=?, outcome=? WHERE id=? AND started IS NULL AND ended IS NULL",
+      now(), f"never started: {why}", run_id)
+    requeue(run_id)
+    log(f"run {run_id} never started ({why}); its work is queued again")
+
+
+def abandon_unstarted():
+    """Close the runs claimed over CLAIM_START seconds ago that no runner started."""
+    for r in q("SELECT id FROM runs WHERE started IS NULL AND ended IS NULL AND claimed<?", now() - CLAIM_START):
+        undo_claim(r["id"], f"no runner started it within {CLAIM_START // 60} minutes of its claim")
 
 
 def retry(agent, run_id, outcome):
@@ -1876,10 +1941,24 @@ def status():
             "summary": kit_summary()}
 
 
+def span(seconds):
+    """A duration, as the human would say it."""
+    m = int(seconds // 60)
+    if m < 1:
+        return "under a minute"
+    if m < 120:
+        return f"{m} minute{'' if m == 1 else 's'}"
+    return f"{m // 60} hours"
+
+
+def clip_line(text, n):
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
 def kit_summary():
-    """One line: whether the kit will make progress by itself, or nothing
-    happens until the human acts. The same test as check_idle, without its
-    wait for quiet."""
+    """One line: whether the kit will make progress by itself, is stuck, or
+    nothing happens until the human acts, and what each agent is doing. The
+    same test as check_idle, without its wait for quiet."""
     try:
         waiting = waiting_on_human()
         ci = ci_running()
@@ -1889,20 +1968,40 @@ def kit_summary():
             if waiting else "nothing waits on you")
     if paused():
         return f"Kit: paused, nothing starts until scripts/resume.sh; {wait}"
-    running = [r["agent"] for r in q("SELECT agent FROM runs WHERE ended IS NULL ORDER BY id")]
-    queued = q("SELECT agent, not_before FROM triggers WHERE run_id IS NULL")
+    runs = q("SELECT id, agent, triggers, claimed, started FROM runs WHERE ended IS NULL ORDER BY id")
+    queued = q("SELECT id, agent, created, not_before FROM triggers WHERE run_id IS NULL")
     capped_agents = sorted({t["agent"] for t in queued if capped(t["agent"])})
     queued = [t for t in queued if t["agent"] not in capped_agents]
     later = [t for t in queued if t["not_before"] and t["not_before"] > now()]
     yours = [a for a in AGENTS if human_active(a)]
-    work = []
-    if running:
-        work.append(f"{len(running)} running ({', '.join(running)})")
-    if queued:
-        held = f", {len(later)} of them not yet due" if later else ""
-        work.append(f"{len(queued)} queued for {', '.join(sorted({t['agent'] for t in queued}))}{held}")
+    work, stuck = [], []
+    for r in runs:
+        if r["started"]:
+            triggers = json.loads(r["triggers"] or "[]")
+            more = f" (and {len(triggers) - 1} more)" if len(triggers) > 1 else ""
+            work.append(f"{r['agent']} running for {span(now() - r['started'])}: "
+                        f"{clip_line(triggers[0] if triggers else 'its work', 90)}{more}")
+        elif now() - r["claimed"] > 120:
+            stuck.append(f"{r['agent']}'s run {r['id']} was claimed {span(now() - r['claimed'])} ago and hasn't "
+                         f"started (closed by itself after {CLAIM_START // 60} minutes, or restart its container)")
+        else:
+            work.append(f"{r['agent']} starting a run")
+    later_ids = {t["id"] for t in later}
+    for agent in sorted({t["agent"] for t in queued}):
+        mine = [t for t in queued if t["agent"] == agent]
+        silent = runner_silent_for(agent) if any(t["id"] not in later_ids for t in mine) else None
+        if silent:
+            stuck.append(f"{len(mine)} queued for {agent}, whose runner hasn't called in for {span(silent)}: "
+                         f"restart its container")
+            continue
+        held = sum(t["id"] in later_ids for t in mine)
+        held = f", {held} not yet due" if held else ""
+        work.append(f"{len(mine)} queued for {agent}, the oldest for {span(now() - min(t['created'] for t in mine))}"
+                    f"{held}")
     if ci:
         work.append("CI running")
+    if stuck:
+        return f"Kit: stuck: {'; '.join(stuck)}" + (f"; also working: {', '.join(work)}" if work else "") + f"; {wait}"
     extra = []
     if capped_agents:
         extra.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
@@ -2094,11 +2193,19 @@ class Handler(BaseHTTPRequestHandler):
             agent = agent_for_key(self.bearer())
             if not agent or agent not in AGENTS:
                 return self.reply(403, {"error": "unknown runner key"})
+            runner_seen(agent)
             data = self.json_body()
             parts = self.path.strip("/").split("/")
             if self.path == "/claim":
                 c = claim(agent)
-                return self.reply(200, c) if c else self.reply(204, None)
+                if not c:
+                    return self.reply(204, None)
+                try:
+                    return self.reply(200, c)
+                except OSError as e:
+                    # The runner gave up waiting: no one will run it.
+                    undo_claim(c["run"], f"the claim's reply didn't reach the runner ({e!r})")
+                    return
             if self.path == "/heartbeat":
                 if data.get("human_active"):
                     kv_set(f"human:{agent}", now())

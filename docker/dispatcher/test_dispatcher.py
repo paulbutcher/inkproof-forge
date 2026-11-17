@@ -93,9 +93,12 @@ class Forge:
         if method != "GET":
             self.writes.append((method, path, body))
             return {}
+        repo, rest = re.fullmatch(r"/repos/org/([\w.-]+)/?(.*)", path).groups()
+        # Forgejo serves every comment at once, ignoring page and limit.
+        if m := re.fullmatch(r"issues/(\d+)/comments", rest):
+            return [e for e in self.items[(repo, int(m[1]))]["events"] if e["type"] == "comment"]
         if int(args.get("page", 1)) > 1:
             return []
-        repo, rest = re.fullmatch(r"/repos/org/([\w.-]+)/?(.*)", path).groups()
         if repo == "inkproof-tools":  # in agents.conf, not yet in Forgejo
             raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
         if rest == "":
@@ -106,8 +109,6 @@ class Forge:
             return self.items[(repo, int(m[1]))]["pr"]
         if m := re.fullmatch(r"issues/(\d+)/timeline", rest):
             return self.items[(repo, int(m[1]))]["events"]
-        if m := re.fullmatch(r"issues/(\d+)/comments", rest):
-            return [e for e in self.items[(repo, int(m[1]))]["events"] if e["type"] == "comment"]
         if m := re.fullmatch(r"pulls/(\d+)/reviews", rest):
             return self.items[(repo, int(m[1]))]["reviews"]
         if re.fullmatch(r"pulls/(\d+)/commits", rest):
@@ -978,6 +979,86 @@ class Mechanics(Case):
             d.handle("release", {"action": "published", "repository": {"name": SCALE, "owner": {"login": "org"}},
                                  "sender": {"login": by}, "release": {"tag_name": f"v1.0.{len(by)}"}})
         self.assertEqual(self.descriptions("coordinator"), [f"{SCALE} released v1.0.5"])
+
+
+class Paging(Case):
+    """inkproof-demo#2 reached 50 comments, and paging through them, which
+    Forgejo doesn't page, took the dispatcher to 82 GiB."""
+
+    def test_a_blocker_with_fifty_comments_or_more_is_read_once(self):
+        released = comment("gatekeeper", 10, "(no reply needed)\n\nReleased in v0.4.3: http://forge/r")
+        self.f.issue(SCALE, 38, "coordinator", ["request"],
+                     events=[comment("scale", 100 - k) for k in range(59)] + [released])
+        self.assertEqual(d.blocker_state(SCALE, 38)["what"], f"{SCALE}#38 was released in v0.4.3")
+
+    def test_a_list_that_ignores_paging_ends_at_its_first_page(self):
+        calls, page = [], [{"id": k} for k in range(50)]
+
+        def same_page(method, path, body=None):
+            calls.append(path)
+            return page
+        d.forge = same_page
+        self.assertEqual(d.forge_all("/repos/org/x/things"), page)
+        self.assertEqual(len(calls), 2)
+
+
+class UnstartedRuns(Case):
+    """A claim whose reply never reached the runner blocked the demo's runs
+    until its container restarted."""
+
+    def setUp(self):
+        super().setUp()
+        d.add_trigger("core", "work:1", "some work", once=True)
+        d.q("UPDATE triggers SET created=?", d.now() - 3600)
+        self.run = d.claim("core")["run"]
+
+    def test_an_undelivered_claim_gives_its_work_back(self):
+        d.undo_claim(self.run, "the reply didn't reach the runner")
+        self.assertEqual(self.queued("core"), ["work"])
+        self.assertIsNotNone(d.q("SELECT ended FROM runs WHERE id=?", self.run)[0]["ended"])
+        self.assertEqual(d.claim("core")["triggers"], ["some work"])
+
+    def test_a_claim_no_one_starts_is_closed_after_a_while(self):
+        d.abandon_unstarted()
+        self.assertEqual(self.queued("core"), [])
+        d.q("UPDATE runs SET claimed=? WHERE id=?", d.now() - d.CLAIM_START - 1, self.run)
+        d.abandon_unstarted()
+        self.assertEqual(self.queued("core"), ["work"])
+
+    def test_a_started_run_is_left_alone(self):
+        d.q("UPDATE runs SET claimed=?, started=? WHERE id=?", d.now() - d.CLAIM_START - 1, d.now(), self.run)
+        d.abandon_unstarted()
+        self.assertIsNone(d.q("SELECT ended FROM runs WHERE id=?", self.run)[0]["ended"])
+
+
+class Summary(Case):
+    def setUp(self):
+        super().setUp()
+        for name, value in (("waiting_on_human", lambda: 0), ("ci_running", lambda: False)):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+            setattr(d, name, value)
+
+    def test_says_what_each_run_is_for(self):
+        d.q("INSERT INTO runs (agent, triggers, claimed, started) VALUES ('core', ?, ?, ?)",
+            '["untriaged request inkproof-core#1", "comment on inkproof-core#2"]', d.now() - 600, d.now() - 600)
+        self.assertIn("core running for 10 minutes: untriaged request inkproof-core#1 (and 1 more)", d.kit_summary())
+
+    def test_a_runner_that_stopped_calling_in_is_stuck(self):
+        d.add_trigger("core", "work:1", "some work", once=True)
+        d.kv_set("seen:core", d.now() - 2400)
+        s = d.kit_summary()
+        self.assertTrue(s.startswith("Kit: stuck: 1 queued for core, whose runner hasn't called in for 40 minutes"), s)
+
+    def test_queued_work_says_how_long_it_has_waited(self):
+        d.add_trigger("core", "work:1", "some work", once=True)
+        d.runner_seen("core")
+        d.q("UPDATE triggers SET created=?", d.now() - 300)
+        self.assertIn("1 queued for core, the oldest for 5 minutes", d.kit_summary())
+
+    def test_a_claim_that_never_started_is_stuck(self):
+        d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?)", d.now() - 600)
+        self.assertIn("core's run", d.kit_summary())
+        self.assertTrue(d.kit_summary().startswith("Kit: stuck:"))
 
 
 class FailedRunsAreRetried(Case):

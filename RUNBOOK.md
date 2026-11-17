@@ -166,7 +166,8 @@ Open it with `scripts/open.sh coordinator`. It's the session named like "coordin
   It then shows your sessions, the notices, and the open requests, pull requests, recommendations and `needs-human` items across the project. It also shows whether the gatekeeper is running and its latest approvals.
 
   Its last line says whether the kit will make progress by itself:
-  - "Kit: working", with what's running, queued or in CI;
+  - "Kit: working", with what each run is for and how long it has run, how long queued work has waited, and CI;
+  - "Kit: stuck", with what can't move on by itself: queued work whose runner has stopped calling in (restart that agent's container: `docker compose restart <agent>`), or a run claimed but never started (closed by itself after 15 minutes, `CLAIM_START_SECONDS`, with its work queued again);
   - "Kit: quiet, nothing happens until you act", with what waits on you;
   - quiet with nothing waiting on you, in which case a stalled item or the coordinator's summary comes next.
 - **`scripts/activity.sh`** follows what's happening, one line per entry, in your time zone. It covers pushes, pull requests, reviews, labels, CI results and releases, with who did them; work queued and why; runs starting and ending, with outcome and cost; your sessions; and notices.
