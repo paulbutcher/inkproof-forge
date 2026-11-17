@@ -17,6 +17,8 @@
 # Before it: scripts/bootstrap.sh (the gatekeeper's team) and scripts/up.sh.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+confirm "This runs the stage 6 acceptance tests, which change Forgejo and the agents as they go"
+export KIT_YES=1
 fails=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }

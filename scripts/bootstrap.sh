@@ -5,6 +5,7 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 : "${HUMAN_USER:?set HUMAN_USER in $KIT_ENV}" "${HUMAN_EMAIL:?set HUMAN_EMAIL in $KIT_ENV}"
+confirm "This brings Forgejo's organisation, accounts, tokens, teams and webhook into line with the kit"
 
 fj() { docker compose exec -T forgejo forgejo "$@"; }
 

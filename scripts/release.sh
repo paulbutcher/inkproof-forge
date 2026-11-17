@@ -16,6 +16,7 @@ run=(docker compose run --rm --no-deps -T)
 if [ $# = 0 ]; then
   exec "${run[@]}" gatekeeper gatekeeper plan "$repo"
 fi
+confirm "This releases $repo"
 # The gatekeeper's code, with your token instead of its own.
 exec "${run[@]}" -e TOKEN_FILE=/run/secrets/human/token \
   -v "$(cd "$STATE_DIR" && pwd)/secrets/human:/run/secrets/human:ro" \

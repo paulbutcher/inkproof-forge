@@ -8,6 +8,11 @@
 # deleted at the first sync.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+if [ "${1:-}" = --rotate ]; then
+  confirm "This adds every missing push mirror to GitHub and replaces every mirror's token"
+else
+  confirm "This adds every missing push mirror to GitHub"
+fi
 docker compose run --rm tools mirrors "$@"
 sleep 5
 docker compose run --rm tools mirror-status

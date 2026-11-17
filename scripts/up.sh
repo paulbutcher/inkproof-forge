@@ -2,6 +2,7 @@
 # Build and start the forge, CI, proxies, dispatcher, gatekeeper and agents. Safe to re-run.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+confirm "This builds the kit's images and starts or recreates its containers, which can cut short runs under way"
 # Mounted into containers; must exist before Docker creates them as root.
 mkdir -p "$STATE_DIR/secrets/ci" "$STATE_DIR/secrets/dispatcher" "$STATE_DIR/secrets/gatekeeper" "$STATE_DIR/secrets/github" "$STATE_DIR/secrets/runner-keys" "$STATE_DIR/secrets/claude" "$STATE_DIR/control" "$STATE_DIR/backups" "$STATE_DIR/proxy"
 # Extra domains for Forgejo's proxy: empty except during scripts/migrate.sh.

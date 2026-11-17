@@ -4,6 +4,8 @@ How to set up and run the kit. [README.md](README.md) says what it is; [DESIGN.m
 
 You need Docker Desktop on a Mac. The scripts are bash 3.2-compatible: run them from the kit's folder as `scripts/<name>.sh`, or with `bash scripts/<name>.sh` if a copy has lost their executable bits. Every setting is in `.env`, described in [.env.example](.env.example). After changing one, rerun `scripts/up.sh`.
 
+A script that changes the kit (`up`, `down`, `pause`, `resume`, `stop-run`, `bootstrap`, `migrate`, `mirrors`, `new-library`, `setup-repo`, `milestone`, `release` when it releases, and the stage tests) first says what it will do and to which kit, the one on this Mac or the dev container's, and asks you to confirm. `KIT_YES=1` answers yes for you, for running one from another script; with no terminal to ask on and no `KIT_YES`, it stops having changed nothing. `restore.sh` keeps its own stronger check.
+
 ## First-time setup
 
 ### The forge
@@ -260,7 +262,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 
 ### Tests
 
-**Run the stage tests in the dev container only, never against the live kit.** They pause and resume the whole kit, file issues, open pull requests, start milestone reviews and attempt releases. Each tests one part of the kit:
+**Run the stage tests in the dev container only, never against the live kit.** They pause and resume the whole kit, file issues, open pull requests, start milestone reviews and attempt releases. Each asks once before it starts, naming the kit it would run against, so check that it says the dev container's. Each tests one part of the kit:
 
 | Test | Checks |
 | --- | --- |

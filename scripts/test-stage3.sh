@@ -17,6 +17,8 @@
 #   scripts/test-stage3.sh        KEEP=1 keeps the test's issues open
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+confirm "This runs the stage 3 acceptance tests, which change Forgejo and the agents as they go"
+export KIT_YES=1
 fails=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; fails=$((fails + 1)); }

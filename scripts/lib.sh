@@ -26,6 +26,28 @@ COMPOSE_ENV_FILES="$KIT_ENV"
 AGENTS_CONF_HASH="$(cksum < agents.conf | awk '{ print $1 }')"
 export KIT_ENV STATE_DIR COMPOSE_ENV_FILES AGENTS_CONF_HASH
 
+# Asks before a script changes the kit, naming which kit it would change:
+#   confirm "This pauses every agent"
+# KIT_YES=1 answers yes, for a script that runs others; without it, and with
+# no terminal to ask on, the script stops having changed nothing.
+confirm() {
+  local kit
+  case "$KIT_ENV" in
+    .env.devcontainer|*/.env.devcontainer) kit="the dev container's kit" ;;
+    .env|*/.env) kit="the kit on this Mac" ;;
+    *) kit="the kit configured by $KIT_ENV" ;;
+  esac
+  [ "${KIT_YES:-}" = 1 ] && return 0
+  [ -t 0 ] || { echo "$1, on $kit. Set KIT_YES=1 to go ahead without being asked." >&2; exit 1; }
+  printf '%s, on %s (%s). Go ahead? [y/N] ' "$1" "$kit" "$KIT_ENV" >&2
+  local answer
+  read -r answer
+  case "$answer" in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Nothing changed." >&2; exit 1 ;;
+  esac
+}
+
 # compose.yaml includes the agents' services, generated from agents.conf.
 # Rewritten only when it changes, so its timestamp means something.
 awk -f scripts/compose-agents.awk agents.conf docker/agent/compose.base.yaml agents.conf > compose.agents.yaml.new \

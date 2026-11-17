@@ -7,4 +7,5 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 [ $# = 2 ] || { echo "usage: scripts/setup-repo.sh <repository> <level 1-3>" >&2; exit 2; }
+confirm "This applies autonomy level $2's Forgejo settings to $1"
 docker compose run --rm tools setup-repo "$1" "$2"

@@ -5,6 +5,7 @@
 # Forgejo's proxy allows GitHub's API only while this runs.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+confirm "This imports agents.conf's repositories that Forgejo lacks from GitHub, opening Forgejo's proxy to GitHub's API meanwhile"
 extra="$STATE_DIR/proxy/domains.txt"
 
 reconfigure() { docker compose exec -T forge-proxy squid -k reconfigure; }

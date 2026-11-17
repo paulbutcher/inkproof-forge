@@ -44,7 +44,7 @@ docker run --rm --user 0 --network none --entrypoint restore-volumes \
   -v "${p}_run-archive:/restore/archive" -v "$b:/backup:ro" \
   inkproof-forge-tools /backup
 
-"$(dirname "$0")/up.sh"
+KIT_YES=1 "$(dirname "$0")/up.sh"
 docker compose exec -T forgejo forgejo admin regenerate hooks >/dev/null
 echo
 echo "Restored ${b##*/}. If tokens were made since that backup, scripts/bootstrap.sh makes them right."

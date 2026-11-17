@@ -4,5 +4,6 @@
 # merge into main. scripts/resume.sh undoes all of it.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+confirm "This pauses every agent, stops runs at their next tool call and cancels every scheduled merge"
 mkdir -p "$STATE_DIR/control"
 docker compose run --rm -T tools pause

@@ -5,4 +5,5 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 [ $# = 1 ] || { echo "usage: scripts/stop-run.sh <agent>" >&2; exit 2; }
+confirm "This interrupts $1's current run"
 docker compose exec -T "$1" agent-runner stop

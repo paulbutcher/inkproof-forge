@@ -9,5 +9,6 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 [ $# = 2 ] || { echo "usage: scripts/new-library.sh <repository> <Name>" >&2; exit 2; }
+confirm "This creates $1 in Forgejo, with a seed, and gives the agents' teams access to it"
 docker compose run --rm tools new-library "$1" "$2"
 docker compose run --rm tools bootstrap
