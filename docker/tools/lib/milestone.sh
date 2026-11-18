@@ -26,15 +26,19 @@ api_lock() {
 
 # Prints the diff in Markdown, and leaves the current refs in MILESTONE_REFS.
 milestone_diff() {
-  local prev r old new d
+  local prev r old new d was is
   prev="$(last_milestone_refs)"
   MILESTONE_REFS='{}'
+  was="$(mktemp)" is="$(mktemp)"
   for r in $(library_repos); do
     new="$(call 200 GET "/repos/$ORG/$r/branches/main" | jq -r .commit.id)"
     MILESTONE_REFS="$(jq -c --arg r "$r" --arg s "$new" '. + {($r): $s}' <<<"$MILESTONE_REFS")"
     old="$(jq -r --arg r "$r" '.[$r] // ""' <<<"$prev")"
-    d="$(diff -u --label "API.lock at ${old:0:12}" --label "API.lock at ${new:0:12}" \
-          <(api_lock "$r" "$old") <(api_lock "$r" "$new") || true)"
+    # One after the other: both fetches use $RESP, so side by side (as two
+    # process substitutions) each could read the other's response.
+    api_lock "$r" "$old" > "$was"
+    api_lock "$r" "$new" > "$is"
+    d="$(diff -u --label "API.lock at ${old:0:12}" --label "API.lock at ${new:0:12}" "$was" "$is" || true)"
     echo "### $r"
     echo
     if [ -z "$old" ]; then
@@ -75,7 +79,8 @@ $diff
 <!-- milestone-refs: $MILESTONE_REFS -->
 EOF
 )"
-  n="$(call 201 POST "/repos/$ORG/$COORDINATION/issues" "$(jq -nc --arg t "Milestone: $name" --arg b "$body" \
-    --argjson l "$(label_ids "$COORDINATION" milestone,milestone-review)" '{title: $t, body: $b, labels: $l}')" | jq -r .html_url)"
+  # The body goes to jq on its input, not as an argument, which is limited to 128 KiB.
+  n="$(call 201 POST "/repos/$ORG/$COORDINATION/issues" "$(printf '%s' "$body" | jq -Rsc --arg t "Milestone: $name" \
+    --argjson l "$(label_ids "$COORDINATION" milestone,milestone-review)" '{title: $t, body: ., labels: $l}')" | jq -r .html_url)"
   log "Opened $n; the reviews start shortly."
 }

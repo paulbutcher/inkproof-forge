@@ -7,6 +7,7 @@ ORG="${FORGE_ORG:?}"
 GH_OWNERS="$(echo ${GH_OWNER:?} ${GH_FORMER_OWNERS:-})"
 COORDINATION="${REPO_PREFIX:-inkproof-}coordination"
 RESP="$(mktemp)"
+REQ="$(mktemp)"
 CHANGES=0
 
 log() { printf '%s\n' "$*" >&2; }
@@ -24,7 +25,9 @@ api() {
   local method="$1" path="$2" body="${3:-}" auth
   if [ -n "${BASIC:-}" ]; then auth=(-u "$BASIC"); else auth=(-H "Authorization: token ${TOKEN:?}"); fi
   local args=(-sS -X "$method" "${auth[@]}" -H 'Accept: application/json' -o "$RESP" -w '%{http_code}')
-  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
+  # From a file: an argument is limited to 128 KiB, and a milestone issue's
+  # body, with every API.lock change in it, is larger.
+  [ -n "$body" ] && { printf '%s' "$body" > "$REQ"; args+=(-H 'Content-Type: application/json' --data-binary "@$REQ"); }
   curl "${args[@]}" "$FORGE_URL/api/v1$path"
 }
 
