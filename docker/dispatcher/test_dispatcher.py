@@ -60,10 +60,15 @@ class Forge:
 
     def __init__(self):
         self.items, self.statuses, self.mains, self.milestones, self.writes = {}, {}, {}, {}, []
-        self.codeowners = {}
+        self.codeowners, self.releases = {}, {}
 
-    def issue(self, repo, n, author, labels=(), state="open", body="", created=7200, events=(), closed=None):
-        self.items[(repo, n)] = {"number": n, "state": state, "user": {"login": author}, "body": body,
+    def release(self, repo, tag, ago, draft=False):
+        """Publish a release: the newest first, as Forgejo lists them."""
+        self.releases.setdefault(repo, []).insert(0, {"tag_name": tag, "published_at": at(ago), "draft": draft})
+
+    def issue(self, repo, n, author, labels=(), state="open", body="", created=7200, events=(), closed=None,
+              title="An issue"):
+        self.items[(repo, n)] = {"number": n, "state": state, "user": {"login": author}, "body": body, "title": title,
                                  "labels": [{"name": l} for l in labels], "created_at": at(created),
                                  "updated_at": at(0), "closed_at": at(closed) if closed is not None else None,
                                  "events": list(events), "reviews": [], "pr": None}
@@ -134,6 +139,8 @@ class Forge:
             if repo not in self.codeowners:
                 raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
             return {"content": base64.b64encode(self.codeowners[repo].encode()).decode()}
+        if rest == "releases":
+            return self.releases.get(repo, [])
         if rest == "milestones":
             return [m for m in self.milestones.get(repo, []) if args.get("state", "open") in ("all", m.get("state", "open"))]
         if rest == "labels":
@@ -736,6 +743,37 @@ class CoordinatorRules(Case):
                          [f"ready-for-release added to issue {CORE}#13. {BELOW_RELEASE}",
                           f"ready-for-release added to issue {SCALE}#13. {SCALE} is at level 3: CODEOWNERS on main "
                           "gives `API.lock` to you, so you release it with `forge release`"])
+
+    def test_27_a_release_overtakes_its_decision_gpu_27(self):
+        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000,
+                     events=[label("needs-human", True, 5000, "coordinator"), comment("human", 100, "Go ahead")])
+        self.f.release(CORE, "v0.6.0", 9000)  # before the decision
+        d.evaluate(CORE, 27)
+        self.assertNotIn("overtaken", self.queued("coordinator"))
+        self.f.release(CORE, "v0.6.1", 3000)
+        self.f.release(CORE, "v0.6.2", 2000, draft=True)
+        d._cache.clear()
+        d.evaluate(CORE, 27)
+        self.assertEqual([x for x in self.descriptions("coordinator") if "released" in x],
+                         [f"{CORE} released v0.6.1 after your decision {CORE}#27 asked the human to release it: "
+                          "close the decision if that release covers it, or update it for what's left"])
+
+    def test_27_not_once_it_has_looked_nor_on_other_issues(self):
+        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000,
+                     events=[comment("coordinator", 1000, "Updated for v0.6.2.")])
+        self.f.issue(CORE, 28, "coordinator", ["needs-human"], title="Release notes", created=5000)
+        self.f.issue(CORE, 29, "core", ["needs-human"], title=f"Release {CORE}", created=5000)
+        self.f.release(CORE, "v0.6.1", 3000)
+        for n in (27, 28, 29):
+            d.evaluate(CORE, n)
+        self.assertNotIn("overtaken", self.queued("coordinator"))
+
+    def test_27_a_release_published_evaluates_the_decision(self):
+        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000)
+        self.f.release(CORE, "v0.6.1", 10)
+        d.handle("release", {"action": "published", "repository": {"name": CORE, "owner": {"login": "org"}},
+                             "sender": {"login": "gatekeeper"}, "release": {"tag_name": "v0.6.1"}})
+        self.assertEqual(self.queued("coordinator"), ["overtaken"])
 
     def test_16_needs_human_added_but_not_once_refused(self):
         self.f.issue(CORE, 4, "core", ["needs-human"], events=[label("needs-human", True, 100)])

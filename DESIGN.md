@@ -252,6 +252,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 - **(23)** No milestone on any repository with an open issue, so a milestone left open once its work is done doesn't hold it back. It fires once for the newest milestone that had work (by creation, so closing leftover or empty milestones doesn't fire it again), and not while the coordinator runs or has work queued, so that what comes next is always someone's work: the next milestone drafted, what it needs put to the human, or the project recorded as finished.
 - **(24)** An open milestone issue on which every milestone review has reported since `milestone-review` went on, if it hasn't commented since the last report.
 - **(18)** A release published by anyone but the gatekeeper and itself.
+- **(27)** An open `Release <repo>` decision it filed, when that library has published a release since it last acted there, whoever published it. A gatekeeper release can overtake one (18 doesn't fire for that), and the human's "go ahead" wakes the library's owner, not the coordinator.
 - **The idle summary.** The kit going quiet, once per quiet spell, with nothing stalled (see Stalls). Quiet means:
   - no run;
   - no queued work, except what a cap holds;

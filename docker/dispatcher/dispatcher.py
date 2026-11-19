@@ -389,6 +389,14 @@ def main_of(repo):
     return cached(("main", repo), 20, lambda: forge("GET", f"/repos/{ORG}/{repo}/branches/main")["commit"])
 
 
+def latest_release(repo):
+    """The newest published release (not a draft), or None."""
+    def read():
+        return next((r for r in forge("GET", f"/repos/{ORG}/{repo}/releases?limit=10") or []
+                     if not r.get("draft")), None)
+    return cached(("release", repo), 20, read)
+
+
 def ci_state(repo, sha):
     """success, failure, running or none: the commit statuses branch
     protection requires (contexts starting "checks"), as it sees them."""
@@ -691,6 +699,10 @@ def handle(event, payload):
         tag = (payload.get("release") or {}).get("tag_name", "")
         if COORDINATOR and trusted and sender not in ("gatekeeper", COORDINATOR):
             add_trigger(COORDINATOR, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
+        # And a `Release <repo>` decision it overtook (27).
+        _cache.pop(("release", repo), None)
+        if kv_get("rules-seeded"):
+            evaluate_labelled(repo, "needs-human")
         return
 
     if not kv_get("rules-seeded"):
@@ -741,7 +753,8 @@ Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(No
 RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci", "merged",
               "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
-              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention"}
+              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention",
+              "overtaken"}
 # Kinds whose state, when the rules first run on an existing ledger, was
 # already acted on under the old event-driven triggers, or only reports what
 # happened: recorded as handled rather than queued. The others are work still
@@ -1127,6 +1140,15 @@ def coordinator_rules(it):
                      "with `forge release`" if at_level_3(it.repo) else
                      f"{it.repo} is below level 3, so the human releases it: put the release to them as a decision")
             o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}:{ci}", f"{what}. {whose}"))
+    if it.open and not it.is_pr and it.author == c and it.issue.get("title") == f"Release {it.repo}":
+        # 27. Its `Release <repo>` decision, overtaken by a release published
+        #     since it last acted there: nothing else closes it (gpu#27, which
+        #     the gatekeeper's release overtook, so 18 didn't fire).
+        rel = latest_release(it.repo)
+        if rel and when(rel["published_at"]) > max(when(it.issue["created_at"]), it.by(c)):
+            o.append(Owed(c, f"overtaken:{at}:{rel['tag_name']}",
+                          f"{it.repo} released {rel['tag_name']} after your decision {at} asked the human to "
+                          "release it: close the decision if that release covers it, or update it for what's left"))
     # 16. needs-human added or removed by someone else (not the kit), and it
     #     hasn't looked since. Not on a process or Lasm recommendation: those
     #     change the kit or go upstream, which is the human's, never its own
