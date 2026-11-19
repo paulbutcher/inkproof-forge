@@ -114,6 +114,17 @@ Once the mirror has pushed the seed, go to the repository's Settings on GitHub:
 
 The site's agent writes `scripts/build-site.sh`, which builds the site into `_site/`. CI runs it on every pull request, and each release tag deploys it to `https://<GH_OWNER>.github.io/<repository>/`. To deploy a tag again, run the `pages` workflow by hand from the repository's Actions tab on GitHub, choosing the tag.
 
+## Retiring an agent
+
+To retire a repository and its agent, as was done with `inkproof-demo`:
+
+1. In Forgejo, archive the repository (its Settings, Danger Zone). It stays readable, and nothing can change it.
+2. Remove the agent's line from `agents.conf`, remove its repository from other agents' dependencies, and delete `roles/<agent>.md`.
+3. `scripts/up.sh` regenerates the compose services and removes the agent's container. The dispatcher restarts without the agent, and the push mirror is left as it is.
+4. Delete `secrets/runner-keys/<agent>`, because the dispatcher still accepts any key in that folder, and `secrets/<agent>/`.
+5. In Forgejo's Site Administration, edit the agent's account and turn on "Disable sign-in". Don't delete the account: Forgejo would reattribute its issues and comments to Ghost.
+6. If nothing in the agent's workspace is still wanted, remove its volumes: `docker volume rm inkproof-forge_work-<agent> inkproof-forge_claude-<agent>`. Its runs stay in the run archive.
+
 ## Day to day
 
 ### Work starts itself
@@ -298,8 +309,6 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 ### Changing an allowlist
 
 The proxies' allowlists are in [docker/proxy/](docker/proxy/): `allow-agents.txt` for agents, `allow-ci.txt` for CI jobs and `allow-forge.txt` for Forgejo. Each is mounted into its proxy, and squid reads it only when it starts, so after editing one, restart that proxy: `docker compose restart proxy` (or `ci-proxy`, or `forge-proxy`). A restart cuts off downloads in progress, so pick a moment when no agent is fetching anything big. `scripts/test-stage1.sh` checks what each network can and can't reach; update it with the list.
-
-The agents' list includes the demo's seismic data. The demo agent keeps the downloads in its workspace volume, inside Docker Desktop's disk image. A year of 100 Hz recordings is about 2.7 GB per station-channel before tiles, so check that the disk image has room (Docker Desktop's Settings, Resources) before the demo fetches its full data set.
 
 ### Upgrading Playwright
 

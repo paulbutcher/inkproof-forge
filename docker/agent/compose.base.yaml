@@ -27,7 +27,7 @@ x-agent-env: &agent-env
   NO_PROXY: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
   no_proxy: forgejo,dispatcher,gatekeeper,localhost,127.0.0.1
   # Node's built-in fetch ignores the variables above unless asked, and the
-  # agents have no route out but the proxy (the demo's data fetch is in Node).
+  # agents have no route out but the proxy (repositories' scripts run in Node).
   NODE_USE_ENV_PROXY: "1"
   FORGE_ORG: ${FORGE_ORG}
   HUMAN_USER: ${HUMAN_USER}
