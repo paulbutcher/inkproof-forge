@@ -222,7 +222,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.
   - **(4)** A conflict with `main`.
   - **(5)** No merge scheduled, once the owner's run has ended (it is looked at again then). Or a merge scheduled that hasn't gone through `MERGE_STUCK_SECONDS` (default 10 minutes) after nothing stood in its way: CI passed on the head, there's no conflict and no request for changes standing, and everyone a review was requested from has approved the head.
-- **(6)** An open request it hasn't labelled `ready-for-release`, not blocked, that one of its pull requests, merged since the request was last unblocked, refers to with `Refs`.
+- **(6)** An open request it hasn't labelled `ready-for-release`, not blocked, that one of its pull requests, merged since the request was last unblocked, refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description).
 - **(7)** An accepted request that:
   - isn't blocked;
   - has no open pull request referring to it;
@@ -258,6 +258,8 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
   - the human active nowhere;
   - no CI;
   - nothing new for `IDLE_SECONDS` (default 20 minutes).
+
+  It comes only when the set of items waiting on the human differs from the set at the last idle summary. Otherwise it would say again what they already know, while releases and verifications in between keep ending one quiet spell and starting the next. When the project finishes, it comes once, since nothing waiting on them is a change.
 
   The run's last message, which the Claude extension lists in its container, tells the human what finished and what it needs from them.
 
@@ -328,7 +330,7 @@ Everything waiting on the human is in Forgejo's own dashboards: open issues and 
 
   A stalled request is a problem for the human to resolve or fix in the kit. No agent verifies another's request.
 - Below level 3, the coordinator puts each library's ready release to the human as a decision, `Release <repo>`, with the exact `scripts/release.sh` command.
-- The coordinator's idle summary says whether the project is waiting on the human, stalled or finished, and how many items wait on them. It comes only in a quiet spell in which no item was found stalled, so "stalled" there means a stall the kit's check can't see.
+- The coordinator's idle summary says whether the project is waiting on the human, stalled or finished, and how many items wait on them. It comes only in a quiet spell in which no item was found stalled, so "stalled" there means a stall the kit's check can't see. It also comes only when what waits on the human has changed since the last one.
 
 ## Notifications
 

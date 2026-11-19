@@ -431,6 +431,10 @@ def label_id(repo, name):
 
 
 REFS = re.compile(r"(?im)^\s*refs:?\s+(.+)$")
+# "Refs #2" in the middle of a line, as in "… not done yet. Refs #2." (demo#18):
+# only the references that follow it, not the rest of the line.
+_ONE_REF = r"(?:[\w.-]+/[\w.-]+)?#\d+"
+REFS_INLINE = re.compile(rf"(?i)(?<![\w/-])refs:?\s+({_ONE_REF}(?:(?:\s*,\s*|\s+and\s+|\s+){_ONE_REF})*)")
 REF = re.compile(r"(?:([\w.-]+)/([\w.-]+))?#(\d+)")
 # "Part of #2", as agents write it in titles and descriptions when they forget
 # the Refs line (demo#2).
@@ -446,7 +450,7 @@ def pr_refs(repo, pr):
                   for c in forge_all(f"/repos/{ORG}/{repo}/pulls/{pr['number']}/commits")]
         found = set()
         for text in texts:
-            for line in REFS.findall(text) + PART_OF.findall(text):
+            for line in REFS.findall(text) + REFS_INLINE.findall(text) + PART_OF.findall(text):
                 for org, r, k in REF.findall(line):
                     if (not org or (org.lower() == ORG.lower() and r == repo)) and int(k) != pr["number"]:
                         found.add(int(k))
@@ -580,9 +584,9 @@ def decision_issue(repo, key, kind, title, sections):
         log(f"couldn't open the decision {title!r} on {repo}: {e}")
 
 
-def waiting_on_human():
-    """How many open issues and pull requests wait on the human: assigned to
-    them, or requesting their review."""
+def waiting_for_human():
+    """The open issues and pull requests that wait on the human, as sorted
+    `repo#n`: assigned to them, or requesting their review."""
     found = set()
     for repo in OWNER_OF:
         for i in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&assigned_by={HUMAN}"):
@@ -590,7 +594,12 @@ def waiting_on_human():
         for p in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
             if HUMAN in {u["login"] for u in p.get("requested_reviewers") or []}:
                 found.add((repo, p["number"]))
-    return len(found)
+    return [f"{r}#{n}" for r, n in sorted(found)]
+
+
+def waiting_on_human():
+    """How many open issues and pull requests wait on the human."""
+    return len(waiting_for_human())
 
 
 def check_unverified_stalls(repo):
@@ -1698,7 +1707,14 @@ def check_idle():
     # Stalled work first: the summary waits for a quiet spell with none.
     if check_stalls():
         return
-    n = waiting_on_human()
+    # Only when what waits on the human has changed since the last summary:
+    # otherwise it says again what they already know (coordination#156).
+    items = waiting_for_human()
+    if kv_get("idle-waiting") == json.dumps(items):
+        log("quiet, and the same items wait on the human as at the last idle summary: no summary")
+        return
+    kv_set("idle-waiting", json.dumps(items))
+    n = len(items)
     waiting = f"{n} item{'' if n == 1 else 's'} wait{'s' if n == 1 else ''} on you" if n else "nothing waits on you"
     add_trigger(COORDINATOR, f"idle:{int(now())}", f"{IDLE_TRIGGER}; {waiting}")
 

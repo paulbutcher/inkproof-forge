@@ -452,6 +452,20 @@ class OwnerRules(Case):
         self.assertEqual(self.descriptions("core")[:1],
                          [f"your pull request {CORE}#28 merged; it answers {CORE}#2, not yet labelled ready-for-release"])
 
+    def test_6_refs_in_the_middle_of_a_line_demo_18(self):
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
+                     events=[label("accepted", True, 8000)])
+        self.f.pull(CORE, 18, "core", title="Browser app",
+                    body="Not done yet for #2: performance gates. Refs org/inkproof-core#2.",
+                    state="closed", merged=100)
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.descriptions("core")[:1],
+                         [f"your pull request {CORE}#18 merged; it answers {CORE}#2, not yet labelled ready-for-release"])
+        # Only the references after it, not everything else on the line.
+        found = [r for m in d.REFS_INLINE.findall("Done. Refs #2, #3 and org/x#4. Not #5; prefs #6") for r in
+                 d.REF.findall(m)]
+        self.assertEqual([k for _, _, k in found], ["2", "3", "4"])
+
     def test_7_as_soon_as_the_run_that_left_it_ends_demo_2(self):
         # Its pull request merged as its run was ending: nothing else looks
         # at the request again until the sweep.
@@ -1066,6 +1080,40 @@ class UnstartedRuns(Case):
         d.q("UPDATE runs SET claimed=?, started=? WHERE id=?", d.now() - d.CLAIM_START - 1, d.now(), self.run)
         d.abandon_unstarted()
         self.assertIsNone(d.q("SELECT ended FROM runs WHERE id=?", self.run)[0]["ended"])
+
+
+class IdleSummary(Case):
+    """The coordinator's idle summary, once a quiet spell finds nothing stalled."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock, self.waiting = d.now(), ["inkproof-core#1"]
+        for name, value in (("now", lambda: self.clock), ("ci_running", lambda: False),
+                            ("check_stalls", lambda: 0), ("waiting_for_human", lambda: list(self.waiting))):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+            setattr(d, name, value)
+
+    def spell(self):
+        """Something happens, then a quiet spell: whether it brought a summary."""
+        self.clock += 60
+        d.add_trigger("core", f"work:{self.clock}", "some work", once=True)
+        self.handled()
+        self.clock += d.IDLE + 60
+        d.check_idle()
+        found = [r["description"] for r in d.q("SELECT description FROM triggers WHERE run_id IS NULL")]
+        self.handled()
+        return found
+
+    def test_only_when_what_waits_on_the_human_changed_coordination_156(self):
+        self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; 1 item waits on you"])
+        # Releases and verifications in between, but the same item waits.
+        self.assertEqual(self.spell(), [])
+        self.waiting = ["inkproof-core#1", "inkproof-scale#4"]
+        self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; 2 items wait on you"])
+        # Finished, with nothing waiting: said once.
+        self.waiting = []
+        self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; nothing waits on you"])
+        self.assertEqual(self.spell(), [])
 
 
 class Summary(Case):
