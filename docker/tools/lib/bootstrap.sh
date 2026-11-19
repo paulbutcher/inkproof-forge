@@ -167,7 +167,7 @@ cmd_bootstrap() {
     local r_list
     mapfile -t r_list < <(expand_reads "$reads" "$own")
     case "$kind" in
-      library)
+      library|site)
         ensure_token "$name" "$SCOPES_WRITE"
         ensure_team "$name-own" "$U_OWN" "$name" "$own"
         # Every library reads every repository, to reuse before it builds

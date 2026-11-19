@@ -1,14 +1,16 @@
 # kit new-library REPO NAME: create a library's repository in Forgejo and
 # commit its seed to main, as the human: a Lake package for Inkproof.NAME, with
 # a test package, that builds and passes CI. REPO must be a library's own
-# repository in agents.conf.
+# repository in agents.conf, or a site's.
 #
 # The seed is templates/library/ with REPO, NAME and the source library's
 # copyright header filled in, and from the source library's main (SEED_FROM,
 # default inkproof-core), the files every library shares: CLAUDE.md, LICENSE,
 # .gitignore and lean-toolchain, and the Lake manifests' format. It also has
 # the CI workflow, check-pins.sh and the request template from templates/repo/,
-# exactly as scripts/setup-repo.sh would add them.
+# exactly as scripts/setup-repo.sh would add them, and for a site, its Pages
+# workflow from templates/site/ (it deploys only release tags, so the seed
+# needs no site yet).
 #
 # Safe to re-run: a repository already seeded is left alone, and an empty one
 # (from a run that stopped part way) is seeded. One with other content is
@@ -21,8 +23,8 @@ cmd_new_library() {
   local repo="${1:-}" name="${2:-}" src lib header ops
   [ -n "$repo" ] && [ -n "$name" ] || die "usage: new-library <repository> <Name>, e.g. new-library inkproof-float Float"
   [[ "$name" =~ ^[A-Z][A-Za-z0-9]*$ ]] || die "the name is a Lean namespace under Inkproof, such as Float"
-  grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf | awk -v r="$repo" '$2 == "library" && $3 == r { f = 1 } END { exit !f }' \
-    || die "$repo isn't a library's own repository in agents.conf; add its agent there first"
+  grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf | awk -v r="$repo" '($2 == "library" || $2 == "site") && $3 == r { f = 1 } END { exit !f }' \
+    || die "$repo isn't a library's or a site's own repository in agents.conf; add its agent there first"
   TOKEN="$(token_of human)"
   src="${SEED_FROM:-${REPO_PREFIX:-inkproof-}core}"
   lib="Inkproof$name"
@@ -64,6 +66,7 @@ cmd_new_library() {
   for f in .forgejo/workflows/checks.yml scripts/check-pins.sh .forgejo/issue_template/request.md; do
     add_op "$f" "$(cat "$REPO_TEMPLATES/$f")"
   done
+  is_site "$repo" && add_op "$SITE_WORKFLOW" "$(cat "/etc/kit/templates/site/$SITE_WORKFLOW")"
   for f in CLAUDE.md LICENSE .gitignore lean-toolchain; do
     text="$(src_file "$src" "$f")"
     add_op "$f" "$text"

@@ -1,0 +1,79 @@
+# Deploys the site to GitHub Pages from each release tag. This runs on GitHub,
+# not in the kit: the push mirror carries main and every tag there. It is
+# code-owned by the human, and scripts/setup-repo.sh checks it against the
+# kit's templates/site/, so the repository's agent can't change it.
+#
+# The repository's own scripts/build-site.sh builds the whole site into
+# _site/; the kit's CI runs it on every pull request too. Only the build job
+# runs the repository's code, and it can read the repository and nothing else.
+# The deploy job runs no repository code.
+#
+# Pages must be set to deploy from GitHub Actions, and the github-pages
+# environment must allow the v* tags (RUNBOOK.md, Adding a site). To deploy
+# again, run this workflow by hand on a release tag.
+name: pages
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # bash with -eo pipefail
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # The kit's CI image has Node 24.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Build the site
+        run: |
+          if [ ! -f scripts/build-site.sh ]; then
+            echo "::error::No scripts/build-site.sh: it builds the whole site into _site/"
+            exit 1
+          fi
+          bash scripts/build-site.sh
+          if [ ! -f _site/index.html ]; then
+            echo "::error::scripts/build-site.sh left no _site/index.html"
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -63,7 +63,7 @@ docker/proxy/           one allowlist each for agents, CI and Forgejo
 docker/ci/              CI runner and the image CI jobs run in
 docker/tools/           admin tools (bootstrap, setup, tests), run in a container rather than on the host
 roles/                  each agent's role
-templates/              what every repository needs, and the seed for a new library
+templates/              what every repository needs, the seed for a new library, and a site's Pages workflow
 scripts/                everything you run on the host
 launchd/                the notifier's and backups' launchd jobs
 ```

@@ -33,7 +33,7 @@ This happens once. Forgejo imports each repository in `agents.conf` with its his
 The repositories are under `GH_OWNER` on GitHub and in the organisation `FORGE_ORG` in Forgejo. `GH_FORMER_OWNERS` lists owners they used to live under, because old tags' lakefiles still name them.
 
 1. On GitHub, create a fine-grained token with resource owner `GH_OWNER`, the `inkproof-` repositories, and read-only Contents, Issues, Pull requests and Metadata. Save it as `secrets/github/import-token` (`chmod 600`).
-2. Create a second fine-grained token on the same repositories with Contents read and write and nothing else. Save it as `secrets/github/mirror-token` (`chmod 600`).
+2. Create a second fine-grained token on the same repositories with Contents and Workflows read and write and nothing else. Workflows is for a site's Pages workflow ([Adding a site](#adding-a-site)): GitHub refuses a push that changes `.github/workflows/` without it. Save it as `secrets/github/mirror-token` (`chmod 600`).
 3. `scripts/migrate.sh` imports whatever Forgejo doesn't have yet, then gives the agents' teams their repositories. Forgejo's proxy allows GitHub's API only while it runs. You can delete the import token afterwards.
 4. Decide what the mirrors carry. Forgejo mirrors exactly:
    - with `MIRROR_BRANCHES=main`, the default, the first sync deletes every other branch on GitHub (tags, `main` and closed pull requests' diffs are untouched);
@@ -62,9 +62,11 @@ Imported issues, pull requests and comments are posted by Ghost. Agents treat th
 - it checks the repository's own files against `templates/repo/`.
 
 Those files are code-owned by you, so where they differ it doesn't commit them. Instead it opens a pull request in your name and prints its link. The changes it can make:
-- it removes `.github/`, because Forgejo ignores GitHub's `CODEOWNERS` and would try to run GitHub's workflow;
+- it removes `.github/`, because Forgejo ignores GitHub's `CODEOWNERS` and would try to run GitHub's workflow. A site keeps `.github/workflows/pages.yml`, which it checks against `templates/site/`;
 - it adds `.forgejo/workflows/checks.yml`, `.forgejo/issue_template/request.md` and `scripts/check-pins.sh` from `templates/repo/`;
-- it generates `.forgejo/CODEOWNERS` for the level.
+- it generates `.forgejo/CODEOWNERS` for the level, which gives you `.forgejo/` and `.github/` at every level.
+
+When the kit's templates or code owners change, run it again on every repository, at the level each is already at, and merge the pull requests it opens.
 
 Review the pull request and merge it once CI passes. As an admin you can merge without an approval. Then run the script again: it reports the files right and exits 0. Until then it exits 3, which Docker Desktop reports with a hint about a "Compose error". There is no error.
 
@@ -96,6 +98,21 @@ A new library starts in Forgejo, not on GitHub: `scripts/new-library.sh` creates
    It then gives the teams the repository and creates its labels. It never seeds over a repository that has content.
 4. `scripts/mirrors.sh`, then `scripts/up.sh`, which starts the agent. Every agent clones the new repository before its next run.
 5. `scripts/setup-repo.sh <repository> <level>`, and merge its pull request.
+
+## Adding a site
+
+A site is a library whose release tags GitHub deploys to GitHub Pages, such as `inkproof-demos`. It is added as a library is, with these differences:
+
+- In step 1, the token must also have Workflows read and write. Changing an existing fine-grained token's permissions keeps its value; if you regenerate it, save the new one and run `scripts/mirrors.sh --rotate`.
+- In step 2, its line in `agents.conf` has kind `site`.
+- In step 3, `scripts/new-library.sh` also commits `.github/workflows/pages.yml` from `templates/site/`.
+
+Once the mirror has pushed the seed, go to the repository's Settings on GitHub:
+
+1. Under Pages, set Source to GitHub Actions. This creates the `github-pages` environment.
+2. Under Environments, `github-pages`, Deployment branches and tags, add a tag rule `v*`. Until then only `main` may deploy, and the workflow runs only on tags.
+
+The site's agent writes `scripts/build-site.sh`, which builds the site into `_site/`. CI runs it on every pull request, and each release tag deploys it to `https://<GH_OWNER>.github.io/<repository>/`. To deploy a tag again, run the `pages` workflow by hand from the repository's Actions tab on GitHub, choosing the tag.
 
 ## Day to day
 

@@ -78,6 +78,21 @@ jobs:
           if [ -f test/package-lock.json ] || [ -f app/package-lock.json ]; then export INKPROOF_REQUIRE_LASM=1; fi
           lake test
 
+      # A site's release tags are deployed to GitHub Pages by
+      # .github/workflows/pages.yml, which runs scripts/build-site.sh: build
+      # it here first, so a broken site never reaches a tag.
+      - name: Site builds
+        run: |
+          if [ -f scripts/build-site.sh ]; then
+            bash scripts/build-site.sh
+            if [ ! -f _site/index.html ]; then
+              echo "::error::scripts/build-site.sh left no _site/index.html"
+              exit 1
+            fi
+          else
+            echo "No scripts/build-site.sh; not a site."
+          fi
+
       - name: API lock is up to date
         run: |
           if [ -f scripts/api-lock.sh ]; then

@@ -46,7 +46,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
   Registration is disabled, and `scripts/bootstrap.sh` creates the kit's accounts and tokens.
 
   The GitHub account `inkproof-tentenths`, which the agents shared before the kit, is never used or recreated.
-- **Organisation and teams.** The repositories live in the Forgejo organisation `FORGE_ORG`. It can't be the human's username, because Forgejo users and organisations share one namespace. Each library agent and the coordinator get teams with per-unit access:
+- **Organisation and teams.** The repositories live in the Forgejo organisation `FORGE_ORG`. It can't be the human's username, because Forgejo users and organisations share one namespace. Each library agent and the coordinator get teams with per-unit access. A site's agent (kind `site`) is a library's in everything here and below; only its deployment differs ([Sites](#sites)).
   - **Its own repository:** Code, Issues and Pull requests write; Releases, Actions and Wiki read; Packages none.
   - **Its dependencies (all libraries, for the coordinator):** Code read, Issues write, Pull requests read. The coordinator's team has Pull requests write, so it can review and approve.
   - **Every repository, for each library agent:** Code, Issues and Pull requests read, so it can reuse before it builds. Forgejo lets anyone who can read a repository open an issue on it, so filing requests only on dependencies is the protocol's rule, not a permission.
@@ -55,7 +55,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
   - `architecture`, `process` and `lasm` have Code read everywhere, and Issues write on `inkproof-coordination` only.
 
   No reviewer can push.
-- **Agents never administer.** No agent account is a repository or organisation admin, so none can change branch protection, tag protection, webhooks, mirrors or workflow settings. `.forgejo/` and `CLAUDE.md` are code-owned by the human.
+- **Agents never administer.** No agent account is a repository or organisation admin, so none can change branch protection, tag protection, webhooks, mirrors or workflow settings. `.forgejo/`, `.github/` and `CLAUDE.md` are code-owned by the human.
 - **Trusted authors** are the kit's accounts and the human. Content migrated from GitHub is never trusted. Forgejo posts it as Ghost (user id -1) and keeps its GitHub author only in the database, because Forgejo 17's API leaves `original_author` empty. A migrated "Go ahead" from the human is therefore history, not a decision; decisions that still stand are recorded in the coordination repository. Comments from `dispatcher` and `gatekeeper` always mark themselves as needing no reply.
 - **Tokens.** There is one Forgejo token per account, in `secrets/<account>/token`, `chmod 600`. Each agent container mounts only its own, and the `dispatcher` and `gatekeeper` tokens are mounted only into those services.
 
@@ -71,8 +71,9 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 | No agent creates a tag or release | Protected tags `*`: the human, and at level 3 `gatekeeper`; Releases read-only for agent teams |
 | At level 3, releases only through the gatekeeper's computed version and `CHANGELOG.md` check | Only `gatekeeper` may push tags; its token is only in its container; it answers only the coordinator |
 | `API.lock` needs the human (levels 1, 2) or the coordinator (level 3) | `CODEOWNERS` plus "block on official review requests", with the code owner on the approvals list |
-| `.forgejo/`, `lean-toolchain`, `REQUIREMENTS.md`, `CLAUDE.md` need the human | `CODEOWNERS`, at every level |
+| `.forgejo/`, `.github/`, `lean-toolchain`, `REQUIREMENTS.md`, `CLAUDE.md` need the human | `CODEOWNERS`, at every level |
 | Agents can't weaken CI | Workflows in `.forgejo/workflows/` are code-owned by the human; CI jobs run in `ci-docker`, never the host's Docker |
+| No agent runs code on GitHub except a site's build | `.github/` is code-owned by the human, and `setup-repo.sh` removes it everywhere but a site's Pages workflow; that workflow gives the repository's code read access to its own contents and nothing else |
 | Every API change still reaches the human once | `scripts/milestone-diff.sh`, against Forgejo, in each milestone issue |
 | Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination`; none can push, and policy files are read-only to every agent |
 | Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers and names, never issue text |
@@ -421,7 +422,7 @@ Denying `curl` doesn't stop a repository's own scripts from downloading. The dem
 ## GitHub mirror
 
 - **Migration.** `scripts/migrate.sh` uses Forgejo's migration to import each repository from GitHub once, with history, issues, labels and pull requests, using a GitHub token of the human's own. Imported content is posted by Ghost.
-- **Mirrors.** After import, each repository push-mirrors to GitHub on every commit, with a credential of the human's own: contents write on the `inkproof-` repositories, and no machine user.
+- **Mirrors.** After import, each repository push-mirrors to GitHub on every commit, with a credential of the human's own: contents and workflows write on the `inkproof-` repositories, and no machine user. GitHub refuses a push that adds or changes a file in `.github/workflows/` without workflows write, and a site's Pages workflow is one.
   - Mirrors carry `main` (`MIRROR_BRANCHES`) and every tag. Issues and pull requests live only in Forgejo, which is why Forgejo itself is backed up.
   - Forgejo pushes with `git push --mirror`, so branches and tags on GitHub outside that set are deleted at the first sync. `refs/pull/*` is never pushed.
   - Git ignores Forgejo's `[proxy]` setting, so Forgejo's container sets the standard proxy variables for it.
@@ -430,6 +431,19 @@ Denying `curl` doesn't stop a repository's own scripts from downloading. The dem
   - There is one `url."http://forgejo:3000/<FORGE_ORG>/inkproof-".insteadOf` value for each GitHub owner the repositories have lived under (`GH_OWNER` and `GH_FORMER_OWNERS`), because old tags' lakefiles name the former owner.
   - The values are set in the root-owned system git config, and in CI, which reads the owners from the organisation's `DEPS_GITHUB_OWNERS` Actions variable.
   - Each value is scoped to `https://github.com/<owner>/inkproof-`. A rule for all of `https://github.com/` would send Mathlib, Batteries, Plausible and Lasm to Forgejo, where they don't exist.
+
+### Sites
+
+A site is an application whose pages are public: `inkproof-demos`. It has kind `site` in `agents.conf` and is otherwise a library, with the same accounts, teams, autonomy levels and releases. Each release tag is deployed to GitHub Pages.
+
+- **GitHub deploys, not the kit.** The mirror carries the tag to GitHub, where the site's `.github/workflows/pages.yml` builds and deploys it. Nothing in the kit gains a GitHub credential or an allowlist entry. Forgejo ignores the workflow, because it reads `.github/workflows/` only when `.forgejo/workflows/` doesn't exist.
+- **The deployment is a Pages artifact, not a branch.** Mirroring deletes any branch on GitHub that Forgejo doesn't have, so a `gh-pages` branch would be deleted at the next sync.
+- **The workflow is the human's, and the build is the agent's.** The workflow comes from `templates/site/`: `new-library.sh` seeds it and `setup-repo.sh` checks it, and `.github/` is code-owned by the human. It runs the repository's `scripts/build-site.sh`, which builds the whole site into `_site/`.
+  - Only the build job runs that script, with `contents: read` and nothing else.
+  - The deploy job, which holds `pages: write`, runs only GitHub's `deploy-pages` action.
+  - The repository's code therefore runs on GitHub's runners, but it can't push, tag or change settings there.
+- **CI builds the site first.** `checks.yml` runs `scripts/build-site.sh` wherever it exists, so a site that doesn't build fails its pull request rather than its deployment.
+- **Only tags deploy.** GitHub's `github-pages` environment allows only the default branch until the human adds `v*` (RUNBOOK.md, Adding a site), so each deployed page is a released version.
 
 ## Backups
 

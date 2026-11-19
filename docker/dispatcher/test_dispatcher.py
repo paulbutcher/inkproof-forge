@@ -18,6 +18,7 @@ with open(CONF, "w") as f:
             "core library inkproof-core inkproof-coordination\n"
             "scale library inkproof-scale inkproof-coordination,inkproof-core\n"
             "devtools library inkproof-tools inkproof-coordination\n"
+            "demos site inkproof-demos inkproof-coordination,inkproof-core\n"
             "conformance pr-reviewer - *\n"
             "architecture milestone-reviewer - *\n"
             "lasm milestone-reviewer - *\n")
@@ -189,6 +190,12 @@ class Case(unittest.TestCase):
 
 
 class OwnerRules(Case):
+    def test_1_a_site_owns_its_repository_as_a_library_does(self):
+        self.assertEqual(d.OWNER_OF["inkproof-demos"], "demos")
+        self.f.issue("inkproof-demos", 1, "core", ["request", "new"])
+        d.evaluate("inkproof-demos", 1)
+        self.assertEqual(self.descriptions("demos"), ["untriaged request inkproof-demos#1"])
+
     def test_1_an_untriaged_request_from_someone_else(self):
         self.f.issue(CORE, 1, "scale", ["request", "new"])
         self.f.issue(CORE, 2, "core", ["request", "new"])

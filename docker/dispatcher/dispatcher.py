@@ -137,7 +137,7 @@ def load_agents():
 AGENTS = load_agents()
 TRUSTED = set(AGENTS) | {"gatekeeper", "dispatcher", HUMAN}
 OWNER_OF = {a["own"]: name for name, a in AGENTS.items()
-            if a["own"] and a["kind"] in ("library", "coordinator")}
+            if a["own"] and a["kind"] in ("library", "site", "coordinator")}
 COORDINATOR = next((n for n, a in AGENTS.items() if a["kind"] == "coordinator"), None)
 COORDINATION = AGENTS[COORDINATOR]["own"] if COORDINATOR else f"{PREFIX}coordination"
 

@@ -17,11 +17,15 @@
 # only through the human's pull request): .forgejo/workflows/checks.yml,
 # .forgejo/CODEOWNERS, .forgejo/issue_template/request.md and
 # scripts/check-pins.sh, against templates/repo/; and that nothing is left in
-# .github/ from GitHub.
+# .github/ from GitHub, except, for a site (kind site in agents.conf), its
+# .github/workflows/pages.yml, checked against templates/site/.
 
 # conformance reviews every pull request: it is on every approvals list and a
 # code owner of every path. CONFORMANCE_REVIEW=false leaves it out.
 CONFORMANCE_REVIEW="${CONFORMANCE_REVIEW:-true}"
+
+# A site's Pages workflow, in its repository and in templates/site/.
+SITE_WORKFLOW=.github/workflows/pages.yml
 
 LABELS='[
   ["request", "0e8a16", "A capability another library or consumer needs"],
@@ -76,6 +80,12 @@ ensure_repo_settings() {
 # coordination repository holds documents only.
 has_ci() {
   [ "$1" != "$COORDINATION" ]
+}
+
+# is_site REPO: whether the repository is a site's own, whose release tags
+# GitHub deploys to Pages with the workflow in templates/site/.
+is_site() {
+  grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf | awk -v r="$1" '$2 == "site" && $3 == r { f = 1 } END { exit !f }'
 }
 
 # approvals list for a level, as a JSON array
@@ -160,6 +170,7 @@ codeowners() {
 .* $catchall$conf
 API\.lock $api
 \.forgejo/.* @$HUMAN_USER
+\.github/.* @$HUMAN_USER
 lean-toolchain @$HUMAN_USER
 CLAUDE\.md @$HUMAN_USER
 REQUIREMENTS\.md @$HUMAN_USER
@@ -169,11 +180,16 @@ EOF2
 # file_ops REPO REF LEVEL: the file operations, as a JSON array for Forgejo's
 # multi-file commit, that make REF's files right for LEVEL.
 file_ops() {
-  local repo="$1" ref="$2" level="$3" ops='[]' f want have op commit
+  local repo="$1" ref="$2" level="$3" ops='[]' f want have op commit keep=""
   local files=".forgejo/issue_template/request.md .forgejo/CODEOWNERS"
   has_ci "$repo" && files=".forgejo/workflows/checks.yml scripts/check-pins.sh $files"
+  is_site "$repo" && files="$files $SITE_WORKFLOW" keep="$SITE_WORKFLOW"
   for f in $files; do
-    if [ "$f" = .forgejo/CODEOWNERS ]; then want="$(codeowners "$level")"; else want="$(cat "/etc/kit/templates/repo/$f")"; fi
+    case "$f" in
+      .forgejo/CODEOWNERS) want="$(codeowners "$level")" ;;
+      "$SITE_WORKFLOW") want="$(cat "/etc/kit/templates/site/$f")" ;;
+      *) want="$(cat "/etc/kit/templates/repo/$f")" ;;
+    esac
     if [ "$(api GET "/repos/$ORG/$repo/contents/$f?ref=$ref")" = 200 ]; then
       have="$(jq -r '.content // ""' "$RESP" | base64 -d)"
       FILE_SHA="$(jq -r .sha "$RESP")"
@@ -186,15 +202,18 @@ file_ops() {
       '. + [{operation: $o, path: $p, content: $c} + (if $s == "" then {} else {sha: $s} end)]' <<<"$ops")"
   done
   # Everything left in .github/: Forgejo ignores its CODEOWNERS, and would run
-  # its workflow if .forgejo/workflows/ were missing. And the coordinator's
-  # retired NEEDS-HUMAN.md: what waits on the human is the issues assigned to
-  # them, and the pull requests that request their review.
+  # its workflow if .forgejo/workflows/ were missing. A site keeps its Pages
+  # workflow, which runs only on GitHub: Forgejo reads .github/workflows/ only
+  # when .forgejo/workflows/ doesn't exist. And the coordinator's retired
+  # NEEDS-HUMAN.md: what waits on the human is the issues assigned to them,
+  # and the pull requests that request their review.
   local retired=""
   [ "$repo" = "$COORDINATION" ] && retired="NEEDS-HUMAN.md"
   commit="$(call 200 GET "/repos/$ORG/$repo/branches/$ref" | jq -r .commit.id)"
   call 200 GET "/repos/$ORG/$repo/git/trees/$commit?recursive=true&per_page=10000" \
-    | jq -c --argjson ops "$ops" --arg r "$retired" '$ops + [.tree[] | select(.type == "blob" and (.path | startswith(".github/") or . == $r))
-                                           | {operation: "delete", path: .path, sha: .sha}]'
+    | jq -c --argjson ops "$ops" --arg r "$retired" --arg k "$keep" '$ops + [.tree[]
+        | select(.type == "blob" and ((.path | startswith(".github/")) and .path != $k or .path == $r))
+        | {operation: "delete", path: .path, sha: .sha}]'
 }
 
 # The human's pull request that makes the files right: opened if there's none,
