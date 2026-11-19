@@ -223,7 +223,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.
   - **(4)** A conflict with `main`.
   - **(5)** No merge scheduled, once the owner's run has ended (it is looked at again then). Or a merge scheduled that hasn't gone through `MERGE_STUCK_SECONDS` (default 10 minutes) after nothing stood in its way: CI passed on the head, there's no conflict and no request for changes standing, and everyone a review was requested from has approved the head.
-- **(6)** An open request it hasn't labelled `ready-for-release`, not blocked, that one of its pull requests, merged since the request was last unblocked, refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description).
+- **(6)** An open request it hasn't labelled `ready-for-release` or `verified`, not blocked, that one of its pull requests refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description). The pull request must have merged since the request was last unblocked, and, once the request has been released, since its last `Released in` comment. That covers a fix for what the requester found missing in a release, which nothing else would release again.
 - **(7)** An accepted request that:
   - isn't blocked;
   - has no open pull request referring to it;
@@ -245,7 +245,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 ### The coordinator, across the `inkproof-` repositories
 
 - **(12)** An open request filed by someone else.
-- **(13)** A pull request opened by someone else, open or merged. The trigger is held until CI finishes on the pull request, or for `PR_OPENED_HOLD_SECONDS` at most (default 10 minutes), so that a review requested from the coordinator shares the run.
+- **(13)** A pull request opened by another agent, open or merged, unless it changes only `CHANGELOG.md`, which the coordinator checks when it releases (15). The human's pull requests, such as `setup-repo.sh`'s, don't count. The changed files are read again at each evaluation, so a pull request that grows beyond `CHANGELOG.md` fires then. The trigger is held until CI finishes on the pull request, or for `PR_OPENED_HOLD_SECONDS` at most (default 10 minutes), so that a review requested from the coordinator shares the run.
 - **(14)** A pull request requesting its review, whose head passed CI and which it hasn't approved at that head. The trigger says whether the coordinator's is the review the pull request waits for: it is when CODEOWNERS on the repository's `main` gives `API.lock` to the coordinator (level 3), read from Forgejo, since a clone made before the setup pull request merged has no CODEOWNERS.
 - **(15)** An item labelled `ready-for-release`, once CI on `main` has finished and passed, that it hasn't commented on or labelled since the label went on, since `main` last changed, or since CI on `main` finished. The trigger says who releases the library, read from Forgejo as for (14): the coordinator at level 3, the human below it.
 - **(16)** `needs-human` added or removed by anyone but itself and the dispatcher, if it hasn't commented or labelled since. Not on a process or Lasm review's recommendation: those change the kit or go upstream, which is never within its remit.

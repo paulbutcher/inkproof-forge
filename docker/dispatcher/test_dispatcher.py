@@ -76,7 +76,8 @@ class Forge:
         return self.items[(repo, n)]
 
     def pull(self, repo, n, author, labels=(), sha="a" * 40, events=(), reviews=(), mergeable=True, title="Work",
-             body="", requested=(), merged=None, state="open", created=7200, ci="pending"):
+             body="", requested=(), merged=None, state="open", created=7200, ci="pending",
+             files=("Inkproof/Core.lean",)):
         i = self.issue(repo, n, author, labels, state, body, created, events)
         # A head CI has started on, as Forgejo marks it at once, unless a test
         # says otherwise: ci=None for a branch with no workflow.
@@ -87,6 +88,7 @@ class Forge:
                    "mergeable": mergeable, "title": title, "body": body, "created_at": at(created),
                    "merged": merged is not None, "merged_at": at(merged) if merged is not None else None,
                    "requested_reviewers": [{"login": r} for r in requested]}
+        i["files"] = list(files)
         return i
 
     def issue_json(self, i):
@@ -121,6 +123,8 @@ class Forge:
             return self.items[(repo, int(m[1]))]["reviews"]
         if re.fullmatch(r"pulls/(\d+)/commits", rest):
             return []
+        if m := re.fullmatch(r"pulls/(\d+)/files", rest):
+            return [{"filename": p} for p in self.items[(repo, int(m[1]))]["files"]]
         mine = [i for (r, _), i in self.items.items() if r == repo]
         if rest == "pulls":
             prs = [i["pr"] for i in mine if i["pr"]]
@@ -413,6 +417,19 @@ class OwnerRules(Case):
         d.evaluate(CORE, 6)
         self.assertEqual(self.queued("core"), [])
 
+    def test_6_work_merged_after_its_release_web_20(self):
+        # Its requester found it short of its criteria at the release, and the
+        # owner's fix merged afterwards: nothing else would release it again.
+        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
+                             comment("scale", 4000, "Not verified yet: the README names the wrong function.")])
+        self.f.pull(CORE, 7, "core", body="Refs #6", state="closed", merged=6000)  # the released work
+        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)
+        d.evaluate(CORE, 6)
+        self.assertIn(f"your pull request {CORE}#8 merged; it answers {CORE}#6, released in v0.2.0 and not yet "
+                      "verified, not yet labelled ready-for-release", self.descriptions("core"))
+        self.assertNotIn("idle-request", self.queued("core"))  # 7 still ends at the release
+
     def test_6_not_while_blocked_consumer_metrics_12(self):
         self.f.issue(SCALE, 38, "coordinator", ["request"])
         self.f.issue(CORE, 12, "coordinator", ["request", "accepted", "blocked"], body="Blocked-by: org/inkproof-scale#38")
@@ -651,6 +668,23 @@ class CoordinatorRules(Case):
         self.f.statuses["a" * 40] = ["success"]
         d.evaluate(CORE, 7)
         self.assertIsNone(d.q("SELECT not_before FROM triggers WHERE key LIKE 'pr-opened:%'")[0]["not_before"])
+
+    def test_13_not_for_the_humans_or_a_changelog_only_pull_request_coordination_171(self):
+        self.f.pull(CORE, 7, "human", title="Set up for autonomy level 3", files=(".forgejo/CODEOWNERS",))
+        self.f.pull(CORE, 8, "core", title="Changelog for 0.3.0", files=("CHANGELOG.md",))
+        self.f.pull(CORE, 9, "core", files=("CHANGELOG.md", "Inkproof/Core.lean"))
+        for n in (7, 8, 9):
+            self.f.statuses["a" * 40] = ["success"]
+            d.evaluate(CORE, n)
+        self.assertEqual(self.descriptions("coordinator"), [f"pull request opened: {CORE}#9"])
+
+    def test_13_a_changelog_only_pull_request_that_grows(self):
+        self.f.pull(CORE, 8, "core", files=("CHANGELOG.md",), ci="success")
+        d.evaluate(CORE, 8)
+        self.assertEqual(self.queued("coordinator"), [])
+        self.f.items[(CORE, 8)]["files"].append("Inkproof/Core.lean")
+        d.evaluate(CORE, 8)
+        self.assertEqual(self.queued("coordinator"), ["pr-opened"])
 
     def test_14_its_review_once_ci_passed_and_until_it_approves(self):
         self.f.pull(CORE, 7, "core", requested=["coordinator"], events=[event("pull_scheduled_merge", "core", 50)])

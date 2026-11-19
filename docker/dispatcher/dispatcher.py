@@ -782,6 +782,7 @@ class Item:
         self.kind = "pull request" if self.is_pr else "issue"
         self.at = f"{repo}#{n}"
         self._ci = None
+        self._files = None
 
     @property
     def head(self):
@@ -791,6 +792,12 @@ class Item:
         if self._ci is None:
             self._ci = ci_state(self.repo, self.head) if has_ci(self.repo) else "none"
         return self._ci
+
+    def files(self):
+        """The paths a pull request changes, read when a rule first asks."""
+        if self._files is None:
+            self._files = {f["filename"] for f in forge_all(f"/repos/{ORG}/{self.repo}/pulls/{self.n}/files")}
+        return self._files
 
     def comments(self):
         return [e for e in self.events if e.get("type") == "comment"]
@@ -1009,18 +1016,25 @@ def owner_rules(it, blocked, unblocked_at):
     # Blocked by its Blocked-by: lines, or (naming none) by the label.
     held = blocked if blocked is not None else "blocked" in it.labels
     released = it.released()
-    if request and not released:
-        # Since it was last unblocked (or accepted): earlier work was only part of it.
+    if request:
+        # Since it was last unblocked (or accepted): earlier work was only part
+        # of it. Once released, since its last release: work merged after that
+        # is what its requester found missing when they checked the release
+        # (web#20), and nothing else wakes anyone to release it.
         since = (unblocked_at and iso(unblocked_at)) or it.label_event("blocked", False) \
             or it.label_event("accepted") or it.issue["created_at"]
+        if released:
+            since = max(since, released[-1][0]["created_at"], key=when)
         merged = [(p, refs) for p, refs in owner_prs(it.repo, owner, "merged")
                   if it.n in refs and when(p["merged_at"]) > when(since)]
         # 6. Merged work it still has to finish: CHANGELOG.md and ready-for-release.
         if merged and not held:
             p = max(merged, key=lambda m: m[0]["merged_at"])[0]
             o.append(Owed(owner, f"merged:{at}:{p['number']}",
-                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
-                          "not yet labelled ready-for-release"))
+                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}"
+                          + (f", released in {released[-1][1]} and not yet verified" if released else "")
+                          + ", not yet labelled ready-for-release"))
+    if request and not released:
         # 7. Accepted, nothing in its way and nothing under way, while the
         #    owner has nothing to do: once each time it's unblocked, and once
         #    after each merge for it. Quiet, so it comes after the merge's own
@@ -1092,10 +1106,16 @@ def coordinator_rules(it):
     # 12. A request filed by someone else: check it's well formed and placed.
     if it.open and not it.is_pr and "request" in it.labels and it.author in TRUSTED and it.author != c:
         o.append(Owed(c, f"filed:{at}:", f"request filed: {at}"))
-    if it.is_pr and it.author in TRUSTED and it.author != c and (it.open or it.pr.get("merged")):
-        # 13. A pull request opened by someone else: check its scope. Held a
+    if (it.is_pr and it.author in TRUSTED and it.author not in (c, HUMAN) and (it.open or it.pr.get("merged"))
+            and it.files() != {"CHANGELOG.md"}):
+        # 13. A pull request opened by an agent: check its scope. Held a
         #     while, or until CI has finished, so that a review requested of
-        #     the coordinator (14) shares the run.
+        #     the coordinator (14) shares the run. Not the human's (setup
+        #     pull requests), nor one that changes only CHANGELOG.md, which
+        #     the coordinator checks when it releases (15). Its files are
+        #     read on every evaluation, and again when the trigger is
+        #     claimed, so one that grows beyond CHANGELOG.md wakes it then
+        #     (coordination#171).
         settled = not it.open or not has_ci(it.repo) or it.ci() in ("success", "failure")
         o.append(Owed(c, f"pr-opened:{at}:", f"pull request opened: {at}",
                       None if settled else when(it.pr["created_at"]) + OPENED_HOLD))
