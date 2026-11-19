@@ -1120,7 +1120,13 @@ def coordinator_rules(it):
             what = (f"ready-for-release added to {it.kind} {at}" if looked < when(labelled) else
                     f"{at} is still labelled ready-for-release, and main has changed or its CI has finished "
                     "since you last looked at it")
-            o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}:{ci}", what))
+            # Said outright, as for 14: the coordinator's own reading of
+            # CODEOWNERS went wrong (gpu#27, export#20: `grep API.lock`
+            # doesn't match the escaped `API\.lock`).
+            whose = (f"{it.repo} is at level 3: CODEOWNERS on main gives `API.lock` to you, so you release it "
+                     "with `forge release`" if at_level_3(it.repo) else
+                     f"{it.repo} is below level 3, so the human releases it: put the release to them as a decision")
+            o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}:{ci}", f"{what}. {whose}"))
     # 16. needs-human added or removed by someone else (not the kit), and it
     #     hasn't looked since. Not on a process or Lasm recommendation: those
     #     change the kit or go upstream, which is the human's, never its own

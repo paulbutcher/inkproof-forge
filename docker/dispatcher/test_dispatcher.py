@@ -27,6 +27,8 @@ os.environ.update(STATE_DIR=STATE, AGENTS_CONF=CONF, CONTROL_DIR=STATE, FORGE_OR
 import dispatcher as d  # noqa: E402
 
 CORE, SCALE, COORD = "inkproof-core", "inkproof-scale", "inkproof-coordination"
+# Rule 15's trigger for a repository without level 3's CODEOWNERS on main.
+BELOW_RELEASE = f"{CORE} is below level 3, so the human releases it: put the release to them as a decision"
 PAUSED = os.path.join(STATE, "paused")
 
 
@@ -682,7 +684,7 @@ class CoordinatorRules(Case):
         d.evaluate(CORE, 13)
         self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
                          [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has finished "
-                          "since you last looked at it"])
+                          f"since you last looked at it. {BELOW_RELEASE}"])
 
     def test_15_not_once_it_has_looked(self):
         self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
@@ -710,7 +712,7 @@ class CoordinatorRules(Case):
         d.evaluate(CORE, 13)
         self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
                          [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has "
-                          "finished since you last looked at it"])
+                          f"finished since you last looked at it. {BELOW_RELEASE}"])
 
     def test_15_not_while_mains_ci_runs(self):
         self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"],
@@ -722,7 +724,18 @@ class CoordinatorRules(Case):
         d._cache.clear()
         d.evaluate(CORE, 13)
         self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
-                         [f"ready-for-release added to issue {CORE}#13"])
+                         [f"ready-for-release added to issue {CORE}#13. {BELOW_RELEASE}"])
+
+    def test_15_says_who_releases_gpu_27(self):
+        self.f.codeowners[SCALE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
+        for repo, owner in ((SCALE, "scale"), (CORE, "core")):  # Core has no CODEOWNERS on main
+            self.f.issue(repo, 13, owner, ["request", "ready-for-release"],
+                         events=[label("ready-for-release", True, 400, owner)])
+            d.evaluate(repo, 13)
+        self.assertEqual(sorted(x for x in self.descriptions("coordinator") if "ready-for-release" in x),
+                         [f"ready-for-release added to issue {CORE}#13. {BELOW_RELEASE}",
+                          f"ready-for-release added to issue {SCALE}#13. {SCALE} is at level 3: CODEOWNERS on main "
+                          "gives `API.lock` to you, so you release it with `forge release`"])
 
     def test_16_needs_human_added_but_not_once_refused(self):
         self.f.issue(CORE, 4, "core", ["needs-human"], events=[label("needs-human", True, 100)])

@@ -246,7 +246,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 - **(12)** An open request filed by someone else.
 - **(13)** A pull request opened by someone else, open or merged. The trigger is held until CI finishes on the pull request, or for `PR_OPENED_HOLD_SECONDS` at most (default 10 minutes), so that a review requested from the coordinator shares the run.
 - **(14)** A pull request requesting its review, whose head passed CI and which it hasn't approved at that head. The trigger says whether the coordinator's is the review the pull request waits for: it is when CODEOWNERS on the repository's `main` gives `API.lock` to the coordinator (level 3), read from Forgejo, since a clone made before the setup pull request merged has no CODEOWNERS.
-- **(15)** An item labelled `ready-for-release`, once CI on `main` has finished and passed, that it hasn't commented on or labelled since the label went on, since `main` last changed, or since CI on `main` finished.
+- **(15)** An item labelled `ready-for-release`, once CI on `main` has finished and passed, that it hasn't commented on or labelled since the label went on, since `main` last changed, or since CI on `main` finished. The trigger says who releases the library, read from Forgejo as for (14): the coordinator at level 3, the human below it.
 - **(16)** `needs-human` added or removed by anyone but itself and the dispatcher, if it hasn't commented or labelled since. Not on a process or Lasm review's recommendation: those change the kit or go upstream, which is never within its remit.
 - **(17)** A milestone with closed issues and none open on any repository it spans (namesakes are matched by title), once per milestone rather than once per repository.
 - **(23)** No milestone on any repository with an open issue, so a milestone left open once its work is done doesn't hold it back. It fires once for the newest milestone that had work (by creation, so closing leftover or empty milestones doesn't fire it again), and not while the coordinator runs or has work queued, so that what comes next is always someone's work: the next milestone drafted, what it needs put to the human, or the project recorded as finished.
@@ -329,7 +329,7 @@ Everything waiting on the human is in Forgejo's own dashboards: open issues and 
   - an item still stalled after `STALL_ROUNDS` quiet spells.
 
   A stalled request is a problem for the human to resolve or fix in the kit. No agent verifies another's request.
-- Below level 3, the coordinator puts each library's ready release to the human as a decision, `Release <repo>`, with the exact `scripts/release.sh` command.
+- Below level 3, the coordinator puts each library's ready release to the human as a decision, `Release <repo>`, with the exact `scripts/release.sh` command for the human to run. Its "If you say go ahead" says only what the coordinator does: close it once the release is published. A "go ahead" comment releases nothing.
 - The coordinator's idle summary says whether the project is waiting on the human, stalled or finished, and how many items wait on them. It comes only in a quiet spell in which no item was found stalled, so "stalled" there means a stall the kit's check can't see. It also comes only when what waits on the human has changed since the last one.
 
 ## Notifications
