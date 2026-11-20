@@ -1438,5 +1438,36 @@ class Draining(Case):
         self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL"), [])
 
 
+class Priority(Case):
+    """Work labelled priority comes before anything new."""
+
+    def test_28_the_owner_is_woken_when_someone_else_makes_it_a_priority(self):
+        self.f.issue(CORE, 2, "scale", ["request", "accepted", "priority"],
+                     events=[label("priority", True, 100, who="human")])
+        self.f.issue(CORE, 3, "scale", ["request", "accepted", "priority"],
+                     events=[label("priority", True, 100, who="core")])  # its own doing
+        d.evaluate(CORE, 2)
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.descriptions("core"),
+                         [f"{CORE}#2 is now a priority: it comes before anything new (Protocol: Priority)"])
+
+    def test_a_runs_priority_work_comes_first(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        self.f.issue(CORE, 2, "scale", ["request", "new", "priority"])
+        self.f.issue(CORE, 3, "scale", ["request", "accepted", "priority"])  # nothing queued for it
+        self.f.issue(CORE, 4, "scale", ["request", "accepted", "priority"], state="closed")
+        self.addCleanup(setattr, d, "no_longer_owed", d.no_longer_owed)
+        d.no_longer_owed = lambda rows: []  # this test is about the order alone
+        d.add_trigger("core", f"comment:{CORE}#1:1", f"a comment on {CORE}#1")
+        d.add_trigger("core", f"request:{CORE}#2:1", f"untriaged request {CORE}#2")
+        d.add_trigger("core", "idle:1", "the kit is idle")
+        d.q("UPDATE triggers SET created=?", d.now() - 3600)
+        self.assertEqual(d.claim("core")["triggers"], [
+            f"priority: untriaged request {CORE}#2",
+            f"priority items open on your repository: {CORE}#3: they come before anything new (Protocol: Priority)",
+            f"a comment on {CORE}#1",
+            "the kit is idle"])
+
+
 if __name__ == "__main__":
     unittest.main()

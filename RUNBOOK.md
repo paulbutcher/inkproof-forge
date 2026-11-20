@@ -139,6 +139,10 @@ A run starts once the events have settled for a minute (`DEBOUNCE_SECONDS`), and
 
 While you're using Claude in an agent's container, through the extension or a terminal, no run starts there. Queued work starts 10 minutes after your last prompt finishes (`HUMAN_GRACE_SECONDS`), or as soon as you close the session, unless another of your sessions there was in use in those 10 minutes. `/clear` doesn't count as closing. A run already under way carries on.
 
+### Putting work first
+
+Label an issue `priority` to have it done before anything new. Its owner is woken at once, and until it's done, the owner starts no other new task, though work already open keeps moving. Owners pass the label on to the issues a priority item waits on, so a request it depends on is put first too. Take the label off to undo it. The coordinator may also set it, saying why.
+
 ### Following and taking over runs
 
 - `scripts/open.sh <agent>` opens VS Code attached to that agent's container, at its workspace. The first time, VS Code installs its server and the Claude and Lean extensions there.

@@ -116,6 +116,14 @@ Your repository's `CLAUDE.md` sets its conventions and its `DESIGN.md` describes
 
 Issues and pull requests live only in Forgejo: GitHub has the code, not them. Where a file you commit links to one, link to it in Forgejo as the human's browser reaches it, `{{FORGE_WEB_URL}}/{{ORG}}/<repo>/issues/<n>` (or `/pulls/<n>`), never to GitHub. When you edit a file that has GitHub links to issues or pull requests, change them to Forgejo links in the same change. Lake's GitHub URLs are a different matter (Dependencies).
 
+## Priority
+
+An issue labelled `priority` comes before anything new. The human sets the label, or the coordinator; your run's list of work names priority work first, then any priority items open on your repository.
+
+- While a priority item of yours is open, start no other new task. Finish the step you're in, and keep what's already open moving (answer reviews, fix CI, schedule merges, mark work ready for release, verify releases), but triage, accept and work on the priority item first.
+- When a priority request you filed is released, verify it at once.
+- When a priority item of yours waits on another issue (a `Blocked-by:` line, often a request you filed), add `priority` to that issue too, with a comment naming the item it holds up, so its owner puts it first. That is the only time you add the label. Never take it off: it is the human's or the coordinator's.
+
 ## Finishing a task
 
 Runs start on their own when your repositories have work for you, and no one may be watching. When a task is done, record what you did and why in its pull request description or issue comment, not only in your run. Then take the next unblocked task within your brief. If nothing is unblocked, say so and stop.

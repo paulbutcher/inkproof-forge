@@ -35,7 +35,8 @@ LABELS='[
   ["needs-human", "d93f0b", "Waiting for the human"],
   ["blocked", "b60205", "Waiting on another issue (Blocked-by: line)"],
   ["ready-for-release", "5319e7", "Merged and in CHANGELOG.md; waiting for a release"],
-  ["verified", "0e8a16", "The requester checked the release"]
+  ["verified", "0e8a16", "The requester checked the release"],
+  ["priority", "e11d21", "Before anything new: set by the human or the coordinator"]
 ]'
 COORD_LABELS='[
   ["upstream", "bfdadc", "A bug or limitation in a dependency outside this project"],

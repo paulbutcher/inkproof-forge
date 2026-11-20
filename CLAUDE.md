@@ -2,7 +2,7 @@
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) is the kit's specification: a change to what the kit does updates it in the same change. The dispatcher's rule numbers (`# 1.` to `# 27.`) match its Triggers section, so keep them in step.
+- [DESIGN.md](DESIGN.md) is the kit's specification: a change to what the kit does updates it in the same change. The dispatcher's rule numbers (`# 1.` to `# 28.`) match its Triggers section, so keep them in step.
 - [RUNBOOK.md](RUNBOOK.md) covers setting the kit up and running it; update it when a script's usage or a manual step changes.
 - [README.md](README.md) is for someone new to the project, finding the repository on GitHub. Keep it brief, and keep the detail in the other two.
 

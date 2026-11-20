@@ -971,6 +971,12 @@ def owner_rules(it, blocked, unblocked_at):
     o, owner, at = [], it.owner, it.at
     if not owner or not it.open:
         return o
+    # 28. Made a priority, by someone else: before anything new.
+    added = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == PRIORITY
+             and (e.get("body") or "") == "1"]
+    if not it.is_pr and PRIORITY in it.labels and added and login(added[-1]) != owner:
+        o.append(Owed(owner, f"priority:{at}:{added[-1]['created_at']}",
+                      f"{at} is now a priority: it comes before anything new (Protocol: Priority)"))
     # 1. An untriaged request from someone else.
     if (not it.is_pr and {"request", "new"} <= it.labels and it.author in TRUSTED and it.author != owner):
         since = it.label_event("new") or it.issue["created_at"]
@@ -1921,19 +1927,47 @@ def claim(agent):
         q(f"UPDATE triggers SET run_id=-1, key = key || ':stale:' || CAST(? AS INTEGER) "
           f"WHERE run_id IS NULL AND id IN ({','.join('?' * len(stale))})", now(), *stale)
         log(f"dropped {len(stale)} trigger(s) for {agent} that are no longer owed")
-    return due(agent, grant=True)
+    try:
+        prio = priorities(agent, [r["key"] for r in rows])
+    except Exception as e:
+        log(f"couldn't read {agent}'s priority items: {e!r}")
+        prio = (set(), [])
+    return due(agent, grant=True, prio=prio)
 
 
-def due(agent, grant=False):
+PRIORITY = "priority"
+TRIGGER_ITEM = re.compile(r"^[a-z-]+:([A-Za-z0-9_.-]+)#(\d+)(?::|$)")
+
+
+def priorities(agent, keys):
+    """Which of these triggers' items are labelled priority, and every open
+    issue labelled priority on the agent's own repository,
+    as `repo#n`."""
+    def labelled(repo, n):
+        issue = cached(("issue", repo, n), 20, lambda: forge("GET", f"/repos/{ORG}/{repo}/issues/{n}"))
+        return issue.get("state") == "open" and PRIORITY in {l["name"] for l in issue.get("labels") or []}
+    items = {(m[1], int(m[2])) for k in keys for m in [TRIGGER_ITEM.match(k)] if m}
+    hot = {f"{r}#{n}" for r, n in items if labelled(r, n)}
+    own = AGENTS[agent]["own"]
+    mine = []
+    if own and not forge_missing(own):
+        mine = [f"{own}#{i['number']}" for i in
+                forge_list(f"/repos/{ORG}/{own}/issues?state=open&type=all&labels={PRIORITY}")]
+    return hot, mine
+
+
+def due(agent, grant=False, prio=(set(), [])):
     """Whether the agent's work is due: no run, not paused, under its caps,
     and its newest trigger settled for DEBOUNCE (or its oldest waited
-    MAX_DELAY). With grant, the run is started and returned."""
+    MAX_DELAY). With grant, the run is started and returned, its priority
+    work first: prio is the triggers' items labelled priority, and the
+    priority items open on the agent's own repository."""
     with LOCK:
         if DB.execute("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", (agent,)).fetchone():
             return None
         if paused() or draining():
             return None
-        rows = DB.execute("SELECT id, description, created FROM triggers WHERE agent=? AND run_id IS NULL "
+        rows = DB.execute("SELECT id, key, description, created FROM triggers WHERE agent=? AND run_id IS NULL "
                           "AND (not_before IS NULL OR not_before<=?) ORDER BY created", (agent, now())).fetchall()
         if not rows:
             return None
@@ -1958,7 +1992,14 @@ def due(agent, grant=False):
             return None
         if not grant:
             return True
-        descs = list(dict.fromkeys(r["description"] for r in rows))
+        hot, mine = prio
+        first = [f"priority: {r['description']}" for r in rows if item_of(r["key"]) in hot]
+        rest = [r["description"] for r in rows if item_of(r["key"]) not in hot]
+        others = [m for m in mine if m not in hot]
+        if others:
+            first.append(f"priority items open on your repository: {', '.join(others)}: they come before "
+                         "anything new (Protocol: Priority)")
+        descs = list(dict.fromkeys(first + rest))
         cur = DB.execute("INSERT INTO runs (agent, triggers, claimed) VALUES (?,?,?)",
                          (agent, json.dumps(descs), t))
         run_id = cur.lastrowid
@@ -1966,6 +2007,12 @@ def due(agent, grant=False):
                    (run_id, *[r["id"] for r in rows]))
     log(f"{agent} claimed run {run_id}: {', '.join(descs)}")
     return {"run": run_id, "triggers": descs}
+
+
+def item_of(key):
+    """The `repo#n` a trigger's key names, if it names one."""
+    m = TRIGGER_ITEM.match(key)
+    return f"{m[1]}#{m[2]}" if m else None
 
 
 def requeue(run_id):

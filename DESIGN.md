@@ -148,7 +148,8 @@ With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0,
 
 ## Runs
 
-- **Hand-off.** The dispatcher queues triggers per agent. Each container's `agent-runner` claims a batch over HTTP with its runner key. The dispatcher grants a claim only when the agent has no run, is under its caps, and the kit is not paused. The runner reports the run's start and end, and the dispatcher records it.
+- **Hand-off.** The dispatcher queues triggers per agent. Each container's `agent-runner` claims a batch over HTTP with its runner key. The dispatcher grants a claim only when the agent has no run, is under its caps, and the kit is neither paused nor draining. The runner reports the run's start and end, and the dispatcher records it.
+- **Priority.** An issue labelled `priority` comes before anything new. The human sets the label, or the coordinator; an agent adds it only to an issue that holds up one of its own priority items. In a claimed batch, the triggers whose items are labelled `priority` come first, marked so, followed by a line naming any other open priority items on the agent's own repository. The protocol says what to do with them: keep what's open moving, but start nothing new before them.
   - A claim no runner will start would keep the agent from every other run, so it is closed unstarted and its work queued again as it was: at once if its reply doesn't reach the runner (which gave up waiting), and otherwise once it has gone unstarted for `CLAIM_START_SECONDS` (default 900, above the ten minutes the runner may spend cloning new repositories before it starts).
   - The dispatcher records when each runner last called in. Queued work for an agent with no run open, whose runner has been silent for three minutes (an idle runner calls in every 15 seconds; one running a run doesn't), and a claim unstarted for two, make the status line say "Kit: stuck".
   - At most `FORGE_CONCURRENCY` (default 8) of the dispatcher's requests to Forgejo run at once, so that a slow Forgejo isn't given more work. Lists are read page by page, except issue comments, which Forgejo serves all at once and doesn't page; a list that serves the same page again ends there.
@@ -244,6 +245,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   It fires again whenever the agent has acted on the request since, such as reporting progress on it, up to `FOLLOW_UP_RUNS` times (default 3) per unblocking or merge. So a run that works on a request and stops short, with nothing merged for it, is followed by another as soon as it ends, rather than waiting 20 minutes for the stall check. A run that looks and does nothing isn't followed up. Past the limit, the request waits for the stall check, which in time puts it to the human.
 - **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
+- **(28)** An open issue labelled `priority` by someone other than its owner, once each time the label goes on.
 
 The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is open and unreleased. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
 
