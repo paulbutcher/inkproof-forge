@@ -72,18 +72,17 @@ cp_days="$(in_core jq -r .cleanupPeriodDays /etc/claude-code/managed-settings.js
 echo "== Deny rules in an unattended run"
 out="$(docker compose exec -T -e INKPROOF_RUN=1 -w /workspace/inkproof-core core timeout 600 \
   claude -p --permission-mode dontAsk --output-format json --max-turns 12 \
-  "This is a test of your permission rules. Run each of these shell commands as a separate Bash call, exactly as written, even if you expect it to be refused, then list which ran: (1) git tag kit-deny-test (2) curl -sI https://example.com (3) tea api /user (4) git config user.name x (5) tea repos ls --limit 1. Do nothing else." \
+  "This is a test of your permission rules. Run each of these shell commands as a separate Bash call, exactly as written, even if you expect it to be refused, then list which ran: (1) curl -sI https://example.com (2) tea api /user (3) git config user.name x (4) tea repos ls --limit 1. Do nothing else." \
   2>/dev/null || true)"
 if [ -z "$out" ]; then
   fail "the unattended run produced no result (did it wait on a prompt?)"
 else
   denied="$(printf '%s' "$out" | jqt -r '[.permission_denials[]?.tool_input.command // empty] | join("\n")')"
-  for c in "git tag" "curl" "tea api" "git config"; do
+  for c in "curl" "tea api" "git config"; do
     printf '%s\n' "$denied" | grep -q "^$c" && pass "denied in dontAsk: $c" || fail "not denied in dontAsk: $c"
   done
   printf '%s\n' "$denied" | grep -q '^tea repos' && fail "tea repos was denied (a deny rule matches too much)" \
     || pass "tea repos was allowed (the tea r alias rule doesn't over-match)"
-  in_core git -C /workspace/inkproof-core tag -l kit-deny-test | grep -q . && fail "the tag was created" || pass "no tag was created"
 fi
 
 echo "== A trusted request starts a run"

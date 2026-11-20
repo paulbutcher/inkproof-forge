@@ -156,10 +156,14 @@ s7_check_merged() {
 
 # --- releases -------------------------------------------------------------------------
 s7_issue() {
-  local n
+  local n t
   n="$(as core call 201 POST "/repos/$ORG/$S7/issues" "$(jq -nc --argjson l "$(label_ids "$S7" request,ready-for-release)" \
     '{title: "Stage 7 test: theorems two and three", body: "(no reply needed)\n\nThe kit'"'"'s stage 7 test.", labels: $l}')" | jq -r .number)"
+  # A task core files for itself: not a request, so nobody verifies it.
+  t="$(as core call 201 POST "/repos/$ORG/$S7/issues" "$(jq -nc --argjson l "$(label_ids "$S7" ready-for-release)" \
+    '{title: "Stage 7 test: a task of its own", body: "(no reply needed)\n\nThe kit'"'"'s stage 7 test.", labels: $l}')" | jq -r .number)"
   echo "ISSUE $n"
+  echo "TASK $t"
 }
 
 s7_changelog() {
@@ -179,7 +183,7 @@ s7_changelog() {
 }
 
 s7_check_release() {
-  local tag="$1" issue="$2" by="$3" rel
+  local tag="$1" issue="$2" by="$3" task="${4:-}" rel
   rel="$(as human call 200,404 GET "/repos/$ORG/$S7/releases/tags/$tag")"
   if jq -e '.tag_name' <<<"$rel" >/dev/null 2>&1; then
     s7_pass "$tag is released by $(jq -r .author.login <<<"$rel")"
@@ -194,6 +198,12 @@ s7_check_release() {
       && s7_pass "the gatekeeper commented $tag on #$issue, needing no reply" || s7_fail "no release comment on #$issue"
     as human call 200 GET "/repos/$ORG/$S7/issues/$issue" | jq -e '[.labels[].name] | index("ready-for-release") | not' >/dev/null \
       && s7_pass "#$issue is no longer labelled ready-for-release" || s7_fail "#$issue is still labelled ready-for-release"
+    [ "$(as human call 200 GET "/repos/$ORG/$S7/issues/$issue" | jq -r .state)" = open ] \
+      && s7_pass "the request #$issue stays open for its requester to verify" || s7_fail "the request #$issue was closed"
+  fi
+  if [ -n "$task" ]; then
+    [ "$(as human call 200 GET "/repos/$ORG/$S7/issues/$task" | jq -r .state)" = closed ] \
+      && s7_pass "#$task, not a request, is closed by its release" || s7_fail "#$task, not a request, is still open"
   fi
   s7_done
 }
@@ -234,6 +244,6 @@ cmd_test_stage7() {
     human-tag) s7_human_tag ;;
     api-remove) s7_api_remove; s7_done ;;
     cleanup) s7_cleanup ;;
-    *) die "usage: test-stage7 scratch|api-pr|check-waits N|push N|check-merged N|issue|changelog V S|check-release TAG [ISSUE] BY|docs|human-tag|api-remove|cleanup" ;;
+    *) die "usage: test-stage7 scratch|api-pr|check-waits N|push N|check-merged N|issue|changelog V S|check-release TAG [ISSUE] BY [TASK]|docs|human-tag|api-remove|cleanup" ;;
   esac
 }

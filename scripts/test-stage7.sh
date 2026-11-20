@@ -4,7 +4,8 @@
 #     approval, and a new commit dismisses it;
 #   - the coordinator releases through the gatekeeper, which computes the
 #     version from API.lock's changes since the last tag and refuses without
-#     the matching CHANGELOG.md entry; versions before and after 1.0;
+#     the matching CHANGELOG.md entry; versions before and after 1.0; it
+#     comments the release on each issue, and closes one that isn't a request;
 #   - only the coordinator can ask: other agents can't reach the gatekeeper,
 #     and a wrong key is refused; nothing is released while paused, or for a
 #     library below level 3, whose releases are yours (scripts/release.sh);
@@ -121,14 +122,16 @@ phase check-merged "$pr"
 echo "== Releases at level 3"
 phase issue
 issue="$(key ISSUE)"
+task="$(key TASK)"
 expect_refusal "no entry for v0.2.0" "without a changelog entry, it's refused" coord_release "$S7" 'Theorems two and three.' "$issue"
 phase changelog 0.1.1 'Adds theorems two and three.'
 expect_refusal "no entry for v0.2.0" "with an entry for the wrong version, it's refused" coord_release "$S7" 'Theorems two and three.' "$issue"
 phase changelog 0.2.0 'Adds theorems two and three.'
-out="$(coord_release "$S7" 'Theorems two and three.' "$issue" 2>&1)" && pass "the coordinator released: $out" || fail "the coordinator's release: $out"
-phase check-release v0.2.0 "$issue" gatekeeper
+out="$(coord_release "$S7" 'Theorems two and three.' "$issue" "$task" 2>&1)" && pass "the coordinator released: $out" || fail "the coordinator's release: $out"
+phase check-release v0.2.0 "$issue" gatekeeper "$task"
 expect_refusal "nothing to release" "asking again releases nothing" coord_release "$S7" 'Again.'
 expect_refusal "isn't at autonomy level 3" "a library below level 3 isn't released" coord_release inkproof-core 'Not mine.'
+expect_refusal "did you mean $S7" "a short name is refused as no such repository, not as below level 3" coord_release scratch 'Short name.'
 
 echo "== Paused, then your own release"
 phase changelog 0.2.1 'Documents the changelog.'

@@ -4,6 +4,7 @@ scripts/test-dispatcher.sh, in the dispatcher's image.
 
 The rules' numbers are those in the dispatcher's Rules section."""
 import base64
+import json
 import os
 import re
 import tempfile
@@ -94,7 +95,7 @@ class Forge:
     def issue_json(self, i):
         j = {k: v for k, v in i.items() if k not in ("events", "reviews", "pr")}
         if i["pr"]:
-            j["pull_request"] = {}
+            j["pull_request"] = {"merged": i["pr"]["merged"], "merged_at": i["pr"]["merged_at"]}  # as Forgejo gives it
         return j
 
     def __call__(self, method, path, body=None):
@@ -408,6 +409,23 @@ class OwnerRules(Case):
         self.assertEqual(self.descriptions("core"),
                          [f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release"])
 
+    def test_6_an_owners_own_issue_demos_22(self):
+        # Not a request, but finished as one: nothing else wakes it to label it.
+        self.f.issue(CORE, 5, "core")
+        self.f.issue(CORE, 6, "core", ["ready-for-release"])
+        self.f.issue(CORE, 8, "scale")  # someone else's, untriaged: rule 1's
+        self.f.pull(CORE, 7, "core", body="Refs #5\nRefs #6\nRefs #8", state="closed", merged=100)
+        for n in (5, 6, 8):
+            d.evaluate(CORE, n)
+        self.assertIn(f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release",
+                      self.descriptions("core"))
+        self.assertEqual([k for k in self.queued("core") if k == "merged"], ["merged"])
+        # The coordinator's own issues are its decisions and records, never released.
+        self.f.issue(COORD, 3, "coordinator")
+        self.f.pull(COORD, 4, "coordinator", body="Refs #3", state="closed", merged=100)
+        d.evaluate(COORD, 3)
+        self.assertNotIn("merged", self.queued("coordinator"))
+
     def test_6_not_once_labelled_or_released(self):
         self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
         self.f.issue(CORE, 6, "scale", ["request", "accepted"],
@@ -577,6 +595,20 @@ class OwnerRules(Case):
         d.evaluate(CORE, 12)
         self.assertEqual(self.descriptions("core"),
                          [f"{SCALE}#38 was released in v0.5.3; {CORE}#12 is blocked on it"])
+
+    def test_8_a_line_may_name_a_pull_request_coordination_198(self):
+        # demos#19 waited for its owner's own pull request, which doesn't name it.
+        self.f.pull(CORE, 13, "core")
+        self.f.issue(CORE, 19, "scale", ["request", "accepted"],
+                     events=[comment("core", 7000, "Blocked-by: org/inkproof-core#13")])
+        d.evaluate(CORE, 19)
+        self.assertEqual(self.queued("core"), [])
+        self.assertIn(("POST", f"/repos/org/{CORE}/issues/19/labels", {"labels": [1]}), self.f.writes)
+        self.f.items[(CORE, 13)]["state"] = "closed"
+        self.f.items[(CORE, 13)]["pr"].update(state="closed", merged=True, merged_at=at(100))
+        self.f.items[(CORE, 19)]["labels"].append({"name": "blocked"})
+        d.evaluate(CORE, 19)
+        self.assertEqual(self.descriptions("core"), [f"pull request {CORE}#13 merged; {CORE}#19 is blocked on it"])
 
     def test_8_the_humans_comment_on_an_upstream_issue(self):
         self.f.issue(COORD, 9, "core", ["upstream"], events=[comment("human", 100, "Fixed in Lean 4.36.")])
@@ -1047,6 +1079,28 @@ class Stalls(Case):
         self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")],
                          ["stall", "stalled", "stall"])
 
+    def test_moved_on_between_checks_starts_again_demos_22(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        # Its owner only says what it will do, and the dispatcher's own labels
+        # are no progress: the count goes on.
+        self.f.items[(CORE, 1)]["events"] += [comment("core", 60, "I'll do it once #2 merges."),
+                                              label("blocked", False, 30, who="dispatcher")]
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual(json.loads(d.kv_get(f"stall:{CORE}#1"))[0], 2)
+        # A pull request referring to it opens and merges while the kit is busy,
+        # so no check sees it moving: still, it starts again from nothing.
+        self.f.items[(CORE, 1)]["events"].append(event("pull_ref", "core", 60))
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual(json.loads(d.kv_get(f"stall:{CORE}#1"))[0], 1)
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stall"])
+
+    def test_a_count_from_before_the_mark_carries_on(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"], events=[event("pull_ref", "core", 60)])
+        d.kv_set(f"stall:{CORE}#1", json.dumps([2, 1]))
+        self.assertEqual(self.spell(), (0, []))
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stalled"])
+
     def test_a_capped_agent_isnt_woken_or_counted(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])
         for _ in range(d.CAP):
@@ -1292,6 +1346,30 @@ class FailedRunsAreRetried(Case):
         posted = [w[2]["title"] for w in self.f.writes if w[1] == f"/repos/org/{CORE}/issues"]
         self.assertEqual(len(posted), 1)
         self.assertIn("failed 3 times", posted[0])
+
+    def test_a_run_that_never_got_going_waits_longer_and_isnt_counted_coordination_202(self):
+        proxy = {"outcome": "failed: ERR_PROXY_TUNNEL", "turns": 1, "cost": 0}
+        for delay in d.ENV_DELAYS + [d.ENV_DELAYS[-1]]:
+            d.end_run("core", self.claim(), proxy)
+            t = d.q("SELECT run_id, attempts, not_before FROM triggers WHERE key='work:1'")[0]
+            self.assertEqual((t["run_id"], t["attempts"]), (None, 0))
+            self.assertAlmostEqual(t["not_before"], d.now() + delay, delta=5)
+        self.assertEqual(d.runs_today("core"), 0)  # nor do they use up its day
+        # No decision for the human, and one notice however many fail.
+        self.assertFalse([w for w in self.f.writes if w[1].endswith("/issues")])
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices")], ["env-failing"])
+        # Once a run gets going, the delays start again, and so does the notice.
+        d.add_trigger("core", "work:2", "other work", once=True)
+        d.q("UPDATE triggers SET created=?, not_before=NULL", d.now() - 3600)
+        run = d.claim("core")["run"]
+        d.end_run("core", run, {"outcome": "completed", "turns": 30, "cost": 1.5})
+        self.assertIsNone(d.kv_get("env-failures:core"))
+        self.assertIsNone(d.kv_get("env-failing"))
+
+    def test_a_run_that_did_something_is_an_ordinary_failure(self):
+        d.end_run("core", self.claim(), {"outcome": "failed: error_during_execution", "turns": 1, "cost": 0.2})
+        self.assertEqual(d.q("SELECT attempts FROM triggers WHERE key='work:1'")[0]["attempts"], 1)
+        self.assertEqual(d.q("SELECT kind FROM notices"), [])
 
     def test_a_retry_keeps_its_delay_when_its_rule_queues_it_again(self):
         self.run_ending("failed: error_max_turns")

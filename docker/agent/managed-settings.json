@@ -26,7 +26,6 @@
       "Bash(git push --force-if-includes:*)",
       "Bash(git push --mirror:*)",
       "Bash(git push --tags:*)",
-      "Bash(git tag:*)",
       "Bash(git config:*)",
       "Bash(tea api:*)",
       "Bash(tea login:*)",

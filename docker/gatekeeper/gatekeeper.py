@@ -284,6 +284,12 @@ def release(repo, note, issues, by_human=False):
     raise Refused. by_human: the human's own release (scripts/release.sh), at
     any level and while paused."""
     with RELEASE_LOCK:
+        # First, so a short name such as `viewport` isn't refused as below
+        # level 3, which its missing CODEOWNERS would otherwise say (coordination#199).
+        if forge("GET", f"/repos/{ORG}/{repo}", ok=(404,))[0] == 404:
+            like = [r["name"] for r in pages(f"/orgs/{ORG}/repos") if r["name"].endswith(f"-{repo}")]
+            raise Refused(f"there is no repository {ORG}/{repo}"
+                          + (f": did you mean {' or '.join(like)}?" if like else ""))
         if not by_human:
             if PAUSED.exists():
                 raise Refused("the kit is paused: nothing is released until the human resumes it")
@@ -317,6 +323,10 @@ def release(repo, note, issues, by_human=False):
                   {"body": f"{NO_REPLY}\n\nReleased in {p['version']}: {url}"}, ok=(201,))
             forge("DELETE", f"/repos/{ORG}/{repo}/issues/{i['number']}/labels/"
                   f"{next(l['id'] for l in i['labels'] if l['name'] == 'ready-for-release')}", ok=(204,))
+            # An issue that isn't a request, such as an owner's task for
+            # itself, has no requester to verify it: the release ends it.
+            if "request" not in {l["name"] for l in i["labels"]}:
+                forge("PATCH", f"/repos/{ORG}/{repo}/issues/{i['number']}", {"state": "closed"}, ok=(201,))
         log(f"released {repo} {p['version']} at {p['sha'][:12]} ({'the human' if by_human else 'the coordinator'}): {p['reason']}")
         return {**p, "url": url, "issues": [i["number"] for i in found]}
 

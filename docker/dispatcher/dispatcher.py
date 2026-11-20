@@ -95,6 +95,11 @@ NO_CI = int(os.environ.get("CI_MISSING_SECONDS", "600"))
 # after RETRY_DELAY_SECONDS times the attempt; then it is the human's.
 RETRIES = int(os.environ.get("MAX_RUN_RETRIES", "2"))
 RETRY_DELAY = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))
+# A run that failed before it got going (a turn at most, nothing spent, no
+# change in Forgejo) failed for its environment: an outage, the proxy, the
+# API. It isn't counted against RETRIES; its work waits these delays in turn,
+# then the last one each time, until the agent's runs get going again.
+ENV_DELAYS = [int(s) for s in os.environ.get("ENV_RETRY_DELAYS", "300,900,3600").split(",")]
 # An accepted request its owner worked on and left unfinished, with nothing
 # merged for it, wakes the owner again when its run ends, at most this many
 # times since the last merge for it or its unblocking (7); after that, the
@@ -888,7 +893,11 @@ def blocker_state(repo, n):
     s = {"done": None, "what": None, "human": None}
     if issue.get("state") == "closed":
         s["done"] = issue.get("closed_at") or issue.get("updated_at")
-        s["what"] = f"{'upstream issue' if 'upstream' in labels else 'issue'} {repo}#{n} was closed"
+        if issue.get("pull_request") is not None:
+            merged = (issue["pull_request"] or {}).get("merged")
+            s["what"] = f"pull request {repo}#{n} {'merged' if merged else 'was closed'}"
+        else:
+            s["what"] = f"{'upstream issue' if 'upstream' in labels else 'issue'} {repo}#{n} was closed"
         return s
     for c in comments:
         m = RELEASED.search(c.get("body") or "")
@@ -1013,10 +1022,14 @@ def owner_rules(it, blocked, unblocked_at):
                           f"your pull request {at} has every approval it needs and CI passed, but its scheduled "
                           f"merge hasn't gone through: merge it now (`forge pr merge {it.n}`)"))
     request = not it.is_pr and "request" in it.labels and not it.labels & {"ready-for-release", "verified"}
+    # An issue a library's (or site's) owner filed for itself: finished as a
+    # request is, through ready-for-release, and its release closes it (demos#22).
+    task = (not it.is_pr and it.author == owner and AGENTS[owner]["kind"] != "coordinator"
+            and not it.labels & {"request", "ready-for-release", "verified", "upstream", "needs-human"})
     # Blocked by its Blocked-by: lines, or (naming none) by the label.
     held = blocked if blocked is not None else "blocked" in it.labels
     released = it.released()
-    if request:
+    if request or task:
         # Since it was last unblocked (or accepted): earlier work was only part
         # of it. Once released, since its last release: work merged after that
         # is what its requester found missing when they checked the release
@@ -1632,6 +1645,15 @@ def stall_owners(it, blocked):
     return [(it.owner, "nothing is moving it on")]
 
 
+def moved_at(it):
+    """When anyone but the dispatcher last moved an item on: anything in its
+    timeline but a comment, such as a pull request or commit referring to it,
+    a label, a review or a push. A comment alone doesn't count, so an agent
+    that only says what it will do still reaches the human."""
+    return max([when(e["created_at"]) for e in it.events
+                if e.get("type") != "comment" and login(e) != "dispatcher"] or [0])
+
+
 def check_stalls():
     """Wake whoever should move on each open item that waits for nothing the
     kit can see; after STALL_ROUNDS quiet spells, ask the human instead.
@@ -1657,7 +1679,13 @@ def check_stalls():
     queued = 0
     for (repo, n), (it, owners) in stalled.items():
         key = f"stall:{repo}#{n}"
-        rounds, first = json.loads(kv_get(key, "[0, 0]"))
+        rounds, first, mark = (json.loads(kv_get(key, "[0, 0]")) + [None])[:3]
+        moved = moved_at(it)
+        # Moved on since the last wake, if only between two checks (a pull
+        # request opened and merged while the kit was busy): it starts again
+        # from nothing, a gap of its own (demos#22).
+        if mark is not None and moved > mark:
+            rounds, first = 0, 0
         if rounds >= STALL_ROUNDS:
             names = ", ".join(sorted({a for a, _ in owners}))
             decision_issue(COORDINATION, f"stalled-item:{repo}#{n}:{first}", "stalled",
@@ -1685,7 +1713,7 @@ def check_stalls():
             queued += 1
             woke = True
         if woke:
-            kv_set(key, json.dumps([rounds + 1, first or spell]))
+            kv_set(key, json.dumps([rounds + 1, first or spell, moved]))
             # No rule woke anyone for it, so the rules have a gap: the human
             # hears of each one, once, and the process review looks into it.
             names = ", ".join(sorted({a for a, _ in owners if not capped(a)}))
@@ -1797,7 +1825,12 @@ def day_start():
 
 
 def runs_today(agent):
-    return q("SELECT COUNT(*) AS n FROM runs WHERE agent=? AND claimed>=?", agent, day_start())[0]["n"]
+    """Runs claimed today, except those that never got going: retrying
+    through an outage mustn't use up the agent's day."""
+    return q("""SELECT COUNT(*) AS n FROM runs WHERE agent=? AND claimed>=?
+                AND NOT (ended IS NOT NULL AND turns IS NOT NULL AND turns<=1 AND COALESCE(cost, 0)=0
+                         AND COALESCE(forge_changes, 0)=0 AND outcome NOT IN ('completed', 'interrupted'))""",
+             agent, day_start())[0]["n"]
 
 
 def spend_today(agent):
@@ -1972,6 +2005,39 @@ def retry(agent, run_id, outcome):
     return False
 
 
+def never_got_going(r, changes):
+    """A failed run that did nothing: at most one turn, nothing spent, no
+    change in Forgejo (coordination#202). A run with no turns reported
+    didn't say, so it is an ordinary failure."""
+    return (r.get("outcome") or "") not in ("completed", "interrupted") and r.get("turns") is not None \
+        and r["turns"] <= 1 and not r.get("cost") and not changes
+
+
+def env_retry(agent, run_id, outcome):
+    """Queue a run's work again after the next of ENV_DELAYS, without counting
+    it as a try; the human hears once while runs keep failing this way."""
+    k = int(kv_get(f"env-failures:{agent}", "0"))
+    delay = ENV_DELAYS[min(k, len(ENV_DELAYS) - 1)]
+    kv_set(f"env-failures:{agent}", str(k + 1))
+    q("UPDATE triggers SET run_id=NULL, not_before=? WHERE run_id=?", now() + delay, run_id)
+    since = kv_get("env-failing")
+    if not since:
+        since = iso(now())
+        kv_set("env-failing", since)
+    add_notice(f"env-failing:{since}", "env-failing", None, None,
+               f"runs are failing before they get going ({agent} run {run_id}: {outcome}). Their work is retried "
+               f"after {', then '.join(f'{s // 60} minutes' for s in ENV_DELAYS)}, and then at that interval, "
+               "until runs get going again. Look for an outage, the proxy or the Claude credential.")
+    log(f"{agent} run {run_id} {outcome} before getting going: its work is queued again in {delay // 60} minutes")
+
+
+def got_going(agent):
+    """The agent's run got going: its environment works again."""
+    q("DELETE FROM kv WHERE key=?", f"env-failures:{agent}")
+    if not q("SELECT 1 FROM kv WHERE key LIKE 'env-failures:%'"):
+        q("DELETE FROM kv WHERE key='env-failing'")
+
+
 def end_run(agent, run_id, r):
     row = q("SELECT claimed FROM runs WHERE id=? AND agent=?", run_id, agent)
     if not row:
@@ -1986,8 +2052,13 @@ def end_run(agent, run_id, r):
       r.get("session_id"), r.get("log"), r.get("transcript"), int(bool(r.get("in_extension"))),
       changes, r.get("archived_log"), r.get("archived_transcript"), run_id)
     outcome = r.get("outcome") or ""
+    idle = never_got_going(r, changes)
+    if not idle:
+        got_going(agent)
     if paused() and outcome != "interrupted":
         requeue(run_id)  # the pause refused its tool calls: it did what it could, not its work
+    elif idle:
+        env_retry(agent, run_id, outcome)
     elif outcome in ("completed", "interrupted") or not retry(agent, run_id, outcome):
         # Done; or stopped by the human, who may continue it; or given up on.
         # A retried run may still push, so its reviews wait for that.

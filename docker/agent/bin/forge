@@ -16,6 +16,11 @@ follow a rule tea can't enforce. Uses the agent's own token.
                                   the log of each failed job in that run (each
                                   job's, if none failed): its last 200 lines,
                                   or all of them
+  forge ci <repo> <pr|main> --rerun
+                                  run that run again, if it failed, in your own
+                                  repository: only when its log shows the
+                                  failure is the runner's (a package download,
+                                  a crashed job), not the code's
   forge pr approve <repo> <n> <message>
                                   (coordinator) approve, only if the Actions run
                                   for the head commit succeeded
@@ -178,6 +183,24 @@ def ci_logs(repo, sha, everything):
         print("\n".join(lines))
 
 
+def ci_rerun(repo, target):
+    """Run the newest failed Actions run for the head again, in your own
+    repository: for a failure that is the runner's, not the code's."""
+    sha = head_of(repo, target)
+    runs = runs_for(repo, sha)
+    if not runs:
+        die(f"no Actions run for {sha[:12]} in {repo}")
+    run = runs[0]
+    if run.get("status") not in ("failure", "cancelled"):
+        die(f"run {run.get('index_in_repo', run['id'])} for {sha[:12]} is {run.get('status')}: only a failed run "
+            "is run again")
+    s, p = api("POST", f"/repos/{ORG}/{repo}/actions/runs/{run['id']}/rerun")
+    if s // 100 != 2:
+        die(f"couldn't run {repo}'s run {run.get('index_in_repo', run['id'])} again ({s}): "
+            f"{(p or {}).get('message', '')}")
+    print(f"Running {repo}'s run {run.get('index_in_repo', run['id'])} for {sha[:12]} again.")
+
+
 def ci_state(repo, pr):
     sha = head_of(repo, pr)
     mine = runs_for(repo, sha)
@@ -337,6 +360,9 @@ def main(argv):
             if argv[4:] not in ([], ["all"]):
                 die("usage: forge ci <repo> <pr|main> --log [all]")
             ci_logs(repo, head_of(repo, target), argv[4:] == ["all"])
+            return
+        if argv[3:] == ["--rerun"]:
+            ci_rerun(repo, target)
             return
         sha, state = ci_state(repo, target)
         print(f"{state} ({sha[:12]})")

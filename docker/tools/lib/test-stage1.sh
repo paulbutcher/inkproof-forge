@@ -110,6 +110,23 @@ cmd_test_stage1() {
     pass "core can't push a tag"
   fi
 
+  # Actions write on its own repository re-runs CI (forge ci --rerun), and
+  # reaches nothing else of the Actions settings: secrets and runners are the
+  # repository admin's (coordination#201).
+  local bad_run
+  bad_run="$(call 200 GET "/repos/$ORG/$REPO/actions/runs?head_sha=$sha_bad" \
+    | jq -r --arg s "$sha_bad" '[(.workflow_runs // .)[] | select((.commit_sha // .head_sha) == $s)] | max_by(.id) | .id')"
+  s="$(TOKEN="$(token_of core)" api POST "/repos/$ORG/$REPO/actions/runs/$bad_run/rerun")"
+  [ "${s:0:1}" = 2 ] && pass "core can re-run a failed CI run in its own repository ($s)" \
+    || fail "core re-running run $bad_run got $s: $(head -c 300 "$RESP")"
+  s="$(TOKEN="$(token_of core)" api PUT "/repos/$ORG/$REPO/actions/secrets/KIT_PROBE" '{"data":"x"}')"
+  [ "$s" = 403 ] || [ "$s" = 404 ] && pass "core can't write an Actions secret ($s)" || fail "core writing an Actions secret got $s"
+  s="$(TOKEN="$(token_of core)" api POST "/repos/$ORG/$REPO/actions/variables/KIT_PROBE" '{"value":"x"}')"
+  [ "$s" = 403 ] || [ "$s" = 404 ] && pass "core can't write an Actions variable ($s)" || fail "core writing an Actions variable got $s"
+  s="$(TOKEN="$(token_of core)" api GET "/repos/$ORG/$REPO/actions/runners/registration-token")"
+  [ "$s" = 403 ] || [ "$s" = 404 ] && pass "core can't get a runner registration token ($s)" \
+    || fail "core getting a runner registration token got $s"
+
   # Tag protection also covers a release that creates its tag. The probe
   # account may write releases; only tag protection stands in its way.
   call 201 POST /admin/users "$(jq -nc --arg u "$PROBE" --arg p "$(random_hex 24)" \

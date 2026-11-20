@@ -47,7 +47,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 
   The GitHub account `inkproof-tentenths`, which the agents shared before the kit, is never used or recreated.
 - **Organisation and teams.** The repositories live in the Forgejo organisation `FORGE_ORG`. It can't be the human's username, because Forgejo users and organisations share one namespace. Each library agent and the coordinator get teams with per-unit access. A site's agent (kind `site`) is a library's in everything here and below; only its deployment differs ([Sites](#sites)).
-  - **Its own repository:** Code, Issues and Pull requests write; Releases, Actions and Wiki read; Packages none.
+  - **Its own repository:** Code, Issues, Pull requests and Actions write; Releases and Wiki read; Packages none. Actions write lets it re-run a CI run that failed for the runner's sake (`forge ci --rerun`); secrets, variables and runners need the repository's admin, which no agent is (checked by `scripts/test-stage1.sh`).
   - **Its dependencies (all libraries, for the coordinator):** Code read, Issues write, Pull requests read. The coordinator's team has Pull requests write, so it can review and approve.
   - **Every repository, for each library agent:** Code, Issues and Pull requests read, so it can reuse before it builds. Forgejo lets anyone who can read a repository open an issue on it, so filing requests only on dependencies is the protocol's rule, not a permission.
 - **Reviewers own no repository.**
@@ -117,6 +117,7 @@ Every code owner's review request blocks the merge until that owner approves, so
 - **No pushes.** Branch protection's "no pushes" applies to the human too, so the human's own changes, such as the `.forgejo/` files `setup-repo.sh` asks for, also go through pull requests. An admin can merge one without the approval.
 - **Scheduled merges.** Forgejo acts on a scheduled merge only when a review or CI status arrives after it was scheduled. A merge scheduled once everything has already passed would never fire, so `forge pr automerge` merges at once in that case.
 - **Actions webhooks.** Forgejo 17 sends a webhook for a finished Actions run, whether it failed or succeeded (verified 2026-11-08).
+- **Actions write.** A team's Actions write on a repository lets its members re-run a run (`POST /repos/{owner}/{repo}/actions/runs/{id}/rerun`, by the run's database ID), but not write secrets or variables or get a runner registration token, which need the repository's admin (verified 2026-11-20, and by `scripts/test-stage1.sh`).
 
 ### The gatekeeper
 
@@ -135,13 +136,13 @@ It approves the head commit when Forgejo's Actions runs for that commit include 
 At level 3 the gatekeeper also releases, when the coordinator asks with `forge release`. The request comes over a network that only the coordinator and the gatekeeper share, and carries a key that only the coordinator's container holds (`secrets/gatekeeper/coordinator-key`). The gatekeeper refuses while the kit is paused. It also refuses for a repository below level 3, which it recognises by `CODEOWNERS` not giving `API.lock` to `@coordinator`.
 
 The gatekeeper and `scripts/release.sh` run the same code, so a release follows the same steps whoever makes it:
-1. It takes the highest `vX.Y.Z` tag as the last release.
+1. It refuses a repository that doesn't exist, naming any whose name ends with the one given (`viewport` for `inkproof-viewport`), before anything else: otherwise the missing `CODEOWNERS` would make it look below level 3. Then it takes the highest `vX.Y.Z` tag as the last release.
 2. It computes the next version from the diff of `API.lock`'s lines since then:
    - before 1.0, minor if `API.lock` changed and patch otherwise;
    - from 1.0, major if a line was removed or changed, minor if lines were only added, and patch otherwise.
 3. It requires a `CHANGELOG.md` entry headed with that version, in either form the libraries use (`## [X.Y.Z]` or `## vX.Y.Z`), and a successful Actions run on `main`'s head.
 4. It publishes the release, which tags `main`'s head.
-5. It comments the release on each `ready-for-release` issue named, and removes the label.
+5. It comments the release on each `ready-for-release` issue named, and removes the label. It closes each one that isn't a request, such as an owner's task for itself: no requester will verify it, so nothing else would end it.
 
 With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0, starts with a tag the human makes. A level-3 library may depend on one below level 3: that one's releases stay the human's, and its consumers wait on them with a `Blocked-by:` line.
 
@@ -156,6 +157,7 @@ With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0,
 - **Logging.** The stream becomes a Markdown log under `.inkproof/runs/` in the workspace, plus `current.md`, which updates live in a VS Code tab. `.inkproof/` is excluded from git.
 - **Ending.** When a run ends, the runner records its outcome, then rewrites `"entrypoint":"sdk-cli"` to `"entrypoint":"claude-vscode"` in the run's transcript, so that the Claude extension lists it. If the rewrite matched nothing, the run record says so and the human is notified; the run can still be resumed by ID.
 - **Retries.** A run that fails, times out or exits before finishing a reply may have left its work undone, and most triggers are queued only once. So its triggers are queued again after `RETRY_DELAY_SECONDS` (default 300) times the attempt number, at most `MAX_RUN_RETRIES` times (default 2). After that, the dispatcher opens a decision for the human with the run and its work.
+  - A run that failed before it got going (one turn at most, nothing spent, no change in Forgejo) failed for its environment: an outage, the proxy or the API. It doesn't count as an attempt, or against the daily run cap. Its work is queued again after 5 minutes, then 15, then every hour (`ENV_RETRY_DELAYS`), until one of the agent's runs gets going, so it outlasts an outage without filling the human's queue with decisions. The human gets one notice while runs keep failing this way (`env-failing`).
   - A run the human stops isn't retried: they may continue it.
   - A run that ends while the kit is paused is queued again as it was, without counting as an attempt.
   - So is a run abandoned by a restarting runner.
@@ -223,7 +225,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.
   - **(4)** A conflict with `main`.
   - **(5)** No merge scheduled, once the owner's run has ended (it is looked at again then). Or a merge scheduled that hasn't gone through `MERGE_STUCK_SECONDS` (default 10 minutes) after nothing stood in its way: CI passed on the head, there's no conflict and no request for changes standing, and everyone a review was requested from has approved the head.
-- **(6)** An open request it hasn't labelled `ready-for-release` or `verified`, not blocked, that one of its pull requests refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description). The pull request must have merged since the request was last unblocked, and, once the request has been released, since its last `Released in` comment. That covers a fix for what the requester found missing in a release, which nothing else would release again.
+- **(6)** An open request it hasn't labelled `ready-for-release` or `verified`, or on a library or site an issue it filed for itself that isn't a request (its own task, which its release closes), not blocked, that one of its pull requests refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description). The pull request must have merged since the request was last unblocked, and, once the request has been released, since its last `Released in` comment. That covers a fix for what the requester found missing in a release, which nothing else would release again.
 - **(7)** An accepted request that:
   - isn't blocked;
   - has no open pull request referring to it;
@@ -232,7 +234,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   This rule applies only while the agent has nothing running or queued, and its accepted requests are looked at again when its run ends. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
 
   It fires again whenever the agent has acted on the request since, such as reporting progress on it, up to `FOLLOW_UP_RUNS` times (default 3) per unblocking or merge. So a run that works on a request and stops short, with nothing merged for it, is followed by another as soon as it ends, rather than waiting 20 minutes for the stall check. A run that looks and does nothing isn't followed up. Past the limit, the request waits for the stall check, which in time puts it to the human.
-- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. Or the human's comment on an open upstream issue that one of those lines names.
+- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 
 The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is open and unreleased. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
@@ -302,7 +304,7 @@ An item that isn't waiting for any of these wakes whoever should move it on, onc
 - the requester, for a counter-proposal;
 - otherwise, the repository's owner.
 
-An item still stalled after `STALL_ROUNDS` quiet spells (default 2) becomes a decision for the human instead, `Stalled: <repo>#<n>`. A capped agent isn't woken, and the count starts again once the item waits visibly.
+An item still stalled after `STALL_ROUNDS` quiet spells (default 2) becomes a decision for the human instead, `Stalled: <repo>#<n>`. A capped agent isn't woken. The count starts again once the item waits visibly, or once someone other than the dispatcher has moved it on since the last wake: anything in its timeline but a comment, such as a pull request or commit referring to it, a label or a review. That catches progress made between two checks, while the kit was busy and no check saw the item waiting. A comment alone doesn't count, so an agent that only says what it will do still reaches the human.
 
 Each catch is a gap in the rules. So the human hears of it once (a `stall` notice, on the item), and the process review looks for why no rule fired and recommends the change that would have caught it. The coordinator's idle summary comes only in a quiet spell with nothing stalled.
 
@@ -341,7 +343,8 @@ Forgejo has no email without SMTP. The dispatcher records a notice for each of t
 - every reached cap;
 - every `blocking` upstream issue;
 - every item the stall check catches, once each time it stalls;
-- every run whose transcript rewrite failed.
+- every run whose transcript rewrite failed;
+- runs failing before they get going, once until they get going again.
 
 For an existing issue, the dispatcher comments as `dispatcher`, mentioning the human, so the notice shows in Forgejo's notifications. A cap or a failed transcript rewrite gets an issue of its own, assigned to the human. A host launchd job, `scripts/notify.sh`, reads new notices from the dispatcher on `127.0.0.1` and shows each as a macOS notification. SMTP with the human's own mail account is optional, for being told while away from the machine.
 
@@ -400,7 +403,7 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 
 - `forge pr automerge <n>`: merge now if nothing stands in the way, otherwise schedule "merge when checks succeed" (see Forgejo behaviour);
 - `forge pr merge <n>`: merge now, or say why Forgejo won't;
-- `forge ci <repo> <pr|main>`: the Actions run's result for the pull request's head commit, or for `main`'s. With `--log`, it adds the log of each failed job in that run (the last 200 lines, or `--log all`), so an agent can find out why CI failed without the human;
+- `forge ci <repo> <pr|main>`: the Actions run's result for the pull request's head commit, or for `main`'s. With `--log`, it adds the log of each failed job in that run (the last 200 lines, or `--log all`), so an agent can find out why CI failed without the human. With `--rerun`, it runs a failed run again, in the agent's own repository, for a failure that is the runner's rather than the code's;
 - `forge pr approve <repo> <n>` (coordinator): approve, but only if the Actions run for the head commit succeeded;
 - `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI has passed. After the rounds limit, it labels the pull request `needs-human` instead for the findings the author disputes, once per head;
 - `forge reviews <repo> <n>`: a pull request's reviews and their findings, which `tea` doesn't show;
@@ -410,7 +413,7 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 Managed settings deny these, with every alias:
 - `tea api`, `tea login`, and `tea`'s release and approval commands;
 - `curl` and `wget`;
-- `git tag` and `git config`;
+- `git config`;
 - force pushes.
 
 `tea api` is the agent's whole account, including posting a commit status under CI's name, which is the spoof an early trial demonstrated. Denying it and offering `forge` keeps runs to reviewed operations, and puts the rule "approve only after checking the Actions run" in code instead of a prompt. The deny list can be got round with a script; the real boundary is the account's permissions and branch protection, and the list is defence in depth.

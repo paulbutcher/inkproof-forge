@@ -5,14 +5,16 @@
 
 # Team permissions, per repository unit. Units not listed are none.
 units() {
-  local code="$1" issues="$2" pulls="$3"
-  jq -nc --arg c "$code" --arg i "$issues" --arg p "$pulls" '{
+  local code="$1" issues="$2" pulls="$3" actions="${4:-read}"
+  jq -nc --arg c "$code" --arg i "$issues" --arg p "$pulls" --arg a "$actions" '{
     "repo.code": $c, "repo.issues": $i, "repo.pulls": $p,
-    "repo.releases": "read", "repo.actions": "read", "repo.wiki": "read",
+    "repo.releases": "read", "repo.actions": $a, "repo.wiki": "read",
     "repo.projects": "none", "repo.packages": "none",
     "repo.ext_issues": "none", "repo.ext_wiki": "none"}'
 }
-U_OWN="$(units write write write)"
+# Actions write on its own repository: to re-run CI that failed for the
+# runner's sake (forge ci --rerun). Secrets and runners stay the admin's.
+U_OWN="$(units write write write write)"
 U_DEPS="$(units read write read)"
 U_COORD_DEPS="$(units read write write)"
 U_REVIEW="$(units read write write)"
@@ -63,7 +65,14 @@ ensure_token() {
 }
 
 team_id() {
-  call 200 GET "/orgs/$ORG/teams?limit=50" | jq -r --arg n "$1" '.[] | select(.name == $n) | .id'
+  # Every page: an organisation with a dozen agents has over 50 teams.
+  local page=1 got
+  while :; do
+    got="$(call 200 GET "/orgs/$ORG/teams?limit=50&page=$page")"
+    jq -r --arg n "$1" '.[] | select(.name == $n) | .id' <<<"$got"
+    [ "$(jq length <<<"$got")" -lt 50 ] && break
+    page=$((page + 1))
+  done
 }
 
 # ensure_team NAME UNITS MEMBER REPO...: the team exists with these unit

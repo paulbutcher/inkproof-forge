@@ -238,7 +238,7 @@ Your own sessions in agent containers still work.
 
 The coordinator's cap is higher because every other agent's work wakes it.
 
-A failed run that has used up its retries, or a reached cap, becomes a decision for you. A run you stop isn't retried. A run cut short by a pause is queued again as it was.
+A failed run that has used up its retries, or a reached cap, becomes a decision for you. A run you stop isn't retried. A run cut short by a pause is queued again as it was. A run that failed before it got going (one turn at most, $0, no change in Forgejo, as in an outage) isn't counted as a try or against the cap: its work is retried after 5 minutes, 15, then hourly, until runs get going again, and you get one `env-failing` notice for the whole spell instead of a decision per agent.
 
 ## Milestones and reviews
 
