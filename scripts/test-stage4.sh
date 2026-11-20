@@ -5,6 +5,8 @@
 #   - pause: no run starts, a run's tool calls are refused, scheduled merges
 #     are cancelled and recorded, only you may merge; resume undoes it all
 #     and reschedules the merges in your name;
+#   - drain: drain.sh says when it is safe to stop, no run starts while
+#     work is queued, and resume ends it;
 #   - while paused, each kind of event queues work for the right agent, and
 #     untrusted authors, an agent's own comments and no-reply comments queue
 #     nothing; only needs-human (not routine events) makes a notice;
@@ -86,8 +88,10 @@ seen="$(mktemp)"; echo "$first_notice" > "$seen"
 shown="$(NOTIFY_DRY_RUN=1 NOTIFY_SEEN_FILE="$seen" bash "$(dirname "$0")/notify.sh" 2>/dev/null || true)"
 printf '%s\n' "$shown" | grep -q "needs-human inkproof-core#$(key NH)" \
   && pass "notify.sh shows the needs-human notice" || fail "notify.sh didn't show the needs-human notice: $shown"
-[ "$(printf '%s\n' "$shown" | grep -c '^NOTICE')" = 1 ] && pass "and nothing else" \
-  || fail "notify.sh showed more than the needs-human notice"
+printf '%s\n' "$shown" | grep -q "blocking inkproof-coordination#$(key UP)" \
+  && pass "notify.sh shows the blocking upstream issue" || fail "notify.sh didn't show the blocking notice: $shown"
+[ "$(printf '%s\n' "$shown" | grep -c '^NOTICE')" = 2 ] && pass "and nothing else" \
+  || fail "notify.sh showed more than those two notices: $shown"
 
 echo "== Status"
 st="$(bash "$(dirname "$0")/status.sh" 2>/dev/null || true)"
@@ -99,6 +103,19 @@ echo "== Resume"
 kit test-stage4 drop >/dev/null 2>&1   # what the test queued shouldn't start runs
 bash "$(dirname "$0")/resume.sh" >/dev/null 2>&1
 phase check-resumed "$pr"
+
+echo "== Drain"
+before="$(last_run)"
+out="$(KIT_YES=1 timeout 1200 bash "$(dirname "$0")/drain.sh" 2>&1)" && grep -q "safe to stop" <<<"$out" \
+  && pass "drain.sh waited for what was under way, then said it was safe to stop" || fail "drain.sh: $out"
+kit test-stage4 poke "$(key REQ)" >/dev/null || fail "couldn't comment while draining"
+sleep 90
+[ "$(runs_of scale "$before")" = 0 ] && pass "while draining, no run started" || fail "a run started while draining"
+status | jqt -e '.agents.scale.state == "draining" and (.agents.scale.pending | length) > 0' >/dev/null \
+  && pass "status shows scale draining, with its work queued" || fail "status doesn't show scale draining with work queued"
+kit test-stage4 drop >/dev/null 2>&1   # what the test queued shouldn't start runs
+bash "$(dirname "$0")/resume.sh" >/dev/null 2>&1
+[ ! -e "$STATE_DIR/control/draining" ] && pass "resume.sh ended the drain" || fail "control/draining is still there after resume"
 
 echo "== A burst becomes one run; a cap stops runs and tells you"
 before="$(last_run)"

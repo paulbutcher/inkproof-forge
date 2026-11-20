@@ -201,6 +201,14 @@ While paused:
 
 `scripts/resume.sh` restores the merge lists. In the human's name, it merges each recorded pull request that nothing now stands in the way of, and reschedules the others. While the kit is paused, nothing changes in Forgejo except by the human.
 
+### Draining
+
+`scripts/drain.sh` is a clean stop, for restarting the Mac or the kit. It writes `control/draining`, and while that is there the dispatcher grants no claims. Everything else goes on: runs under way finish, CI runs, scheduled merges land, and the work they bring is queued. The script waits until no run is under way and no CI is running, then says it is safe to stop. With `--max N` it pauses after N minutes instead, which ends the runs still going at their next tool call and queues their work again.
+
+- The flag is a file, so it survives a restart: nothing starts until `scripts/resume.sh` removes it. After a drain, `resume.sh` does only that, since no merge was cancelled.
+- Draining looks quiet, but only because nothing may start. So, as while paused, the quiet-spell checks are skipped: the stall check would otherwise count the wait as stalled work, and the coordinator's idle summary couldn't run.
+- The dispatcher can be replaced on its own without disturbing a run (`docker compose up -d --build dispatcher`): a run talks to Forgejo, and its runner talks to the dispatcher only to claim work and to report the run's end, which it retries for five minutes. That is how a dispatcher without draining is replaced by one with it, before the first drain (verified 2026-11-20 in the dev container: a run's end was recorded although the dispatcher was replaced while it ran).
+
 ## Triggers
 
 Every wake-up is a rule over an issue or pull request as it is now, or over a repository (its `main`, its milestones), never over the event that changed it. The numbers below are the rules' numbers in the dispatcher's code.

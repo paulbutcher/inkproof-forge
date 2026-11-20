@@ -168,6 +168,23 @@ def paused():
     return (CONTROL / "paused").exists()
 
 
+def draining():
+    """Draining for a clean stop (scripts/drain.sh): runs under way finish,
+    and no run starts until scripts/resume.sh."""
+    return (CONTROL / "draining").exists()
+
+
+def under_way():
+    """What a clean stop waits for: runs not yet ended, and CI."""
+    work = [f"{r['agent']}'s run {r['id']}" for r in q("SELECT id, agent FROM runs WHERE ended IS NULL ORDER BY id")]
+    try:
+        if ci_running():
+            work.append("CI")
+    except Exception as e:
+        work.append(f"CI, which Forgejo can't tell ({e!r})")
+    return work
+
+
 # --- The ledger -----------------------------------------------------------------
 
 STATE.mkdir(parents=True, exist_ok=True)
@@ -1744,7 +1761,7 @@ def ci_running():
     """Whether an Actions run is under way. A run left waiting for over an
     hour (its pull request closed before a runner took it) doesn't count."""
     for repo in OWNER_OF:
-        if not has_ci(repo):
+        if not has_ci(repo) or cached(("missing", repo), 300, lambda: forge_missing(repo)):
             continue
         for status in ("running", "waiting"):
             runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?status={status}") or {}
@@ -1766,7 +1783,9 @@ def check_idle():
     no CI, and nothing new for IDLE seconds): wake whoever should move on
     any stalled item, or if none, the coordinator to tell the human what it
     needs from them. Once per quiet spell."""
-    if not COORDINATOR or IDLE <= 0 or paused():
+    # Draining looks quiet, but only because nothing may start: neither the
+    # stall check nor the summary could tell anything true.
+    if not COORDINATOR or IDLE <= 0 or paused() or draining():
         return
     if q("SELECT 1 FROM runs WHERE ended IS NULL"):
         return
@@ -1881,6 +1900,8 @@ def agent_state(agent):
         return "running"
     if paused():
         return "paused"
+    if draining():
+        return "draining"
     if capped(agent):
         return "capped"
     if human_active(agent):
@@ -1910,7 +1931,7 @@ def due(agent, grant=False):
     with LOCK:
         if DB.execute("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", (agent,)).fetchone():
             return None
-        if paused():
+        if paused() or draining():
             return None
         rows = DB.execute("SELECT id, description, created FROM triggers WHERE agent=? AND run_id IS NULL "
                           "AND (not_before IS NULL OR not_before<=?) ORDER BY created", (agent, now())).fetchall()
@@ -2095,7 +2116,10 @@ def status():
                 for s in q("SELECT * FROM sessions ORDER BY id DESC LIMIT 20")]
     notices = [dict(n, at=iso(n["at"])) for n in q("SELECT * FROM notices ORDER BY id DESC LIMIT 50")]
     reconciled = kv_get("reconciled")
-    return {"paused": paused(), "reconciled": iso(float(reconciled)) if reconciled else None,
+    drain = draining()
+    left = under_way() if drain else None
+    return {"paused": paused(), "draining": drain, "under_way": left, "drained": drain and not left,
+            "reconciled": iso(float(reconciled)) if reconciled else None,
             "agents": agents, "runs": runs, "sessions": sessions, "notices": notices,
             "summary": kit_summary()}
 
@@ -2128,6 +2152,10 @@ def kit_summary():
             if waiting else "nothing waits on you")
     if paused():
         return f"Kit: paused, nothing starts until scripts/resume.sh; {wait}"
+    if draining():
+        left = under_way()
+        return (f"Kit: draining, nothing starts until scripts/resume.sh; {wait}\n"
+                + ("\n".join(f"  - finishing: {w}" for w in left) if left else "  - drained: safe to stop"))
     runs = q("SELECT id, agent, triggers, claimed, started FROM runs WHERE ended IS NULL ORDER BY id")
     queued = q("SELECT id, agent, created, not_before FROM triggers WHERE run_id IS NULL")
     capped_agents = sorted({t["agent"] for t in queued if capped(t["agent"])})

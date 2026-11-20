@@ -32,6 +32,7 @@ CORE, SCALE, COORD = "inkproof-core", "inkproof-scale", "inkproof-coordination"
 # Rule 15's trigger for a repository without level 3's CODEOWNERS on main.
 BELOW_RELEASE = f"{CORE} is below level 3, so the human releases it: put the release to them as a decision"
 PAUSED = os.path.join(STATE, "paused")
+DRAINING = os.path.join(STATE, "draining")
 
 
 def at(seconds_ago):
@@ -1388,6 +1389,53 @@ class FailedRunsAreRetried(Case):
             os.remove(PAUSED)
         t = d.q("SELECT run_id, attempts FROM triggers WHERE key='work:1'")[0]
         self.assertEqual((t["run_id"], t["attempts"]), (None, 0))
+
+
+class Draining(Case):
+    """A clean stop: runs under way finish, nothing new starts, and the quiet
+    that follows isn't taken for a stall."""
+
+    def setUp(self):
+        super().setUp()
+        self.ci = False
+        for name, value in (("waiting_on_human", lambda: 0), ("ci_running", lambda: self.ci)):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+            setattr(d, name, value)
+        d.add_trigger("core", "work:1", "some work", once=True)
+        d.add_trigger("scale", "work:2", "other work", once=True)
+        d.q("UPDATE triggers SET created=?", d.now() - 3600)
+        self.run = d.claim("core")["run"]
+        open(DRAINING, "w").close()
+        self.addCleanup(lambda: os.path.exists(DRAINING) and os.remove(DRAINING))
+
+    def test_a_run_under_way_finishes_and_nothing_starts(self):
+        self.assertIsNone(d.claim("scale"))
+        self.assertEqual(d.agent_state("scale"), "draining")
+        s = d.status()
+        self.assertEqual((s["draining"], s["drained"], s["under_way"]), (True, False, [f"core's run {self.run}"]))
+        d.end_run("core", self.run, {"outcome": "completed", "turns": 20, "cost": 1.0})
+        self.ci = True
+        self.assertEqual(d.status()["under_way"], ["CI"])
+        self.ci = False
+        s = d.status()
+        self.assertEqual((s["drained"], s["under_way"]), (True, []))
+        self.assertIn("drained: safe to stop", d.kit_summary())
+        # The work it didn't start waits, and starts once resumed.
+        os.remove(DRAINING)
+        self.assertIsNotNone(d.claim("scale"))
+
+    def test_the_quiet_isnt_a_stall(self):
+        d.end_run("core", self.run, {"outcome": "completed", "turns": 20, "cost": 1.0})
+        d.q("UPDATE triggers SET run_id=-1 WHERE run_id IS NULL")
+        called = []
+        self.addCleanup(setattr, d, "check_stalls", d.check_stalls)
+        d.check_stalls = lambda: called.append(1) or 0
+        real_now = d.now
+        self.addCleanup(setattr, d, "now", real_now)
+        d.now = lambda: real_now() + d.IDLE + 3600
+        d.check_idle()
+        self.assertEqual(called, [])
+        self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL"), [])
 
 
 if __name__ == "__main__":

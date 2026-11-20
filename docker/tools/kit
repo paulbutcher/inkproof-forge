@@ -9,6 +9,7 @@
 #   kit setup-repo REPO LEVEL  apply an autonomy level to a repository
 #   kit new-library REPO NAME  create a library's repository and commit its seed
 #   kit pause, kit resume  the human's brake (scripts/pause.sh, resume.sh)
+#   kit drain              a clean stop: nothing new starts (scripts/drain.sh)
 #   kit project-status  requests, pull requests and needs-human items
 #   kit reviews DAYS   which reviews have taken place, and their results
 #   kit dispatcher METHOD PATH [JSON]  the dispatcher's admin requests
@@ -67,6 +68,7 @@ case "${1:-}" in
   setup-repo) shift; cmd_setup_repo "$@" ;;
   new-library) shift; cmd_new_library "$@" ;;
   pause) cmd_pause ;;
+  drain) cmd_drain ;;
   resume) cmd_resume ;;
   project-status) cmd_project_status ;;
   reviews) shift; cmd_reviews "$@" ;;

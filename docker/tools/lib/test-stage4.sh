@@ -202,8 +202,10 @@ s4_check_triggers() {
   expect coordinator "^$S4_DEP released $S4_TAG$" "a release"
   expect_not core "^untriaged request|^request filed" "events on other repositories"
   local notices
-  notices="$(dstatus | jq -r --arg since "$S4_SINCE" '[.notices[] | select(.at >= $since) | .kind] | join(" ")')"
-  [ "$notices" = needs-human ] && s4_pass "the only notice is the needs-human one (nothing routine is a notice)" \
+  # The upstream issue core is blocked on is blocking, which is a notice too.
+  notices="$(dstatus | jq -r --arg since "$S4_SINCE" '[.notices[] | select(.at >= $since) | .kind] | sort | join(" ")')"
+  [ "$notices" = "blocking needs-human" ] \
+    && s4_pass "the only notices are the needs-human one and the blocking upstream issue (nothing routine is a notice)" \
     || s4_fail "notices since the test began: ${notices:-none}"
   s4_done
 }

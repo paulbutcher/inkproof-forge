@@ -4,7 +4,10 @@
 #           every scheduled merge, recording it in control/paused-merges.json,
 #           and narrows main's merge list in every repository to the human;
 #   resume  restores the merge lists, reschedules the recorded merges in the
-#           human's name, then removes control/paused.
+#           human's name, then removes control/paused; and ends a drain;
+#   drain   writes control/draining: runs under way finish, CI and scheduled
+#           merges go on, and no run starts until resume (scripts/drain.sh
+#           waits for what is under way, for a clean stop).
 # While paused, nothing changes in Forgejo except by the human.
 #
 # kit project-status: open requests, pull requests, recommendations and
@@ -60,9 +63,19 @@ cmd_pause() {
   log "Recorded $(jq length <<<"$recorded") scheduled merge(s) in control/paused-merges.json for scripts/resume.sh."
 }
 
+cmd_drain() {
+  : > /control/draining
+  log "Draining: runs under way finish, and no run starts until scripts/resume.sh."
+}
+
 cmd_resume() {
   TOKEN="$(token_of human)"
   local r repo n s
+  if [ ! -e /control/paused ]; then
+    rm -f /control/draining
+    log "Resumed: agents start work again."
+    return
+  fi
   for r in $(existing_repos); do
     set_merge_list "$r" false
   done
@@ -88,7 +101,7 @@ cmd_resume() {
     done < <(jq -r '.[] | "\(.repo) \(.number)"' "$PAUSED_MERGES")
     rm -f "$PAUSED_MERGES"
   fi
-  rm -f /control/paused
+  rm -f /control/paused /control/draining
   log "Resumed: agents start work again."
 }
 

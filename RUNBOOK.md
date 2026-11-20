@@ -4,7 +4,7 @@ How to set up and run the kit. [README.md](README.md) says what it is; [DESIGN.m
 
 You need Docker Desktop on a Mac. The scripts are bash 3.2-compatible: run them from the kit's folder as `scripts/<name>.sh`, or with `bash scripts/<name>.sh` if a copy has lost their executable bits. Every setting is in `.env`, described in [.env.example](.env.example). After changing one, rerun `scripts/up.sh`.
 
-A script that changes the kit (`up`, `down`, `pause`, `resume`, `stop-run`, `bootstrap`, `migrate`, `mirrors`, `new-library`, `setup-repo`, `milestone`, `release` when it releases, and the stage tests) first says what it will do and to which kit, the one on this Mac or the dev container's, and asks you to confirm. `KIT_YES=1` answers yes for you, for running one from another script; with no terminal to ask on and no `KIT_YES`, it stops having changed nothing. `restore.sh` keeps its own stronger check.
+A script that changes the kit (`up`, `down`, `pause`, `drain`, `resume`, `stop-run`, `bootstrap`, `migrate`, `mirrors`, `new-library`, `setup-repo`, `milestone`, `release` when it releases, and the stage tests) first says what it will do and to which kit, the one on this Mac or the dev container's, and asks you to confirm. `KIT_YES=1` answers yes for you, for running one from another script; with no terminal to ask on and no `KIT_YES`, it stops having changed nothing. `restore.sh` keeps its own stronger check.
 
 ## First-time setup
 
@@ -224,6 +224,17 @@ Your own sessions in agent containers still work.
 - it merges in your name each recorded pull request that nothing now stands in the way of;
 - it reschedules the rest;
 - it lets agents start again.
+
+### Restarting the Mac or the kit
+
+Drain the kit first, so that nothing is cut short:
+1. `scripts/drain.sh`. No run starts from now on, while runs under way finish and CI and scheduled merges go on. It reports what it is waiting for, and says when it is safe to stop. That can take as long as the longest run (up to `MAX_RUN_MINUTES`); `scripts/drain.sh --max 30` pauses after 30 minutes instead, ending the runs still going at their next step and queuing their work again.
+2. Restart the Mac, or run `scripts/up.sh`.
+3. `scripts/resume.sh`. Work queued in the meantime starts.
+
+The drain survives the restart: if Docker brings the kit back up by itself, nothing starts until you resume.
+
+If the dispatcher predates draining, `drain.sh` says so. Bring in the new one first, which leaves runs alone: `docker compose build tools && docker compose up -d --build dispatcher`. Then drain as above.
 
 ### Bounds
 
