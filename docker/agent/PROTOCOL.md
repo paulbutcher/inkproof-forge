@@ -134,7 +134,7 @@ Runs start on their own when your repositories have work for you, and no one may
 
 Never leave an open issue or pull request waiting on something only your run's text mentions, such as "I'll retry later": the kit can't see it, and nothing will wake you for it. Leave each one waiting for something the kit can see: a `Blocked-by:` line naming an open issue, `needs-human` with a decision, a review you requested, or an open pull request that refers to the issue. Or finish it, or close it saying why. A run that starts with "the kit is quiet and nothing is moving … on" means one of yours waits for nothing the kit can see: move it on, or record what it waits for in one of those ways. If you are woken for the same item again without having moved it on (a pull request or commit referring to it, a label or a review; a comment, or a mention of it elsewhere, isn't), it becomes the human's.
 
-An issue you filed on your own repository for yourself, rather than a request, finishes as a request does: when its work is merged and `CHANGELOG.md` has its entry, add `ready-for-release`. A run starts for you when a pull request of yours that names it with `Refs` merges, as for a request. Nobody verifies it, so its release closes it.
+An issue you filed on your own repository for yourself, rather than a request, finishes as a request does: when its work is merged and `CHANGELOG.md` has its entry, add `ready-for-release`. As for an accepted request, a run starts for you when it has nothing blocking it and no pull request under way, and again when a pull request of yours that names it with `Refs` merges. Nobody verifies it, so its release closes it.
 
 ## Definition of done
 

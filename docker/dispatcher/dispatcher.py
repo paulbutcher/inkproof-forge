@@ -1075,8 +1075,9 @@ def owner_rules(it, blocked, unblocked_at):
                           f"your pull request {it.repo}#{p['number']} merged; it answers {at}"
                           + (f", released in {released[-1][1]} and not yet verified" if released else "")
                           + ", not yet labelled ready-for-release"))
-    if request and not released:
-        # 7. Accepted, nothing in its way and nothing under way, while the
+    if (request or task) and not released:
+        # 7. Accepted (or its own task, which it accepted by filing it:
+        #    demos#74), nothing in its way and nothing under way, while the
         #    owner has nothing to do: once each time it's unblocked, and once
         #    after each merge for it. Quiet, so it comes after the merge's own
         #    trigger (6), if that run left part of it to do (demo#3). And
@@ -1085,7 +1086,8 @@ def owner_rules(it, blocked, unblocked_at):
         #    nothing merged for it, otherwise waits for the stall check
         #    (demo#2). A run that looks and does nothing isn't woken again.
         last_merge = max((when(p["merged_at"]) for p, _ in merged), default=0)
-        if ("accepted" in it.labels and not held
+        what = "accepted request" if request else "issue"
+        if (("accepted" in it.labels or task) and not held
                 and not it.labels & {"new", "needs-human", "counter-proposal"}
                 and not any(it.n in refs for _, refs in owner_prs(it.repo, owner, "open"))
 ):
@@ -1093,11 +1095,11 @@ def owner_rules(it, blocked, unblocked_at):
             base, acted = f"idle-request:{at}:{started}", it.by(owner)
             if acted <= when(started):
                 o.append(Owed(owner, base,
-                              f"your accepted request {at} isn't blocked and has no pull request under way: work "
+                              f"your {what} {at} isn't blocked and has no pull request under way: work "
                               "on it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
             elif follow_ups(owner, base) < FOLLOW_UPS:
                 o.append(Owed(owner, f"{base}:{iso(acted)}",
-                              f"your accepted request {at} isn't finished: you last acted on it at {iso(acted)}, "
+                              f"your {what} {at} isn't finished: you last acted on it at {iso(acted)}, "
                               "and it has no pull request under way. Carry on with it, or say on it what it waits "
                               "for (a `Blocked-by:` line, or `needs-human`)", quiet=True))
     return o

@@ -256,7 +256,8 @@ class OwnerRules(Case):
         self.assertEqual(self.descriptions("core"), [f"comment on issue {CORE}#1"])
 
     def test_2_the_newest_ask_is_the_version_so_a_burst_is_one_trigger(self):
-        self.f.issue(CORE, 1, "core", events=[comment("scale", 300), comment("scale", 200), comment("scale", 100)])
+        # Held, so that its owner's rule 7 for its own issue stays out of it.
+        self.f.issue(CORE, 1, "core", ["blocked"], events=[comment("scale", 300), comment("scale", 200), comment("scale", 100)])
         d.evaluate(CORE, 1)
         self.handled()
         d.evaluate(CORE, 1)
@@ -462,6 +463,23 @@ class OwnerRules(Case):
         self.f.pull(CORE, 42, "core", body="Refs #38", state="closed", merged=2000)  # the part it could do
         d.evaluate(CORE, 38)
         self.assertEqual(self.queued("core"), ["unblocked"])
+
+    def test_7_an_owners_own_issue_demos_74(self):
+        # Filed for itself in the human's session: nothing else wakes it.
+        self.f.issue(CORE, 74, "core", created=600)
+        self.f.issue(CORE, 75, "core", ["blocked"], body="Blocked-by: org/inkproof-scale#93")
+        self.f.issue(SCALE, 93, "core", ["request", "new"])
+        self.f.issue(CORE, 76, "core")
+        self.f.pull(CORE, 77, "core", body="Refs #76")  # under way
+        for n in (74, 75, 76):
+            d.evaluate(CORE, n)
+        self.assertEqual(self.descriptions("core"),
+                         [f"your issue {CORE}#74 isn't blocked and has no pull request under way: work on it, or "
+                          "say on it what it waits for (a `Blocked-by:` line)"])
+        # The coordinator's own issues are its decisions and records.
+        self.f.issue(COORD, 3, "coordinator")
+        d.evaluate(COORD, 3)
+        self.assertNotIn("idle-request", self.queued("coordinator"))
 
     def test_7_and_8_float_5_unblocked_then_left_alone(self):
         self.f.issue(CORE, 2, "coordinator", ["request"], state="closed", closed=3000)
