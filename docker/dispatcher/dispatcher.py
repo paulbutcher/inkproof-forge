@@ -144,6 +144,11 @@ TRUSTED = set(AGENTS) | {"gatekeeper", "dispatcher", HUMAN}
 OWNER_OF = {a["own"]: name for name, a in AGENTS.items()
             if a["own"] and a["kind"] in ("library", "site", "coordinator")}
 COORDINATOR = next((n for n, a in AGENTS.items() if a["kind"] == "coordinator"), None)
+# The supervisor: woken when the kit is quiet with work stalled, to find out
+# why, move it on and report the gap (Stalls). None without one.
+SUPERVISOR = next((n for n, a in AGENTS.items() if a["kind"] == "supervisor"), None)
+# How many of the supervisor's comments on one item a day may wake someone.
+SUPERVISOR_NUDGES = int(os.environ.get("SUPERVISOR_NUDGES", "3"))
 COORDINATION = AGENTS[COORDINATOR]["own"] if COORDINATOR else f"{PREFIX}coordination"
 
 
@@ -776,7 +781,7 @@ RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unsched
               "idle-request",
               "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
               "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention",
-              "overtaken"}
+              "overtaken", "priority", "closed-unreleased"}
 # Kinds whose state, when the rules first run on an existing ledger, was
 # already acted on under the old event-driven triggers, or only reports what
 # happened: recorded as handled rather than queued. The others are work still
@@ -947,7 +952,16 @@ def blocked_rules(it):
     owed = []
     if not blocked:
         t, what = done[-1]
-        owed.append(Owed(it.owner, f"unblocked:{it.at}:{iso(t)}", f"{what}; {it.at} is blocked on it"))
+        # A released request its requester holds back from verifying, with a
+        # line of its own, waits on the requester, not the owner, who has
+        # nothing left to do (scene#51, web#86).
+        req = it.author
+        if (not it.is_pr and "request" in it.labels and "verified" not in it.labels and it.released()
+                and req in AGENTS and req != it.owner):
+            owed.append(Owed(req, f"unblocked:{it.at}:{iso(t)}",
+                             f"{what}; your request {it.at}, released and not yet verified, waits on it: verify it"))
+        else:
+            owed.append(Owed(it.owner, f"unblocked:{it.at}:{iso(t)}", f"{what}; {it.at} is blocked on it"))
     for (r, k), at in found.items():
         h = states[(r, k)]["human"]
         if h and when(h["created_at"]) >= when(at):  # to the second, on another issue
@@ -1060,7 +1074,7 @@ def owner_rules(it, blocked, unblocked_at):
     task = (not it.is_pr and it.author == owner and AGENTS[owner]["kind"] != "coordinator"
             and not it.labels & {"request", "ready-for-release", "verified", "upstream", "needs-human"})
     # Blocked by its Blocked-by: lines, or (naming none) by the label.
-    held = blocked if blocked is not None else "blocked" in it.labels
+    held = blocked if blocked is not None else "blocked" in it.labels and not stale_blocked(it)
     released = it.released()
     if request or task:
         # Since it was last unblocked (or accepted): earlier work was only part
@@ -1123,13 +1137,14 @@ def requester_rules(it):
     if it.open:
         released = it.released()
         # 10. Released: upgrade, check, verify; and again a day later. The
-        #     coordinator verifies its own requests in the run that released them.
+        #     The coordinator verifies its own requests in the run that released
+        #     them, so its trigger is dropped at the claim if it did; if it
+        #     didn't, this is what wakes it (gpu#57).
         if released:
             c, tag = released[-1]
-            if not (req == COORDINATOR and login(c) == "gatekeeper"):
-                o.append(Owed(req, f"released:{at}:{tag}",
-                              f"your request {at} was released in {tag}: upgrade to it, check its acceptance "
-                              "criteria, and verify it"))
+            o.append(Owed(req, f"released:{at}:{tag}",
+                          f"your request {at} was released in {tag}: upgrade to it, check its acceptance "
+                          "criteria, and verify it"))
             age = now() - when(c["created_at"])
             if age > NUDGE:
                 o.append(Owed(req, f"unverified:{at}:{tag}",
@@ -1307,12 +1322,24 @@ def mention_rules(it):
     #     hasn't commented on or acted on the item since: the human's way to
     #     reach an agent other than the owner, whom any comment wakes (2).
     #     An agent's mentions wake no one.
+    #     The supervisor's mentions wake too, the owner's included, since its
+    #     comments ask no reply of the owner (2); at most SUPERVISOR_NUDGES
+    #     of its comments a day on one item, so it can't keep an agent busy.
+    mine = [c for c in it.comments() if SUPERVISOR and login(c) == SUPERVISOR]
     for c in it.comments():
-        if login(c) != HUMAN:
+        who = login(c)
+        if who == SUPERVISOR:
+            day = [m for m in mine if when(c["created_at"]) - 86400 < when(m["created_at"]) <= when(c["created_at"])]
+            if len(day) > SUPERVISOR_NUDGES:
+                continue
+        elif who != HUMAN:
             continue
         for name in dict.fromkeys(MENTION.findall(c.get("body") or "")):
-            if name in AGENTS and name != it.owner and it.by(name) < when(c["created_at"]):
-                o.append(Owed(name, f"mention:{at}:{c['id']}", f"the human mentioned you on {it.kind} {at}"))
+            if (name in AGENTS and name != who and (name != it.owner or who == SUPERVISOR)
+                    and it.by(name) < when(c["created_at"])):
+                o.append(Owed(name, f"mention:{at}:{c['id']}",
+                              f"{'the human' if who == HUMAN else 'the supervisor'} mentioned you on {it.kind} {at}: "
+                              f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"))
     return o
 
 
@@ -1423,8 +1450,20 @@ def queue(o, seed=False):
     add_trigger(o.agent, o.key, o.description, once=True, not_before=o.not_before)
 
 
+def stale_blocked(it):
+    """Whether its `blocked` label is the dispatcher's, left with no
+    Blocked-by: lines to keep it (demos#74, whose label outlived its lines).
+    One someone else put on stays theirs."""
+    added = [e for e in it.events if e.get("type") == "label"
+             and (e.get("label") or {}).get("name") == "blocked" and (e.get("body") or "") == "1"]
+    return "blocked" in it.labels and bool(added) and login(added[-1]) == "dispatcher"
+
+
 def set_blocked(it, blocked):
-    """Keep the `blocked` label in step with the Blocked-by: lines."""
+    """Keep the `blocked` label in step with the Blocked-by: lines; with none
+    left, the dispatcher's own label comes off."""
+    if blocked is None and it.open and stale_blocked(it):
+        blocked = False
     if blocked is None or not it.open or blocked == ("blocked" in it.labels):
         return
     lid = label_id(it.repo, "blocked")
@@ -1732,6 +1771,10 @@ def check_stalls():
         if (repo, int(n)) not in stalled:
             q("DELETE FROM kv WHERE key=?", row["key"])
     queued = 0
+    # With a supervisor that can run, it is woken once for them all, to find
+    # out why each stalled, move it on and report the gap; else each owner.
+    supervised = SUPERVISOR if SUPERVISOR and not capped(SUPERVISOR) else None
+    for_supervisor = []
     for (repo, n), (it, owners) in stalled.items():
         key = f"stall:{repo}#{n}"
         rounds, first, mark = (json.loads(kv_get(key, "[0, 0]")) + [None])[:3]
@@ -1758,6 +1801,13 @@ def check_stalls():
                                        "close this issue.",
                 "Blocked on this": f"{repo}#{n}."})
             continue
+        if supervised:
+            for_supervisor.append(f"{repo}#{n} ({'; '.join(f'{why}: {a}' for a, why in owners)})")
+            kv_set(key, json.dumps([rounds + 1, first or spell, moved]))
+            add_notice(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
+                       f"the stall check woke the supervisor for this {it.kind}: it waited for nothing the kit can "
+                       f"see ({'; '.join(why for _, why in owners)})")
+            continue
         woke = False
         for agent, why in owners:
             if capped(agent):
@@ -1776,6 +1826,11 @@ def check_stalls():
                    f"the stall check woke {names} for this {it.kind}: it waited for nothing the kit can see "
                    f"({'; '.join(why for _, why in owners)}), and no rule had woken anyone for it. That is a gap "
                    "in the kit's rules; the process review looks into each one at the milestone's end.")
+    if for_supervisor:
+        add_trigger(supervised, f"supervise:{spell}",
+                    "the kit is quiet, and these wait for nothing the kit can see: " + "; ".join(for_supervisor)
+                    + ". Find out why each stalled, move it on, and report each gap (Role: Supervision)")
+        queued += 1
     return queued
 
 
@@ -2593,7 +2648,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, status())
         if url.path == "/ledger":
             # The run ledger, for the process review only.
-            if agent_for_key(self.bearer()) != "process":
+            if agent_for_key(self.bearer()) not in ("process", SUPERVISOR):
                 return self.reply(403, {"error": "only the process review reads the ledger"})
             since = float((urllib.parse.parse_qs(url.query).get("since") or ["0"])[0] or 0)
             runs = [dict(r, claimed=iso(r["claimed"]), started=iso(r["started"]), ended=iso(r["ended"]),

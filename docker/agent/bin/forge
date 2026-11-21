@@ -37,7 +37,7 @@ follow a rule tea can't enforce. Uses the agent's own token.
                                   "new|kept|agreed|fixed|withdrawn"}]}
   forge reviews <repo> <n>        the pull request's reviews: who, verdict,
                                   commit and text, oldest first
-  forge ledger [days]             (process) the run ledger for the last days
+  forge ledger [days]             (process, the supervisor) the run ledger for the last days
                                   (default 30): runs, the human's sessions,
                                   notices, as JSON
   forge release <repo> <note> [<issue>...]
@@ -327,7 +327,7 @@ def release(repo, note, issues):
 
 def ledger(days):
     if ME != "process":
-        die("only the process review reads the ledger")
+        die("only the supervisor (process) reads the ledger")
     import time
     with open("/run/secrets/runner_key") as f:
         key = f.read().strip()

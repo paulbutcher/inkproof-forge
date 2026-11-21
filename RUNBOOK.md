@@ -163,7 +163,7 @@ The kit files its own decisions the same way:
 - a request released two days ago that nobody has verified;
 - an item that stays stalled (`Stalled: <repo>#<n>`).
 
-A stall is usually a gap in the kit's rules, worth finding with `scripts/activity.sh <repo>#<n>`.
+When the kit goes quiet with work stalled, the supervisor (`process`) looks first: it finds out why each item stalled, nudges the agent that should act, and files a recommendation for each gap in the kit's rules. So a `Stalled:` decision means the supervisor's nudge didn't move the item on either, or it couldn't tell why; see what it said on the item, and `scripts/activity.sh <repo>#<n>`.
 
 Below level 3, the coordinator puts each library's ready release to you as a decision, `Release <repo>`, with the exact command to run.
 
@@ -320,6 +320,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 | `scripts/test-stage6.sh` | Level 2: the gatekeeper approves only on a real Actions run. |
 | `scripts/test-stage7.sh` | Level 3: the coordinator gates `API.lock`, and releases go through the gatekeeper. |
 | `scripts/test-stage8.sh` | Backups, pruning and restore-test. |
+| `scripts/test-stage9.sh` | Supervision: a stall no rule catches wakes the supervisor, not the owner, and the supervisor acts on it. Starts real Claude runs. |
 
 ### Changing an allowlist
 

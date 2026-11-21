@@ -32,7 +32,7 @@ There's one agent per repository, and each has its own role, in [roles/](roles/)
 There are also four reviewers. They own no repository, can't push, and read everything:
 
 - **`conformance`** runs on every pull request, once its CI has passed and its author has stopped pushing. It checks the change against the repository's `CLAUDE.md` and the protocol, including whether new code duplicates something that already exists, and names the rule each finding breaks. The pull request can't merge until it approves. After three rounds of disagreement with the author, the pull request goes to you to decide.
-- **`architecture`**, **`process`** and **`lasm`** run at the end of each milestone, when the coordinator (or you) opens a milestone issue.
+- **`architecture`**, **`process`** and **`lasm`** run at the end of each milestone, when the coordinator (or you) opens a milestone issue. `process` is also the supervisor: when the kit goes quiet with work stalled, it finds out why, nudges the agent that should act, and suggests a fix for the gap.
   - `architecture` looks at the libraries as a whole: boundaries, coupling, duplication between libraries, and workarounds that should be fixed where they started.
   - `process` looks at how the agents worked, from the run ledger, the transcripts and the review findings. It suggests changes that would prevent repeated mistakes or remove wasted runs.
   - `lasm` collects bugs and improvements for Lasm, the Lean-to-browser toolchain the libraries depend on, each with a reproduction. It also runs at once whenever a Lasm issue blocks an agent.

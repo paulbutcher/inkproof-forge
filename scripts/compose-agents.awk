@@ -44,8 +44,8 @@ file == 2 {
   print "      - agent-elan:/home/agent/.elan"
   printf "      - type: volume\n        source: run-archive\n        target: /var/lib/inkproof/archive\n"
   printf "        volume: { subpath: %s }\n", name
-  if (name == "process") {
-    print "      # Every agent's runs and the human's sessions, for the process review."
+  if (kind == "supervisor") {
+    print "      # Every agent's runs and the human's sessions, for supervision and the process review."
     print "      - type: volume\n        source: run-archive\n        target: /var/lib/inkproof/archive-all\n        read_only: true"
   }
 }

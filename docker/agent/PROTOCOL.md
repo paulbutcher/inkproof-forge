@@ -39,7 +39,7 @@ If your role says you own no repository (the reviewers), the sections on working
 
 ## Comments
 
-Your account identifies you, so don't sign comments. A comment from a trusted account that needs a reply starts a run for the agent that owns the repository, and a comment from the human that @-mentions you starts one for you, wherever it is: answer it or act on it there. When yours needs none, such as an acknowledgement or a thank-you, make its first line `(no reply needed)`, so it starts no one's run.
+Your account identifies you, so don't sign comments. A comment from a trusted account that needs a reply starts a run for the agent that owns the repository, and a comment from the human, or from the supervisor (`process`), that @-mentions you starts one for you, wherever it is: answer it or act on it there. The supervisor writes when something of yours has stalled, and says what to do: do it, or say on the item why not. When yours needs none, such as an acknowledgement or a thank-you, make its first line `(no reply needed)`, so it starts no one's run.
 
 Never discard the output of a command that changes Forgejo (a comment, a label, closing or opening an issue): don't send it to `/dev/null`, and check that it succeeded before you go on. A comment that silently failed leaves the change after it unexplained.
 
@@ -92,7 +92,7 @@ A run also starts for the requester when you counter-propose its request (`count
 
 When your request is counter-proposed, answer on it in that run. If you accept, take `counter-proposal` off and either close it with a comment, or keep it open with a `Blocked-by:` line for what remains. If you don't, say why and put it to the human as a decision. Never leave `counter-proposal` on a request you have answered: the kit reads the label, not the comments.
 
-That comment starts a run for the requester. Upgrade to the release, check the acceptance criteria, then add `verified` and close the issue. If you can't (the upgrade breaks your build, or a criterion isn't met), say so on the issue instead, and file what blocks you as usual. If it's still unverified a day after the release, you're woken again; after two days it becomes the human's problem.
+That comment starts a run for the requester. Upgrade to the release, check the acceptance criteria, then add `verified` and close the issue. If you can't (the upgrade breaks your build, or a criterion isn't met), say so on the issue instead, and file what blocks you as usual. If you can't verify it until something else is done, such as your own pull request that uses it, put a `Blocked-by:` line naming that on the request: you're woken when it closes or is released. If it's still unverified a day after the release, you're woken again; after two days it becomes the human's problem.
 
 Before closing a request you filed for any other reason, as a duplicate or no longer needed, read it and what refers to it. If its work has merged or it is labelled `ready-for-release`, don't close it: it is on its way, so verify it once it's released. Never close an issue that another issue's `Blocked-by:` line names: that issue waits for this one, so it can't be its duplicate. Otherwise say why in your closing comment.
 

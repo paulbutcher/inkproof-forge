@@ -52,7 +52,8 @@ What the kit enforces, how, and why. This is the specification the kit is built 
   - **Every repository, for each library agent:** Code, Issues and Pull requests read, so it can reuse before it builds. Forgejo lets anyone who can read a repository open an issue on it, so filing requests only on dependencies is the protocol's rule, not a permission.
 - **Reviewers own no repository.**
   - `conformance` has Code read and Pull requests write on every `inkproof-` repository, so it can review.
-  - `architecture`, `process` and `lasm` have Code read everywhere, and Issues write on `inkproof-coordination` only.
+  - `architecture` and `lasm` have Code read everywhere, and Issues write on `inkproof-coordination` only.
+  - `process`, the supervisor (kind `supervisor` in `agents.conf`), has Code read and Issues and Pull requests write everywhere, so that it can comment on any item it supervises, reopen one closed by mistake and take off a stale label. Its token has no repository write scope, so it can't approve, merge or push. It alone reads the run ledger and the whole run archive.
 
   No reviewer can push.
 - **Agents never administer.** No agent account is a repository or organisation admin, so none can change branch protection, tag protection, webhooks, mirrors or workflow settings. `.forgejo/`, `.github/` and `CLAUDE.md` are code-owned by the human.
@@ -75,7 +76,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 | Agents can't weaken CI | Workflows in `.forgejo/workflows/` are code-owned by the human; CI jobs run in `ci-docker`, never the host's Docker |
 | No agent runs code on GitHub except a site's build | `.github/` is code-owned by the human, and `setup-repo.sh` removes it everywhere but a site's Pages workflow; that workflow gives the repository's code read access to its own contents and nothing else |
 | Every API change still reaches the human once | `scripts/milestone-diff.sh`, against Forgejo, in each milestone issue |
-| Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination`; none can push, and policy files are read-only to every agent |
+| Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination` (the supervisor also comments on stalled items, and its mentions wake agents); none can push, and policy files are read-only to every agent |
 | Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers, names and links, never issue text |
 | No internet except essentials | Internal networks; the proxies' allowlists are the only exits, and list only tooling |
 | Nothing in the kit calls GitHub's API | No GitHub credential in any container except Forgejo's mirror credential; `api.github.com` is on no allowlist, and on Forgejo's only while `scripts/migrate.sh` runs |
@@ -243,15 +244,15 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   This rule applies only while the agent has nothing running or queued, and its accepted requests are looked at again when its run ends. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
 
   It fires again whenever the agent has acted on the request since, such as reporting progress on it, up to `FOLLOW_UP_RUNS` times (default 3) per unblocking or merge. So a run that works on a request and stops short, with nothing merged for it, is followed by another as soon as it ends, rather than waiting 20 minutes for the stall check. A run that looks and does nothing isn't followed up. Past the limit, the request waits for the stall check, which in time puts it to the human.
-- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. An issue closed while still labelled `ready-for-release` counts only once released: its work isn't out yet, whoever closed it. Or the human's comment on an open upstream issue that one of those lines names.
+- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. An issue closed while still labelled `ready-for-release` counts only once released: its work isn't out yet, whoever closed it. On a released request not yet verified, the requester's own lines (holding back its verification) wake the requester instead of the owner, who has nothing left to do. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 - **(28)** An open issue labelled `priority` by someone other than its owner, once each time the label goes on.
 
-The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is unreleased and open, or closed with `ready-for-release` still on it. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
+The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is unreleased and open, or closed with `ready-for-release` still on it, and off once no line is left, if the dispatcher put it on. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
 
 ### Every agent, on a request it filed
 
-- **(10)** A `Released in vX.Y.Z` comment, from the gatekeeper, the human or the repository's owner, while the request is open and not verified, and again a day after the release (`UNVERIFIED_NUDGE_SECONDS`). The exception is the gatekeeper's comment on the coordinator's own requests, which the coordinator verifies in the run that asked for the release.
+- **(10)** A `Released in vX.Y.Z` comment, from the gatekeeper, the human or the repository's owner, while the request is open and not verified, and again a day after the release (`UNVERIFIED_NUDGE_SECONDS`). The coordinator verifies its own requests in the run that asked for the release, so its trigger is dropped when it is claimed if it did; if it didn't, the trigger wakes it as it would any requester.
 - **(11)** On someone else's repository, a counter-proposal, or the request being closed without `verified` by someone other than the agent itself.
 
 ### The coordinator, across the `inkproof-` repositories
@@ -296,7 +297,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 ### Any agent, when the human mentions it
 
-- **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). An agent's @-mentions wake no one.
+- **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). The supervisor's @-mentions wake too, the owner's included, since its comments start `(no reply needed)` and so don't wake the owner by (2); at most `SUPERVISOR_NUDGES` (default 3) of its comments a day on one item wake anyone. Any other agent's @-mentions wake no one.
 
 ### Stalls
 
@@ -308,16 +309,18 @@ The rules can't foresee every way work stops. So once the kit has gone quiet (as
 - a released request's requester (rule 10);
 - for an issue, an open pull request referring to it.
 
-An item that isn't waiting for any of these wakes whoever should move it on, once per quiet spell:
+Each item that isn't waiting for any of these has someone who should move it on:
 - the reviewer;
 - the author of a pull request;
 - the coordinator, for `ready-for-release`;
 - the requester, for a counter-proposal;
 - otherwise, the repository's owner.
 
+Once per quiet spell, the stall check wakes the supervisor once for all of them, with each item, what should move it and whose that is. The supervisor reads each item, its timeline and the latest runs of the agents concerned, finds out why it stalled, and moves it on with the smallest step: a comment @-mentioning the agent that should act, saying what to do and why, which wakes that agent (26), or reopening an issue closed by mistake, or taking off a stale label. It never does an agent's work. Where a rule or the protocol should have caught the stall, it files a recommendation for the human, so the kit is fixed rather than the stall worked around. Without a supervisor, or with it capped, the stall check wakes whoever should move each item on, as before.
+
 An item still stalled after `STALL_ROUNDS` quiet spells (default 2) becomes a decision for the human instead, `Stalled: <repo>#<n>`. A capped agent isn't woken. The count starts again once the item waits visibly, or once someone other than the dispatcher has moved it on since the last wake: anything in its timeline but a comment or a mention from elsewhere, such as a pull request or commit referring to it, a label or a review. That catches progress made between two checks, while the kit was busy and no check saw the item waiting. A comment alone doesn't count, so an agent that only says what it will do still reaches the human.
 
-Each catch is a gap in the rules. So the human hears of it once (a `stall` notice, on the item), and the process review looks for why no rule fired and recommends the change that would have caught it. The coordinator's idle summary comes only in a quiet spell with nothing stalled.
+Each catch is a gap in the rules, or an agent's slip. The human hears of it once: a `stall` notice, with a comment on the item when an owner is woken; when the supervisor is woken, its recommendation is the report. The process review counts the catches at the milestone's end. The coordinator's idle summary comes only in a quiet spell with nothing stalled.
 
 ### The first sweep
 
@@ -353,7 +356,7 @@ Forgejo has no email without SMTP. The dispatcher records a notice for each of t
 - every `needs-human` label added, with a milestone's recommendations grouped into one notice per report;
 - every reached cap;
 - every `blocking` upstream issue;
-- every item the stall check catches, once each time it stalls;
+- every item the stall check catches, once each time it stalls (when the supervisor is woken for it, without a comment on the item: the supervisor reports the gap);
 - every run whose transcript rewrite failed;
 - runs failing before they get going, once until they get going again.
 

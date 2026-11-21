@@ -196,6 +196,12 @@ cmd_bootstrap() {
         for r in "${r_list[@]}"; do [ "$r" = "$COORDINATION" ] || others+=("$r"); done
         ensure_team "$name-read" "$U_READ" "$name" "${others[@]}"
         ensure_team "$name-coord" "$U_DEPS" "$name" "$COORDINATION" ;;
+      supervisor)
+        # A milestone reviewer that also supervises: it comments on any issue
+        # or pull request (to move stalled work on), reopens and takes off
+        # stale labels, but pushes nothing: its token has no repository write.
+        ensure_token "$name" "$SCOPES_ISSUES"
+        ensure_team "$name-supervise" "$U_REVIEW" "$name" "*" ;;
       *) die "agents.conf: $name has unknown kind $kind" ;;
     esac
   done < <(grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf)

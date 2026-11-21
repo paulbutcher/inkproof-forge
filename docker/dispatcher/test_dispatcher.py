@@ -227,7 +227,7 @@ class OwnerRules(Case):
 
     def test_26_the_humans_mention_wakes_that_agent_gpu_9(self):
         asks = comment("human", 300, "@coordinator inkproof-core is at level 3; decide. cc @scale @core @stranger "
-                                     "(not mail@lasm.org)")
+                                     "(not mail@lasm.org)", cid=26)
         self.f.pull(CORE, 9, "core", events=[asks, comment("scale", 200, "(no reply needed)\nSeen.")])
         self.f.pull(CORE, 10, "core", sha="b" * 40, events=[comment("scale", 100, "@coordinator please look")])
         d.evaluate(CORE, 9)
@@ -235,7 +235,8 @@ class OwnerRules(Case):
         self.assertEqual(sorted(k for k in self.queued() if k[1] == "mention"), [("coordinator", "mention")],
                          "scale has acted since; core is the owner, whom any comment wakes; an agent's mention "
                          "wakes no one")
-        self.assertIn(f"the human mentioned you on pull request {CORE}#9", self.descriptions("coordinator"))
+        self.assertIn(f"the human mentioned you on pull request {CORE}#9: http://forge/org/{CORE}/issues/9#issuecomment-26",
+                      self.descriptions("coordinator"))
         rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'mention:%'")
         self.f.items[(CORE, 9)]["events"].append(comment("coordinator", 50, "(no reply needed)\nApproved."))
         self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
@@ -649,6 +650,31 @@ class OwnerRules(Case):
         self.assertEqual(self.descriptions("core"),
                          [f"{SCALE}#62 was released in v0.22.0; {CORE}#57 is blocked on it"])
 
+    def test_8_a_requesters_own_line_on_its_released_request_wakes_it_scene_51(self):
+        self.f.pull(SCALE, 59, "scale", state="closed", merged=100)
+        self.f.issue(CORE, 51, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.18.0: ..."),
+                             comment("scale", 4000, "Not yet verified.\n\nBlocked-by: org/inkproof-scale#59")])
+        self.f.items[(SCALE, 59)]["state"] = "closed"
+        d.evaluate(CORE, 51)
+        self.assertNotIn("unblocked", self.queued("core"))
+        self.assertIn(f"pull request {SCALE}#59 merged; your request {CORE}#51, released and not yet verified, "
+                      "waits on it: verify it", self.descriptions("scale"))
+
+    def test_8_the_dispatchers_label_comes_off_with_its_last_line_demos_74(self):
+        # Its own issue, labelled by the dispatcher, whose lines are gone.
+        self.f.issue(CORE, 74, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="dispatcher")])
+        # The human's own label, with no lines, stays.
+        self.f.issue(CORE, 75, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="human")])
+        d.evaluate(CORE, 74)
+        d.evaluate(CORE, 75)
+        self.assertIn(("DELETE", f"/repos/org/{CORE}/issues/74/labels/1", None), self.f.writes)
+        self.assertNotIn(("DELETE", f"/repos/org/{CORE}/issues/75/labels/1", None), self.f.writes)
+        # And in the same evaluation, nothing holds #74 back any more (7).
+        self.assertEqual([x for x in self.descriptions("core") if "isn't blocked" in x],
+                         [f"your issue {CORE}#74 isn't blocked and has no pull request under way: work on it, or "
+                          "say on it what it waits for (a `Blocked-by:` line)"])
+
     def test_8_the_humans_comment_on_an_upstream_issue(self):
         self.f.issue(COORD, 9, "core", ["upstream"], events=[comment("human", 100, "Fixed in Lean 4.36.")])
         self.f.issue(CORE, 3, "core", ["blocked"], created=5000, body="Blocked-by: org/inkproof-coordination#9")
@@ -695,14 +721,20 @@ class RequesterRules(Case):
         d.evaluate(CORE, 9)
         self.assertEqual(self.queued("scale"), ["released"])
 
-    def test_10_not_the_coordinators_own_release_but_the_humans(self):
+    def test_10_the_coordinators_own_release_dropped_once_it_verifies_gpu_57(self):
         self.f.issue(CORE, 9, "coordinator", ["request"],
                      events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.3: ...")])
         self.f.issue(CORE, 10, "coordinator", ["request"],
-                     events=[comment("human", 100, "(no reply needed)\n\nReleased in v1.2.4: ...")])
+                     events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.4: ...")])
         d.evaluate(CORE, 9)
         d.evaluate(CORE, 10)
-        self.assertEqual([k for k in self.queued("coordinator") if k == "released"], ["released"])
+        self.assertEqual([k for k in self.queued("coordinator") if k == "released"], ["released", "released"])
+        # Its release run verified #9, as its role says, but not #10.
+        self.f.items[(CORE, 9)]["labels"].append({"name": "verified"})
+        d.q("UPDATE triggers SET created=?", d.now() - 3600)
+        self.assertEqual([t for t in d.claim("coordinator")["triggers"] if t.startswith("your request")],
+                         [f"your request {CORE}#10 was released in v1.2.4: upgrade to it, check its acceptance "
+                          "criteria, and verify it"])
 
     def test_10_still_unverified_a_day_later(self):
         self.f.issue(CORE, 9, "scale", ["request"],
@@ -1169,6 +1201,59 @@ class Stalls(Case):
                 self.clock + 3600)
         self.assertEqual(self.spell(), (0, []))
         self.assertIsNone(d.kv_get(f"stall:{CORE}#1"))
+
+
+class Supervisor(Case):
+    """With a supervisor, a stalled item wakes it, once for them all, rather
+    than each owner; and its mentions wake whoever they name."""
+
+    spell = Stalls.spell
+
+    def setUp(self):
+        super().setUp()
+        self.clock = d.now()
+        self.addCleanup(setattr, d, "now", d.now)
+        d.now = lambda: self.clock
+        self.addCleanup(d.AGENTS.pop, "process", None)
+        d.AGENTS["process"] = {"kind": "supervisor", "own": None}
+        self.addCleanup(setattr, d, "SUPERVISOR", d.SUPERVISOR)
+        d.SUPERVISOR = "process"
+
+    def test_a_quiet_spell_wakes_the_supervisor_once_for_every_stalled_item(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        self.f.issue(CORE, 5, "scale", ["request", "ready-for-release"])
+        self.assertEqual(self.spell(), (1, []))  # no owner is woken
+        sup = [r["description"] for r in d.q("SELECT description FROM triggers WHERE agent='process'")]
+        self.assertEqual(len(sup), 1)
+        self.assertIn(f"{CORE}#1 (nothing is moving it on: core)", sup[0])
+        self.assertIn(f"{CORE}#5 (it is labelled ready-for-release but hasn't been released: coordinator)", sup[0])
+        self.assertTrue(sup[0].endswith("Find out why each stalled, move it on, and report each gap (Role: Supervision)"))
+        # The human isn't sent a comment for each: the supervisor reports the gaps.
+        self.assertFalse([w for w in self.f.writes if w[1].endswith("/comments")])
+        # Still stalled after STALL_ROUNDS spells, each is the human's, as before.
+        self.spell()
+        self.assertEqual(self.spell(), (0, []))
+        self.assertEqual(sorted(r["kind"] for r in d.q("SELECT kind FROM notices")),
+                         ["stall", "stall", "stalled", "stalled"])
+
+    def test_a_capped_supervisor_leaves_it_to_the_owners(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        for _ in range(d.cap_of("process")):
+            d.q("INSERT INTO runs (agent, triggers, claimed, ended, turns, cost) VALUES ('process', '[]', ?, ?, 9, 1)",
+                self.clock + 3600, self.clock + 3600)
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+
+    def test_26_its_mention_wakes_the_owner_too_at_most_three_a_day(self):
+        nudges = [comment("process", 500 - 10 * i, f"(no reply needed)\n\n@core Move this on ({i}).") for i in range(4)]
+        self.f.issue(CORE, 4, "core", ["blocked"], events=nudges)
+        d.evaluate(CORE, 4)
+        self.assertEqual([x for x in self.descriptions("core") if "supervisor" in x],
+                         [f"the supervisor mentioned you on issue {CORE}#4: http://forge/org/{CORE}/issues/4"
+                          f"#issuecomment-{c['id']}" for c in nudges[:3]])
+        # An agent's mention still wakes no one.
+        self.f.issue(CORE, 5, "core", ["blocked"], events=[comment("scale", 100, "(no reply needed)\n\n@core Hi.")])
+        d.evaluate(CORE, 5)
+        self.assertFalse([x for x in self.descriptions("core") if f"{CORE}#5" in x])
 
 
 class Mechanics(Case):
