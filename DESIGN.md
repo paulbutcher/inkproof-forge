@@ -243,11 +243,11 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   This rule applies only while the agent has nothing running or queued, and its accepted requests are looked at again when its run ends. It fires once each time the request is unblocked, and once after each pull request merged for it, which comes after (6) has had its run: a request still open then has more to do.
 
   It fires again whenever the agent has acted on the request since, such as reporting progress on it, up to `FOLLOW_UP_RUNS` times (default 3) per unblocking or merge. So a run that works on a request and stops short, with nothing merged for it, is followed by another as soon as it ends, rather than waiting 20 minutes for the stall check. A run that looks and does nothing isn't followed up. Past the limit, the request waits for the stall check, which in time puts it to the human.
-- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. Or the human's comment on an open upstream issue that one of those lines names.
+- **(8)** An open issue whose `Blocked-by: <owner>/<repo>#<n>` lines name only issues now closed or released (a `Released in` comment), once each time. A line may name a pull request, which Forgejo closes when it merges. An issue closed while still labelled `ready-for-release` counts only once released: its work isn't out yet, whoever closed it. Or the human's comment on an open upstream issue that one of those lines names.
 - **(9)** CI failing on `main`.
 - **(28)** An open issue labelled `priority` by someone other than its owner, once each time the label goes on.
 
-The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is open and unreleased. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
+The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:` lines: on while an issue they name is unreleased and open, or closed with `ready-for-release` still on it. It keeps an upstream issue's `blocking` label in step with them too: on while an open item's lines name it. Agents write only the `Blocked-by:` lines.
 
 ### Every agent, on a request it filed
 
@@ -266,6 +266,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 - **(24)** An open milestone issue on which every milestone review has reported since `milestone-review` went on, if it hasn't commented since the last report.
 - **(18)** A release published by anyone but the gatekeeper and itself.
 - **(27)** An open `Release <repo>` decision it filed, when that library has published a release since it last acted there, whoever published it. A gatekeeper release can overtake one (18 doesn't fire for that), and the human's "go ahead" wakes the library's owner, not the coordinator.
+- **(29)** An issue closed while labelled `ready-for-release` and never released, once per close. Nothing else would release it, and what waits on it would wait for nothing. The coordinator reopens and releases it, or, if its work truly isn't wanted, takes the label off and says why.
 - **The idle summary.** The kit going quiet, once per quiet spell, with nothing stalled (see Stalls). Quiet means:
   - no run;
   - no queued work, except what a cap holds;
@@ -314,7 +315,7 @@ An item that isn't waiting for any of these wakes whoever should move it on, onc
 - the requester, for a counter-proposal;
 - otherwise, the repository's owner.
 
-An item still stalled after `STALL_ROUNDS` quiet spells (default 2) becomes a decision for the human instead, `Stalled: <repo>#<n>`. A capped agent isn't woken. The count starts again once the item waits visibly, or once someone other than the dispatcher has moved it on since the last wake: anything in its timeline but a comment, such as a pull request or commit referring to it, a label or a review. That catches progress made between two checks, while the kit was busy and no check saw the item waiting. A comment alone doesn't count, so an agent that only says what it will do still reaches the human.
+An item still stalled after `STALL_ROUNDS` quiet spells (default 2) becomes a decision for the human instead, `Stalled: <repo>#<n>`. A capped agent isn't woken. The count starts again once the item waits visibly, or once someone other than the dispatcher has moved it on since the last wake: anything in its timeline but a comment or a mention from elsewhere, such as a pull request or commit referring to it, a label or a review. That catches progress made between two checks, while the kit was busy and no check saw the item waiting. A comment alone doesn't count, so an agent that only says what it will do still reaches the human.
 
 Each catch is a gap in the rules. So the human hears of it once (a `stall` notice, on the item), and the process review looks for why no rule fired and recommends the change that would have caught it. The coordinator's idle summary comes only in a quiet spell with nothing stalled.
 

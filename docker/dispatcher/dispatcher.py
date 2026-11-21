@@ -908,7 +908,12 @@ def blocker_state(repo, n):
     comments = forge_comments(repo, n)
     labels = {l["name"] for l in issue.get("labels") or []}
     s = {"done": None, "what": None, "human": None}
-    if issue.get("state") == "closed":
+    # Closed while still labelled ready-for-release, its work isn't released:
+    # it blocks until it is (coordination#208, scene#62 closed by its
+    # requester before Scene's release).
+    unreleased = (issue.get("state") == "closed" and issue.get("pull_request") is None
+                  and "ready-for-release" in labels)
+    if issue.get("state") == "closed" and not unreleased:
         s["done"] = issue.get("closed_at") or issue.get("updated_at")
         if issue.get("pull_request") is not None:
             merged = (issue["pull_request"] or {}).get("merged")
@@ -1205,6 +1210,17 @@ def coordinator_rules(it):
             o.append(Owed(c, f"overtaken:{at}:{rel['tag_name']}",
                           f"{it.repo} released {rel['tag_name']} after your decision {at} asked the human to "
                           "release it: close the decision if that release covers it, or update it for what's left"))
+    if not it.open and not it.is_pr and "ready-for-release" in it.labels and not it.released():
+        # 29. Closed while ready for release, and never released: nothing
+        #     would release it, and what waits on it waits for nothing
+        #     (coordination#208: scene#62, closed by its requester as a
+        #     duplicate of the issue it blocked). Once per close.
+        closes = [e for e in it.events if e.get("type") == "close"]
+        if closes:
+            o.append(Owed(c, f"closed-unreleased:{at}:{closes[-1]['created_at']}",
+                          f"{at} was closed by {login(closes[-1]) or 'someone'} while labelled ready-for-release, "
+                          "and hasn't been released: reopen it and release it, or, if its work truly isn't "
+                          "wanted, take the label off and say why on it"))
     # 16. needs-human added or removed by someone else (not the kit), and it
     #     hasn't looked since. Not on a process or Lasm recommendation: those
     #     change the kit or go upstream, which is the human's, never its own
@@ -1668,13 +1684,19 @@ def stall_owners(it, blocked):
     return [(it.owner, "nothing is moving it on")]
 
 
+# Timeline entries that only mention an item from elsewhere: no progress on it.
+MENTIONS = {"comment", "comment_ref", "issue_ref"}
+
+
 def moved_at(it):
     """When anyone but the dispatcher last moved an item on: anything in its
-    timeline but a comment, such as a pull request or commit referring to it,
-    a label, a review or a push. A comment alone doesn't count, so an agent
-    that only says what it will do still reaches the human."""
+    timeline but a comment or a mention from elsewhere, such as a pull
+    request or commit referring to it, a label, a review or a push. A comment
+    alone doesn't count, so an agent that only says what it will do still
+    reaches the human; nor does a mention, which once filed the same stall
+    twice (coordination#209)."""
     return max([when(e["created_at"]) for e in it.events
-                if e.get("type") != "comment" and login(e) != "dispatcher"] or [0])
+                if e.get("type") not in MENTIONS and login(e) != "dispatcher"] or [0])
 
 
 def check_stalls():

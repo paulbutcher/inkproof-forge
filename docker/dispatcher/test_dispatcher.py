@@ -611,6 +611,21 @@ class OwnerRules(Case):
         d.evaluate(CORE, 19)
         self.assertEqual(self.descriptions("core"), [f"pull request {CORE}#13 merged; {CORE}#19 is blocked on it"])
 
+    def test_8_closed_but_never_released_still_blocks_coordination_208(self):
+        # Its requester closed scene#62 before Scene released it.
+        self.f.issue(SCALE, 62, "core", ["request", "accepted", "ready-for-release"], state="closed", closed=3000)
+        self.f.issue(CORE, 57, "coordinator", ["request", "accepted", "blocked"],
+                     events=[comment("core", 7000, "Blocked-by: org/inkproof-scale#62")])
+        d.evaluate(CORE, 57)
+        self.assertEqual(self.queued("core"), [])
+        self.assertNotIn(("DELETE", f"/repos/org/{CORE}/issues/57/labels/1", None), self.f.writes)
+        # Released after all: that unblocks it.
+        self.f.items[(SCALE, 62)]["events"].append(
+            comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v0.22.0: ..."))
+        d.evaluate(CORE, 57)
+        self.assertEqual(self.descriptions("core"),
+                         [f"{SCALE}#62 was released in v0.22.0; {CORE}#57 is blocked on it"])
+
     def test_8_the_humans_comment_on_an_upstream_issue(self):
         self.f.issue(COORD, 9, "core", ["upstream"], events=[comment("human", 100, "Fixed in Lean 4.36.")])
         self.f.issue(CORE, 3, "core", ["blocked"], created=5000, body="Blocked-by: org/inkproof-coordination#9")
@@ -766,6 +781,20 @@ class CoordinatorRules(Case):
         self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
                          [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has finished "
                           f"since you last looked at it. {BELOW_RELEASE}"])
+
+    def test_29_closed_while_ready_for_release_coordination_208(self):
+        self.f.issue(SCALE, 62, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
+                     events=[label("ready-for-release", True, 4000, who="scale"), event("close", "demos", 100)])
+        # Released, then closed by its requester: as it should be.
+        self.f.issue(SCALE, 63, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
+                     events=[comment("gatekeeper", 200, "(no reply needed)\n\nReleased in v0.22.0: ..."),
+                             event("close", "demos", 100)])
+        d.evaluate(SCALE, 62)
+        d.evaluate(SCALE, 63)
+        self.assertEqual([x for x in self.descriptions("coordinator") if "closed" in x],
+                         [f"{SCALE}#62 was closed by demos while labelled ready-for-release, and hasn't been "
+                          "released: reopen it and release it, or, if its work truly isn't wanted, take the label "
+                          "off and say why on it"])
 
     def test_15_not_once_it_has_looked(self):
         self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
@@ -1095,6 +1124,14 @@ class Stalls(Case):
         self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
         self.assertEqual(json.loads(d.kv_get(f"stall:{CORE}#1"))[0], 1)
         self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stall"])
+
+    def test_a_mention_from_elsewhere_isnt_progress_coordination_209(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.f.items[(CORE, 1)]["events"] += [event("comment_ref", "scale", 60), event("issue_ref", "scale", 50)]
+        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
+        self.assertEqual(self.spell(), (0, []))
+        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stalled"])
 
     def test_a_count_from_before_the_mark_carries_on(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"], events=[event("pull_ref", "core", 60)])
