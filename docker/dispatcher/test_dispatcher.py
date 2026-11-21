@@ -72,6 +72,7 @@ class Forge:
     def issue(self, repo, n, author, labels=(), state="open", body="", created=7200, events=(), closed=None,
               title="An issue"):
         self.items[(repo, n)] = {"number": n, "state": state, "user": {"login": author}, "body": body, "title": title,
+                                 "html_url": f"http://forge/org/{repo}/issues/{n}",
                                  "labels": [{"name": l} for l in labels], "created_at": at(created),
                                  "updated_at": at(0), "closed_at": at(closed) if closed is not None else None,
                                  "events": list(events), "reviews": [], "pr": None}
@@ -240,20 +241,22 @@ class OwnerRules(Case):
         self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
 
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
-        self.f.issue(CORE, 1, "core", events=[comment("scale", 300)])
+        self.f.issue(CORE, 1, "core", events=[comment("scale", 300, cid=1)])
         self.f.issue(CORE, 2, "core", events=[comment("scale", 300), comment("core", 200, "Answered.")])
         self.f.issue(CORE, 3, "core", events=[comment("scale", 300, "(no reply needed)\n\nThanks.")])
         self.f.issue(CORE, 4, "core", events=[comment("stranger", 300)])
         for n in (1, 2, 3, 4):
             d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("core"), [f"comment on issue {CORE}#1"])
+        self.assertEqual(self.descriptions("core"),
+                         [f"comment on issue {CORE}#1 from scale: http://forge/org/{CORE}/issues/1#issuecomment-1"])
 
     def test_2_in_the_same_second_the_timelines_order_decides(self):
-        self.f.issue(CORE, 1, "core", events=[comment("core", 100, "Mine."), comment("scale", 100)])
+        self.f.issue(CORE, 1, "core", events=[comment("core", 100, "Mine."), comment("scale", 100, cid=1)])
         self.f.issue(CORE, 2, "core", events=[comment("scale", 100), comment("core", 100, "Answered.")])
         d.evaluate(CORE, 1)
         d.evaluate(CORE, 2)
-        self.assertEqual(self.descriptions("core"), [f"comment on issue {CORE}#1"])
+        self.assertEqual(self.descriptions("core"),
+                         [f"comment on issue {CORE}#1 from scale: http://forge/org/{CORE}/issues/1#issuecomment-1"])
 
     def test_2_the_newest_ask_is_the_version_so_a_burst_is_one_trigger(self):
         # Held, so that its owner's rule 7 for its own issue stays out of it.
@@ -296,8 +299,9 @@ class OwnerRules(Case):
              "commit_id": "a" * 40, "submitted_at": at(300)}])
         for n in (7, 8, 9):
             d.evaluate(CORE, n)
-        self.assertIn(f"changes requested on pull request {CORE}#7", self.descriptions("core"))
-        self.assertIn(f"review on pull request {CORE}#8", self.descriptions("core"))
+        self.assertIn(f"changes requested on pull request {CORE}#7 by conformance (`forge reviews {CORE} 7`)",
+                      self.descriptions("core"))
+        self.assertIn(f"review on pull request {CORE}#8 by human (`forge reviews {CORE} 8`)", self.descriptions("core"))
         self.assertFalse([x for x in self.descriptions("core") if f"{CORE}#9" in x and "review" in x])
 
     def test_3_ci_failed_on_its_head(self):
@@ -446,8 +450,9 @@ class OwnerRules(Case):
         self.f.pull(CORE, 7, "core", body="Refs #6", state="closed", merged=6000)  # the released work
         self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)
         d.evaluate(CORE, 6)
-        self.assertIn(f"your pull request {CORE}#8 merged; it answers {CORE}#6, released in v0.2.0 and not yet "
-                      "verified, not yet labelled ready-for-release", self.descriptions("core"))
+        self.assertIn(f"your pull request {CORE}#8 merged after {CORE}#6 was released in v0.2.0: if it changes what "
+                      f"{CORE}#6 asked for, it needs ready-for-release again; if it only refers to it (an upgrade, "
+                      "a refactor), leave it to its requester", self.descriptions("core"))
         self.assertNotIn("idle-request", self.queued("core"))  # 7 still ends at the release
 
     def test_6_not_while_blocked_consumer_metrics_12(self):

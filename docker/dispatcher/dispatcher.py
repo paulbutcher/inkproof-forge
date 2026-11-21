@@ -20,8 +20,8 @@ needs them.
 
 Only trusted authors (the human and the kit's accounts) start work, never an
 agent's own actions, and never a comment whose first line is
-`(no reply needed)`. Trigger descriptions carry only numbers and names, never
-issue text, because they become a run's prompt.
+`(no reply needed)`. Trigger descriptions carry only numbers, names and
+links, never issue text, because they become a run's prompt.
 
 What an agent owes comes from rules over each issue and pull request as it
 is now (see Rules), never from the events themselves: a webhook only says
@@ -1003,11 +1003,16 @@ def owner_rules(it, blocked, unblocked_at):
     placed = lambda r: (when(r["submitted_at"]), next(
         (i for i, e in enumerate(it.events) if e.get("type") == "review" and login(e) == login(r)
          and e["created_at"] == r["submitted_at"]), -1))
-    asks = [(order(c, i), f"comment:{at}:{c['id']}", f"comment on {it.kind} {at}")
+    #    The trigger names who asked and links the comment, so a run reads
+    #    that one rather than looking for it (web#94: a run that couldn't
+    #    list the comments took an approval for the one that woke it).
+    link = lambda c: f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"
+    asks = [(order(c, i), f"comment:{at}:{c['id']}", f"comment on {it.kind} {at} from {login(c)}: {link(c)}")
             for i, c in enumerate(it.events) if c.get("type") == "comment"
             and login(c) in TRUSTED and login(c) != owner and wants_reply(c.get("body"))]
     asks += [(placed(r), f"review:{at}:{r['id']}",
-              f"{'changes requested on' if r['state'] == 'REQUEST_CHANGES' else 'review on'} pull request {at}")
+              f"{'changes requested on' if r['state'] == 'REQUEST_CHANGES' else 'review on'} pull request {at} "
+              f"by {login(r)} (`forge reviews {it.repo} {it.n}`)")
              for r in it.reviews if login(r) in TRUSTED and login(r) != owner and r.get("submitted_at")
              and (r.get("state") == "REQUEST_CHANGES" or (r.get("state") == "COMMENT" and wants_reply(r.get("body"))))]
     if asks:
@@ -1072,9 +1077,12 @@ def owner_rules(it, blocked, unblocked_at):
         if merged and not held:
             p = max(merged, key=lambda m: m[0]["merged_at"])[0]
             o.append(Owed(owner, f"merged:{at}:{p['number']}",
-                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}"
-                          + (f", released in {released[-1][1]} and not yet verified" if released else "")
-                          + ", not yet labelled ready-for-release"))
+                          f"your pull request {it.repo}#{p['number']} merged after {at} was released in "
+                          f"{released[-1][1]}: if it changes what {at} asked for, it needs ready-for-release again; "
+                          "if it only refers to it (an upgrade, a refactor), leave it to its requester"
+                          if released else
+                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
+                          "not yet labelled ready-for-release"))
     if (request or task) and not released:
         # 7. Accepted (or its own task, which it accepted by filing it:
         #    demos#74), nothing in its way and nothing under way, while the

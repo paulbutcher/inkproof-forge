@@ -185,8 +185,8 @@ s4_check_triggers() {
   local pr="$1" req="$2" nh="$3" up="$4" blocked="$5" n
   expect scale "^untriaged request $S4_DEP#$req$" "a request from the human"
   expect coordinator "^request filed: $S4_DEP#$req$" "a request filed"
-  n="$(pending scale | grep -c "^comment on issue $S4_DEP#$req$" || true)"
-  [ "$n" = 1 ] && s4_pass "scale has one comment trigger, consumer-metrics's question: its own, the no-reply and the untrusted comments start nothing" \
+  n="$(pending scale | grep -c "^comment on issue $S4_DEP#$req from " || true)"
+  [ "$n" = 1 ] && pending scale | grep -q "^comment on issue $S4_DEP#$req from consumer-metrics: http" && s4_pass "scale has one comment trigger, consumer-metrics's question: its own, the no-reply and the untrusted comments start nothing" \
     || s4_fail "scale has $n comment trigger(s) on #$req; expected 1 (consumer-metrics's question only)"
   expect_not scale "untrusted|$S4_DEP#999" "an untrusted or migrated request"
   [ "$(pending scale | grep -c "^untriaged request")" = 1 ] && s4_pass "the untrusted account's request started nothing" \

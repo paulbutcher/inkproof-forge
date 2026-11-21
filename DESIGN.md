@@ -76,7 +76,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 | No agent runs code on GitHub except a site's build | `.github/` is code-owned by the human, and `setup-repo.sh` removes it everywhere but a site's Pages workflow; that workflow gives the repository's code read access to its own contents and nothing else |
 | Every API change still reaches the human once | `scripts/milestone-diff.sh`, against Forgejo, in each milestone issue |
 | Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination`; none can push, and policy files are read-only to every agent |
-| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers and names, never issue text |
+| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers, names and links, never issue text |
 | No internet except essentials | Internal networks; the proxies' allowlists are the only exits, and list only tooling |
 | Nothing in the kit calls GitHub's API | No GitHub credential in any container except Forgejo's mirror credential; `api.github.com` is on no allowlist, and on Forgejo's only while `scripts/migrate.sh` runs |
 | Agents can't loosen their own rules | Managed settings, managed `CLAUDE.md`, git config and hooks are root-owned in the image or mounted read-only |
@@ -228,7 +228,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
 ### Every library agent and the coordinator, on its own repository
 
 - **(1)** An open request labelled `request` and `new` by someone else, or an open issue by someone else with no labels at all that it hasn't touched. (Forgejo drops the labels of anyone without write access to the repository's issues.)
-- **(2)** A comment, or a review that isn't an approval, by someone else on one of its open issues or pull requests, that wants a reply and is newer than anything it has done there. What it does in a run that started before the comment doesn't count, since that run was briefed without it. A request for changes always wants a reply.
+- **(2)** A comment, or a review that isn't an approval, by someone else on one of its open issues or pull requests, that wants a reply and is newer than anything it has done there. What it does in a run that started before the comment doesn't count, since that run was briefed without it. A request for changes always wants a reply. The trigger names who wrote it and links the comment (or, for a review, gives the `forge reviews` command), so the run reads that one rather than looking for it.
 - On one of its open pull requests:
   - **(3)** CI failing on the head.
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.
