@@ -305,7 +305,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 ### Any agent, when an item waits on it
 
-- **(30)** A `Waiting-on: <agent>` line, at the start of a line in a trusted account's comment, the latest such line on an open issue or pull request, if the agent it names hasn't acted there since. It is how a run that can't go on until another agent answers or acts says so in a way the kit can see, as `Blocked-by:` does for another issue (gpu#59: gpu waited on demos's reproduction, and nothing told demos). The wait holds until the agent it names acts on the item, or a later line names someone else or `none`. A line naming the human, or the writer itself, says nothing: the human is reached with `needs-human`. The repository's owner isn't woken by it when the same comment wants a reply, since (2) already wakes it.
+- **(30)** A `Waiting-on: <agent>` line, at the start of a line in a trusted account's comment, the latest such line on an issue or pull request, open or closed, if the agent it names hasn't acted there since. Closed counts too, since a verified request is where the talk after it goes on (gpu#59: the coordinator asked demos there for the release of its fix). It is how a run that can't go on until another agent answers or acts says so in a way the kit can see, as `Blocked-by:` does for another issue (gpu#59: gpu waited on demos's reproduction, and nothing told demos). The wait holds until the agent it names acts on the item, or a later line names someone else or `none`. A line naming the human, or the writer itself, says nothing: the human is reached with `needs-human`. The repository's owner isn't woken by it when the same comment wants a reply, since (2) already wakes it.
 
 ### Stalls
 

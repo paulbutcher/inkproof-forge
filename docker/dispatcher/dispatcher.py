@@ -1424,13 +1424,15 @@ def mention_rules(it):
 
 def waiting_rules(it):
     """What an item that says who it waits on asks of them."""
-    # 30. A `Waiting-on: <agent>` line, the latest on an open item, which
-    #     that agent hasn't acted on since: whoever wrote it can't go on
-    #     until that agent answers or acts there, and says so in a way the
-    #     kit can see (gpu#59, where gpu waited on demos's reproduction and
-    #     nothing told demos). The owner, whom a comment wanting a reply
+    # 30. A `Waiting-on: <agent>` line, the latest on an item, which that
+    #     agent hasn't acted on since: whoever wrote it can't go on until
+    #     that agent answers or acts there, and says so in a way the kit can
+    #     see (gpu#59, where gpu waited on demos's reproduction and nothing
+    #     told demos). Closed items too: a verified request is where the
+    #     talk after it goes on (gpu#59 again, the coordinator asking demos
+    #     for its release). The owner, whom a comment wanting a reply
     #     already wakes (2), isn't woken twice.
-    waiting = it.waiting_on() if it.open else None
+    waiting = it.waiting_on()
     if not waiting:
         return []
     who, c = waiting

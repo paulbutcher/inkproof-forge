@@ -278,8 +278,12 @@ class OwnerRules(Case):
         # line in a comment that wants no reply still wakes it.
         waits(7, comment("scale", 300, "Waiting-on: core"))
         waits(8, comment("scale", 300, "(no reply needed)\n\nWaiting-on: @core"))
+        # On a closed request too, where the talk after its verification goes on.
+        self.f.issue(CORE, 9, "scale", ["request", "verified"], state="closed",
+                     events=[comment("coordinator", 300, "Fix your changelog first.\n\nWaiting-on: scale")])
+        d.evaluate(CORE, 9)
         self.assertEqual(sorted((a, k) for a, k in self.queued() if k == "waiting"),
-                         [("core", "waiting"), ("scale", "waiting")])
+                         [("core", "waiting"), ("scale", "waiting"), ("scale", "waiting")])
         self.assertIn(f"core is waiting on you on issue {CORE}#1: http://forge/org/{CORE}/issues/1#issuecomment-31",
                       self.descriptions("scale"))
         rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'waiting:%' AND agent='scale'")
