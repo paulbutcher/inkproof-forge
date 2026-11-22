@@ -239,7 +239,7 @@ Only trusted authors count. An agent's own actions, and comments whose first lin
   - **(25)** No CI run at all for the head `CI_MISSING_SECONDS` (default 10 minutes) after it was pushed, as on a branch without the workflow.
   - **(4)** A conflict with `main`.
   - **(5)** No merge scheduled, once the owner's run has ended (it is looked at again then). Or a merge scheduled that hasn't gone through `MERGE_STUCK_SECONDS` (default 10 minutes) after nothing stood in its way: CI passed on the head, there's no conflict and no request for changes standing, and everyone a review was requested from has approved the head.
-- **(6)** An open request it hasn't labelled `ready-for-release` or `verified`, or on a library or site an issue it filed for itself that isn't a request (its own task, which its release closes), not blocked, that one of its pull requests refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description). The pull request must have merged since the request was last unblocked, and, once the request has been released, since its last `Released in` comment. That covers a fix for what the requester found missing in a release, which nothing else would release again.
+- **(6)** An open request it hasn't labelled `ready-for-release` or `verified`, or on a library or site an issue it filed for itself that isn't a request (its own task, which its release closes), not blocked, that one of its pull requests refers to with `Refs` (at the start of a line, or followed directly by the references in the middle of one) or "part of" (in its title or description). The pull request must have merged since the request was last unblocked (or at that moment: a pull request its `Blocked-by:` line names unblocks it by merging, gpu#59), and, once the request has been released, since its last `Released in` comment. That covers a fix for what the requester found missing in a release, which nothing else would release again.
 - **(7)** An accepted request, or on a library or site an issue it filed for itself that isn't a request (its own task, accepted by filing it), that:
   - isn't blocked;
   - has no open pull request referring to it;
@@ -322,8 +322,8 @@ Each item that isn't waiting for any of these has someone who should move it on:
 - the agent its `Waiting-on:` line names (30), until it acts there, whatever else would move the item;
 - the reviewer;
 - the author of a pull request;
+- the coordinator, for `ready-for-release`, even on a request released before, since its requester waits for that release;
 - the requester, for a released request not yet verified, or a counter-proposal;
-- the coordinator, for `ready-for-release`;
 - otherwise, the repository's owner.
 
 Where that would be an author outside the kit (neither an agent nor the human), it is the repository's owner, to take the item on or close it.

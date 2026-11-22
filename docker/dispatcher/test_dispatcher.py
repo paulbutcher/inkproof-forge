@@ -497,6 +497,17 @@ class OwnerRules(Case):
                       "a refactor), leave it to its requester", self.descriptions("core"))
         self.assertNotIn("idle-request", self.queued("core"))  # 7 still ends at the release
 
+    def test_6_the_pull_request_it_waited_on_counts_gpu_59(self):
+        # Its requester held back on the released request for the owner's
+        # pull request, whose merge unblocked it in the same second: that
+        # merge is still work after the unblocking, to be released.
+        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
+                             comment("scale", 300, "I'll switch once it's released.\n\nBlocked-by: org/inkproof-core#8")])
+        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)["closed_at"] = at(100)
+        d.evaluate(CORE, 6)
+        self.assertIn("merged", self.queued("core"))
+
     def test_6_not_while_blocked_consumer_metrics_12(self):
         self.f.issue(SCALE, 38, "coordinator", ["request"])
         self.f.issue(CORE, 12, "coordinator", ["request", "accepted", "blocked"], body="Blocked-by: org/inkproof-scale#38")
@@ -1812,6 +1823,12 @@ class NobodyOrphaned(Case):
                 can |= {wait} if wait else set()
                 if wait and not self.visible(s, specs) and wait not in who:
                     failures.append(f"seed {seed}: {at_} waits on {wait}, who wasn't woken ({sorted(who)}): {s}")
+                # Work waiting to be released is the coordinator's, even on a
+                # request released before, whose requester waits for it (gpu#59).
+                if (not wait and not s["pr"] and "ready-for-release" in s["labels"]
+                        and not self.visible(s, specs) and d.COORDINATOR not in who):
+                    failures.append(f"seed {seed}: {at_} is ready for release, but the coordinator wasn't woken "
+                                    f"({sorted(who)}): {s}")
                 if who - can:
                     failures.append(f"seed {seed}: {at_} woke {sorted(who - can)}, who can't move it on: {s}")
                 if not who and not self.visible(s, specs):

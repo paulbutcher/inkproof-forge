@@ -1107,8 +1107,10 @@ def owner_rules(it, blocked, unblocked_at):
             or it.label_event("accepted") or it.issue["created_at"]
         if released:
             since = max(since, released[-1][0]["created_at"], key=when)
+        # Merged at the moment it was unblocked counts: the pull request a
+        # Blocked-by: line names unblocks it by merging (gpu#59).
         merged = [(p, refs) for p, refs in owner_prs(it.repo, owner, "merged")
-                  if it.n in refs and when(p["merged_at"]) > when(since)]
+                  if it.n in refs and when(p["merged_at"]) >= when(since)]
         # 6. Merged work it still has to finish: CHANGELOG.md and ready-for-release.
         if merged and not held:
             p = max(merged, key=lambda m: m[0]["merged_at"])[0]
@@ -1794,14 +1796,16 @@ def stall_owners(it, blocked):
         if reviewers:
             return [(r, "your review of its head is requested and not given") for r in reviewers]
         return [(author, "it isn't merging, and no review or check is pending")] if author else []
+    # Work for it waiting to be released, even once released before: what
+    # its requester waits for next is that release (gpu#59).
+    if "ready-for-release" in labels:
+        return [(COORDINATOR, "it is labelled ready-for-release but hasn't been released")] if COORDINATOR else []
     # A released request waits on its requester, and rule 10's nudges are
     # no reason to wait: a run they woke can end without a word (gpu#59).
     # A requester that verifies elsewhere says so with a Blocked-by: line,
     # or puts it to the human.
     if "request" in labels and it.released() and "verified" not in labels:
         return [(author, f"it was released in {it.released()[-1][1]} and isn't verified")] if author else []
-    if "ready-for-release" in labels:
-        return [(COORDINATOR, "it is labelled ready-for-release but hasn't been released")] if COORDINATOR else []
     if "counter-proposal" in labels and it.author != it.owner:
         return [(author, "its counter-proposal waits for an answer")] if author else []
     if it.n in open_refs(it.repo):
