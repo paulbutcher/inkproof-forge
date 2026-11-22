@@ -57,7 +57,7 @@ Before designing anything new (a type, an algorithm, a group of lemmas), find ou
 3. Lean core, Std, Batteries and Mathlib: search them with Loogle (`https://loogle.lean-lang.org/json?q=<query>`) or by reading their source;
 4. other Lean packages, on Reservoir (`https://reservoir.lean-lang.org`).
 
-Say in the pull request, in a `Prior art:` line, what you looked for, where, and what you found: the job in a few words, and the libraries and modules you checked for it. "None found" is a fine conclusion, but not a whole line.
+Say in the pull request, in a `Prior art:` line, what you looked for, where, and what you found: the job in a few words, and the libraries and modules you checked for it, outside this project (Lean core, Std, Batteries, Mathlib, Reservoir) as well as in it. "None found" is a fine conclusion, but not a whole line, and code with no knowledge of your domain needs the search outside this project most: Lean core and Std hold far more than their names suggest (dates and time zones, parsing, formatting, arithmetic on `Nat`, `Int` and `Rat`). A request asking where something should live, or proposing a new library, carries the same line: a new library proposed without searching outside this project wastes the human's decision.
 
 - **In a library you depend on**: use it.
 - **In one of this project's libraries you don't depend on, or private in one you do**: don't write it again. If ARCH-1 lets you depend on that library, request that it be made public. If not, ask the coordinator, with a request on `inkproof-coordination`, to move it to the lowest library both can depend on. Either way, carry on as under "Never work around a dependency".
