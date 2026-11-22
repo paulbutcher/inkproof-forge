@@ -277,7 +277,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
   - no queued work, except what a cap holds;
   - the human active nowhere;
   - no CI;
-  - nothing new for `IDLE_SECONDS` (default 20 minutes).
+  - nothing new for `IDLE_SECONDS` (default 20 minutes). The dispatcher starting counts as new, so after a rollout the stall check runs the new rules over a kit that went quiet under the old ones (demos#105).
 
   It comes only when the set of items waiting on the human differs from the set at the last idle summary. Otherwise it would say again what they already know, while releases and verifications in between keep ending one quiet spell and starting the next. When the project finishes, it comes once, since nothing waiting on them is a change.
 

@@ -123,6 +123,12 @@ def now():
     return time.time()
 
 
+# When this dispatcher started: set at startup, and counted as activity, so
+# a rollout starts a quiet spell of its own and the stall check runs the new
+# rules over a kit that went quiet under the old ones (demos#105).
+STARTED = 0.0
+
+
 def iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)) if t else None
 
@@ -1996,10 +2002,10 @@ IDLE_TRIGGER = "the kit is idle"  # each idle trigger begins so
 
 
 def last_activity():
-    """When anything last happened: an event, work queued or a run ending,
-    leaving out the idle summaries themselves (and the human's sessions, so
-    reading one doesn't call for another)."""
-    found = [q("SELECT MAX(at) AS m FROM events")[0]["m"],
+    """When anything last happened: an event, work queued, a run ending or
+    the dispatcher starting, leaving out the idle summaries themselves (and
+    the human's sessions, so reading one doesn't call for another)."""
+    found = [STARTED, q("SELECT MAX(at) AS m FROM events")[0]["m"],
              q("SELECT MAX(created) AS m FROM triggers WHERE key NOT LIKE 'idle:%'")[0]["m"],
              q("SELECT MAX(ended) AS m FROM runs WHERE triggers NOT LIKE ?", f"%{IDLE_TRIGGER}%")[0]["m"]]
     return max([t for t in found if t] or [0])
@@ -2829,6 +2835,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    STARTED = now()
     log(f"listening on :8080; agents: {', '.join(AGENTS)}")
     threading.Thread(target=reconciler, daemon=True).start()
     threading.Thread(target=idler, daemon=True).start()

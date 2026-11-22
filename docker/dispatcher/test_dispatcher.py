@@ -1496,6 +1496,23 @@ class IdleSummary(Case):
         self.handled()
         return found
 
+    def test_a_restart_starts_a_quiet_spell_demos_105(self):
+        # A spell's check ran under the old rules; a rollout brings new ones,
+        # which run once the kit has been quiet IDLE seconds since the start.
+        checks = []
+        d.check_stalls = lambda: checks.append(self.clock) or 0
+        self.addCleanup(setattr, d, "STARTED", d.STARTED)
+        self.spell()
+        self.clock += d.IDLE + 60
+        d.check_idle()
+        self.assertEqual(len(checks), 1, "once per quiet spell")
+        d.STARTED = self.clock
+        d.check_idle()
+        self.assertEqual(len(checks), 1, "not until it has been quiet IDLE seconds since the start")
+        self.clock += d.IDLE + 60
+        d.check_idle()
+        self.assertEqual(len(checks), 2)
+
     def test_only_when_what_waits_on_the_human_changed_coordination_156(self):
         self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; 1 item waits on you"])
         # Releases and verifications in between, but the same item waits.
