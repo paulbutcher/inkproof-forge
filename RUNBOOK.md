@@ -314,7 +314,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 
 | Test | Checks |
 | --- | --- |
-| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out. Quick, isolated, and safe anywhere. |
+| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out, including the search for items nothing would move on (`NobodyOrphaned`: `ORPHAN_WORLDS`, default 500, widens it, and `ORPHAN_VERBOSE=1` lists every failure). Quick, isolated, and safe anywhere. |
 | `scripts/test-hook.sh` | Unit tests for the guard on your sessions in agents' containers. Quick, isolated, and safe anywhere. |
 | `scripts/test-stage1.sh` | Bootstrap, networks and proxies, CI in its own engine, that agents can't tag or release, and Actions webhooks. |
 | `scripts/test-stage2.sh` | Migration from GitHub, attribution, mirrors, and dependencies fetched from Forgejo. With `MIRROR_TEST_REPO`, a round trip through a scratch GitHub repository. |

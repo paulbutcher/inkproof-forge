@@ -257,6 +257,31 @@ class OwnerRules(Case):
         self.assertIn(f"core, its owner, mentioned you on issue {CORE}#9: "
                       f"http://forge/org/{CORE}/issues/9#issuecomment-59", self.descriptions("scale"))
 
+    def test_30_waiting_on_wakes_the_agent_it_names_gpu_59(self):
+        def waits(n, *events, author="scale", labels=("request", "accepted")):
+            self.f.issue(CORE, n, author, labels, events=events)
+            d.evaluate(CORE, n)
+        waits(1, comment("core", 300, "I can't reproduce it; I need your frame.\n\nWaiting-on: scale", cid=31))
+        # Answered: scale has acted since.
+        waits(2, comment("core", 300, "Waiting-on: scale"), comment("scale", 200, "(no reply needed)\n\nAttached."))
+        # A later line decides: none, the human (needs-human reaches them), or the writer itself.
+        waits(3, comment("core", 300, "Waiting-on: scale"), comment("core", 200, "Waiting-on: none"))
+        waits(4, comment("core", 300, "Waiting-on: human"))
+        waits(5, comment("scale", 300, "(no reply needed)\n\nWaiting-on: scale"))
+        # An untrusted account's line says nothing.
+        waits(6, comment("stranger", 300, "Waiting-on: scale"))
+        # Its owner, whom the comment wakes anyway (2), isn't woken twice; a
+        # line in a comment that wants no reply still wakes it.
+        waits(7, comment("scale", 300, "Waiting-on: core"))
+        waits(8, comment("scale", 300, "(no reply needed)\n\nWaiting-on: @core"))
+        self.assertEqual(sorted((a, k) for a, k in self.queued() if k == "waiting"),
+                         [("core", "waiting"), ("scale", "waiting")])
+        self.assertIn(f"core is waiting on you on issue {CORE}#1: http://forge/org/{CORE}/issues/1#issuecomment-31",
+                      self.descriptions("scale"))
+        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'waiting:%' AND agent='scale'")
+        self.f.items[(CORE, 1)]["events"].append(comment("scale", 50, "Here it is."))
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once answered")
+
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
         self.f.issue(CORE, 1, "core", events=[comment("scale", 300, cid=1)])
         self.f.issue(CORE, 2, "core", events=[comment("scale", 300), comment("core", 200, "Answered.")])
@@ -1173,6 +1198,7 @@ class Stalls(Case):
         self.f.pull(CORE, 11, "core", events=requested("conformance"), reviews=approved)  # approved, not merging
         self.f.pull(CORE, 12, "core", events=requested("conformance", "human"), reviews=approved)  # the human's
         self.f.issue(CORE, 13, "scale", ["request", "counter-proposal"])  # the requester's answer
+        # Released: its requester's, rule 10's nudges notwithstanding (gpu#59).
         self.f.issue(CORE, 14, "scale", ["request"], events=[comment("gatekeeper", 100, "Released in v1.0.0")])
         self.f.issue(COORD, 9, "core", ["upstream", "upstream:lasm"])  # the world outside
         # Its reviewers wait for CI, so only its author can move it (export#4).
@@ -1181,9 +1207,9 @@ class Stalls(Case):
         n, found = self.spell()
         self.assertEqual(found, sorted([("core", f"{CORE}#1"), ("coordinator", f"{CORE}#5"),
                                         ("conformance", f"{CORE}#7"), ("core", f"{CORE}#10"),
-                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13"),
+                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13"), ("scale", f"{CORE}#14"),
                                         ("core", f"{CORE}#15"), ("core", f"{CORE}#16")]))
-        self.assertEqual(n, 8)
+        self.assertEqual(n, 9)
 
     def test_twice_without_moving_then_the_humans_and_a_fix_starts_again(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])
@@ -1651,6 +1677,150 @@ class Priority(Case):
             f"priority items open on your repository: {CORE}#3: they come before anything new (Protocol: Priority)",
             f"a comment on {CORE}#1",
             "the kit is idle"])
+
+
+
+class NobodyOrphaned(Case):
+    """Not a proof, but the next best thing: random worlds of issues and pull
+    requests, as Forgejo could hold them, and in each, once the kit is
+    quiet, every open item waits on something the kit can see, or the stall
+    check wakes an agent that can move it on. What counts as visible is
+    written here apart from stall_owners, so that each checks the other.
+    ORPHAN_WORLDS sets how many worlds, ORPHAN_SEED where they start."""
+
+    WORLDS = int(os.environ.get("ORPHAN_WORLDS", "500"))
+    SEED = int(os.environ.get("ORPHAN_SEED", "0"))
+    AUTHORS = ("core", "scale", "coordinator", "demos", "human", "stranger")
+    LABELS = ("request", "accepted", "new", "needs-human", "upstream", "blocked", "ready-for-release",
+              "counter-proposal", "verified")
+
+    def setUp(self):
+        super().setUp()
+        self.real_now = d.now
+        self.addCleanup(setattr, d, "now", self.real_now)
+
+    def reset(self):
+        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels"):
+            d.q(f"DELETE FROM {t}")
+        d._cache.clear()
+        self.f = Forge()
+        d.forge = self.f
+        self.clock = self.real_now()
+        d.now = lambda: self.clock
+
+    def world(self, rng):
+        specs = []
+        for _ in range(rng.randint(1, 6)):
+            repo = rng.choice((CORE, SCALE))
+            specs.append({"repo": repo, "n": 1 + sum(s["repo"] == repo for s in specs), "pr": rng.random() < 0.4})
+        issues = [s for s in specs if not s["pr"]]
+        for s in specs:
+            s.update(author=rng.choice(self.AUTHORS), open=rng.random() < 0.8,
+                     labels=[l for l in self.LABELS if rng.random() < (0.05 if s["pr"] else 0.25)],
+                     human_assigned=rng.random() < 0.1, released=not s["pr"] and rng.random() < 0.3,
+                     blocked_by=rng.choice(issues) if issues and rng.random() < 0.3 else None)
+            if s["blocked_by"] is s:
+                s["blocked_by"] = None
+            if rng.random() < 0.3:
+                s["wait"] = (rng.choice(("core", "scale", "demos", "coordinator", "human", "stranger")),
+                             rng.choice(("core", "scale", "demos", "coordinator", "conformance", "human", "none")),
+                             rng.random() < 0.3)  # who wrote it, whom it names, and whether they answered
+            if s["pr"]:
+                mine = [i for i in issues if i["repo"] == s["repo"]]
+                s.update(refs=rng.choice(mine) if mine and rng.random() < 0.5 else None,
+                         requested=[r for r in ("conformance", "human") if rng.random() < 0.4],
+                         review=rng.choice((None, "APPROVED", "REQUEST_CHANGES", "stale")),
+                         ci=rng.choice((None, "success", "failure")), wip=rng.random() < 0.1,
+                         sha=format(rng.getrandbits(160), "040x"))
+        for s in specs:
+            body = "\n".join(([f"Blocked-by: org/{s['blocked_by']['repo']}#{s['blocked_by']['n']}"]
+                              if s["blocked_by"] else []) + ([f"Refs #{s['refs']['n']}"] if s.get("refs") else []))
+            events = [comment("gatekeeper", 1000, "(no reply needed)\n\nReleased in v1.0.0: ...")] if s["released"] else []
+            if s.get("wait"):
+                writer, named, answered = s["wait"]
+                events.append(comment(writer, 800, f"(no reply needed)\n\nWaiting-on: {named}"))
+                if answered:
+                    events.append(comment(named, 600, "(no reply needed)\n\nDone."))
+            state = "open" if s["open"] else "closed"
+            if s["pr"]:
+                events += [{**event("review_request", s["author"], 4000), "assignee": {"login": r}}
+                           for r in s["requested"]]
+                reviews = [{"id": 1, "user": {"login": "conformance"}, "submitted_at": at(500),
+                            "state": "REQUEST_CHANGES" if s["review"] == "stale" else s["review"],
+                            "commit_id": "0" * 40 if s["review"] == "stale" else s["sha"]}] if s["review"] else []
+                i = self.f.pull(s["repo"], s["n"], s["author"], s["labels"], sha=s["sha"], events=events,
+                                reviews=reviews, body=body, state=state, ci=s["ci"],
+                                title="WIP: work" if s["wip"] else "Work")
+            else:
+                i = self.f.issue(s["repo"], s["n"], s["author"], s["labels"], state, body, events=events)
+            i["assignees"] = [{"login": "human"}] if s["human_assigned"] else []
+        return specs
+
+    @staticmethod
+    def waiting(s):
+        """The agent an item's Waiting-on: line holds it for, if any."""
+        if not s.get("wait"):
+            return None
+        writer, named, answered = s["wait"]
+        answered = answered or (named == "conformance" and s.get("review"))
+        if writer in d.TRUSTED and named in d.AGENTS and named != writer and not answered:
+            return named
+        return None
+
+    @staticmethod
+    def visible(s, specs):
+        """What an open item may wait on without anyone being woken: the
+        human, the world outside, another open item, or its pull request."""
+        if not s["open"] or "needs-human" in s["labels"] or s["human_assigned"] or "upstream" in s["labels"]:
+            return "closed, the human's or upstream"
+        b = s["blocked_by"]
+        if b and s["author"] in d.TRUSTED and not b["released"] and (
+                b["open"] or "ready-for-release" in b["labels"]):
+            return "blocked by an open or unreleased issue"
+        if NobodyOrphaned.waiting(s):
+            return None
+        if s["pr"]:
+            if s["author"] == "human" or "human" in s["requested"]:
+                return "the human's pull request, or their review"
+            return None
+        if any(p["pr"] and p["open"] and p.get("refs") is s for p in specs):
+            return "its open pull request, checked in its own right"
+        if (s["author"] == "human" and "request" in s["labels"] and s["released"]
+                and "verified" not in s["labels"]):
+            return "released, for the human to verify"
+        if s["author"] == "human" and "counter-proposal" in s["labels"]:
+            return "a counter-proposal, for the human to answer"
+        return None
+
+    def test_every_open_item_waits_visibly_or_someone_is_woken(self):
+        failures = []
+        for seed in range(self.SEED, self.SEED + self.WORLDS):
+            rng = __import__("random").Random(seed)
+            self.reset()
+            specs = self.world(rng)
+            self.clock += 3600
+            d._cache.clear()
+            d.check_stalls()
+            woken = {}
+            for r in d.q("SELECT agent, key FROM triggers WHERE key LIKE 'stalled:%'"):
+                woken.setdefault(r["key"].split(":")[1], set()).add(r["agent"])
+            for s in specs:
+                at_ = f"{s['repo']}#{s['n']}"
+                who = woken.get(at_, set())
+                can = {d.OWNER_OF[s["repo"]], s["author"], d.COORDINATOR} | set(s.get("requested", []))
+                wait = self.waiting(s)
+                can |= {wait} if wait else set()
+                if wait and not self.visible(s, specs) and wait not in who:
+                    failures.append(f"seed {seed}: {at_} waits on {wait}, who wasn't woken ({sorted(who)}): {s}")
+                if who - can:
+                    failures.append(f"seed {seed}: {at_} woke {sorted(who - can)}, who can't move it on: {s}")
+                if not who and not self.visible(s, specs):
+                    failures.append(f"seed {seed}: {at_} is orphaned: "
+                                    f"{ {k: (v and f'{v['repo']}#{v['n']}') if k in ('blocked_by', 'refs') else v for k, v in s.items()} }")
+        if os.environ.get("ORPHAN_VERBOSE"):
+            print("\n".join(failures))
+        self.maxDiff = None
+        self.assertEqual(failures[:5], [], f"{len(failures)} failures in {self.WORLDS} worlds")
 
 
 if __name__ == "__main__":

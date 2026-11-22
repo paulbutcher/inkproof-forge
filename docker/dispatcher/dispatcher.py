@@ -110,6 +110,9 @@ KEEP_PAYLOADS = 500
 MAX_BODY = 25 * 1024 * 1024
 NO_REPLY = "(no reply needed)"
 BLOCKED_BY = re.compile(r"Blocked-by:[ \t]*([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([0-9]+)")
+# Who an item waits on, as its latest such line says: an agent's name, or
+# `none` to say it waits on no one any more.
+WAITING_ON = re.compile(r"(?im)^[ \t]*Waiting-on:[ \t]*@?([A-Za-z0-9_.-]+)")
 
 
 def log(msg):
@@ -779,7 +782,7 @@ RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unsched
               "idle-request",
               "unblocked", "upstream-comment", "released", "unanswered", "unverified", "answered", "filed", "pr-opened",
               "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention",
-              "overtaken", "priority", "closed-unreleased"}
+              "overtaken", "priority", "closed-unreleased", "waiting"}
 # Kinds whose state, when the rules first run on an existing ledger, was
 # already acted on under the old event-driven triggers, or only reports what
 # happened: recorded as handled rather than queued. The others are work still
@@ -840,6 +843,21 @@ class Item:
         found = [e["created_at"] for e in self.events if e.get("type") == "label"
                  and (e.get("label") or {}).get("name") == label and ((e.get("body") or "") == "1") == added]
         return found[-1] if found else None
+
+    def waiting_on(self):
+        """The agent this item waits on, with the comment that says so, or
+        None. The latest `Waiting-on:` line from a trusted account decides,
+        and the wait holds until the agent it names acts here. A name that
+        isn't an agent's, or the writer's own, says nothing: the human is
+        reached with `needs-human`."""
+        for c in reversed(self.comments()):
+            names = WAITING_ON.findall(c.get("body") or "") if login(c) in TRUSTED else []
+            if names:
+                who = names[-1]
+                if who in AGENTS and who != login(c) and self.by(who) < when(c["created_at"]):
+                    return who, c
+                return None
+        return None
 
     def released(self):
         """The `Released in vX.Y.Z` comments (from the gatekeeper, the human
@@ -1367,6 +1385,25 @@ def mention_rules(it):
     return o
 
 
+def waiting_rules(it):
+    """What an item that says who it waits on asks of them."""
+    # 30. A `Waiting-on: <agent>` line, the latest on an open item, which
+    #     that agent hasn't acted on since: whoever wrote it can't go on
+    #     until that agent answers or acts there, and says so in a way the
+    #     kit can see (gpu#59, where gpu waited on demos's reproduction and
+    #     nothing told demos). The owner, whom a comment wanting a reply
+    #     already wakes (2), isn't woken twice.
+    waiting = it.waiting_on() if it.open else None
+    if not waiting:
+        return []
+    who, c = waiting
+    if who == it.owner and wants_reply(c.get("body")):
+        return []
+    return [Owed(who, f"waiting:{it.at}:{c['id']}",
+                 f"{login(c)} is waiting on you on {it.kind} {it.at}: "
+                 f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}")]
+
+
 def owed_on(it):
     """Everything owed on an item, and whether it is blocked (None if it
     names no blocker), with the issues it names."""
@@ -1376,6 +1413,7 @@ def owed_on(it):
     owed += coordinator_rules(it)
     owed += reviewer_rules(it)
     owed += mention_rules(it)
+    owed += waiting_rules(it)
     return [o for o in owed if o.agent in AGENTS], blocked, found
 
 
@@ -1701,10 +1739,11 @@ def reconcile():
 # quiet with work open. So once the kit has gone quiet, every open issue and
 # pull request must be waiting for something the kit can see: the human, an
 # open issue its Blocked-by: lines name, a reviewer, the world outside (an
-# upstream issue), a released request's requester (rule 10 nudges them, then
-# it's the human's), or its own pull request. One that isn't wakes whoever
+# upstream issue), CI, or its own pull request. One that isn't wakes whoever
 # should move it on, once per quiet spell; after STALL_ROUNDS spells it is
-# the human's.
+# the human's. Nothing else is an excuse: a rule that ought to have woken
+# someone is no proof that it did (gpu#59), and test_dispatcher's
+# NobodyOrphaned checks this holds for every item it can generate.
 
 STALL_ROUNDS = int(os.environ.get("STALL_ROUNDS", "2"))
 
@@ -1723,8 +1762,21 @@ def stall_owners(it, blocked):
         return []
     if "upstream" in labels or blocked:
         return []
+    # Waiting on an agent, as its latest Waiting-on: line says (30): that
+    # agent's, whatever else would otherwise move it.
+    waiting = it.waiting_on()
+    if waiting:
+        return [(waiting[0], f"{login(waiting[1])} is waiting on you")]
+    # What its author must do falls to an agent author; the human's is
+    # theirs, which they can see; and an outsider's, which no rule answers,
+    # falls to the owner, to take on or close.
+    if it.author == HUMAN:
+        author = None
+    else:
+        author = it.author if it.author in AGENTS else it.owner
     if it.is_pr:
-        author = it.author if it.author in AGENTS else None
+        if it.author == HUMAN:
+            return []
         if wip(it.pr.get("title")):
             return [(author, "it is marked work in progress")] if author else []
         verdicts = it.verdicts()
@@ -1736,18 +1788,22 @@ def stall_owners(it, blocked):
             why = "CI has never run on its head" if it.ci() == "none" else "CI failed on its head"
             return [(author, why)] if author else []
         pending = {who for who in it.requested() if not (who in verdicts and verdicts[who].get("commit_id") == it.head)}
-        if HUMAN in pending or (author is None and it.author == HUMAN):
+        if HUMAN in pending:
             return []
         reviewers = sorted(p for p in pending if p in AGENTS)
         if reviewers:
             return [(r, "your review of its head is requested and not given") for r in reviewers]
         return [(author, "it isn't merging, and no review or check is pending")] if author else []
+    # A released request waits on its requester, and rule 10's nudges are
+    # no reason to wait: a run they woke can end without a word (gpu#59).
+    # A requester that verifies elsewhere says so with a Blocked-by: line,
+    # or puts it to the human.
     if "request" in labels and it.released() and "verified" not in labels:
-        return []
+        return [(author, f"it was released in {it.released()[-1][1]} and isn't verified")] if author else []
     if "ready-for-release" in labels:
         return [(COORDINATOR, "it is labelled ready-for-release but hasn't been released")] if COORDINATOR else []
     if "counter-proposal" in labels and it.author != it.owner:
-        return [(it.author, "its counter-proposal waits for your answer")] if it.author in AGENTS else []
+        return [(author, "its counter-proposal waits for an answer")] if author else []
     if it.n in open_refs(it.repo):
         return []  # its pull request is checked in its own right
     if not it.owner:

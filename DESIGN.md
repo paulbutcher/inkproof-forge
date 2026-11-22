@@ -303,22 +303,32 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 - **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). The supervisor's @-mentions wake too, the owner's included, since its comments start `(no reply needed)` and so don't wake the owner by (2); at most `SUPERVISOR_NUDGES` (default 3) of its comments a day on one item wake anyone. On a request, the owner's comment that wants a reply and @-mentions the requester wakes the requester: it is the owner's way to ask what only the requester knows, such as its reproduction, which nothing else carries to it (gpu#59). The owner's other comments, such as accepting or `Ready for release`, don't wake the requester unless they mention it. Any other agent's @-mentions wake no one.
 
+### Any agent, when an item waits on it
+
+- **(30)** A `Waiting-on: <agent>` line, at the start of a line in a trusted account's comment, the latest such line on an open issue or pull request, if the agent it names hasn't acted there since. It is how a run that can't go on until another agent answers or acts says so in a way the kit can see, as `Blocked-by:` does for another issue (gpu#59: gpu waited on demos's reproduction, and nothing told demos). The wait holds until the agent it names acts on the item, or a later line names someone else or `none`. A line naming the human, or the writer itself, says nothing: the human is reached with `needs-human`. The repository's owner isn't woken by it when the same comment wants a reply, since (2) already wakes it.
+
 ### Stalls
 
 The rules can't foresee every way work stops. So once the kit has gone quiet (as for the idle summary), every open issue and pull request must be waiting for something the kit can see:
-- the human: `needs-human`, assigned to them, or their review requested and not given on the head;
+- the human: `needs-human`, assigned to them, their review requested and not given on the head, or their own pull request, or their own request's counter-proposal or release;
 - an open, unreleased issue its `Blocked-by:` lines name;
 - an upstream issue;
 - a reviewer asked for and not yet answered, on a head whose CI passed (until CI passes, only the author can move a pull request);
-- a released request's requester (rule 10);
 - for an issue, an open pull request referring to it.
 
+Nothing else counts, not even a rule that ought to have woken someone: a released request isn't excused by rule 10's nudges, since a run they woke can end without a word (gpu#59).
+
 Each item that isn't waiting for any of these has someone who should move it on:
+- the agent its `Waiting-on:` line names (30), until it acts there, whatever else would move the item;
 - the reviewer;
 - the author of a pull request;
+- the requester, for a released request not yet verified, or a counter-proposal;
 - the coordinator, for `ready-for-release`;
-- the requester, for a counter-proposal;
 - otherwise, the repository's owner.
+
+Where that would be an author outside the kit (neither an agent nor the human), it is the repository's owner, to take the item on or close it.
+
+The dispatcher's tests check this on random worlds of issues and pull requests (`NobodyOrphaned` in `test_dispatcher.py`): in each, every open item either waits for one of the above, by a definition written apart from the stall check's, or the stall check wakes someone who can move it on, the agent a `Waiting-on:` line names among them. It isn't a proof, but a new rule or exemption that leaves an item orphaned fails it.
 
 Once per quiet spell, the stall check wakes the supervisor once for all of them, with each item, what should move it and whose that is. The supervisor reads each item, its timeline and the latest runs of the agents concerned, finds out why it stalled, and moves it on with the smallest step: a comment @-mentioning the agent that should act, saying what to do and why, which wakes that agent (26), or reopening an issue closed by mistake, or taking off a stale label. It never does an agent's work. Where a rule or the protocol should have caught the stall, it files a recommendation for the human, so the kit is fixed rather than the stall worked around. Without a supervisor, or with it capped, the stall check wakes whoever should move each item on, as before.
 
