@@ -5,7 +5,6 @@ needs them.
 
   POST /hook                 Forgejo's webhooks, signed with the webhook secret
   POST /claim                a runner asks for work (Bearer: its runner key)
-  POST /heartbeat            a runner reports the human active in its container
   POST /runs/<id>/start      the runner started the claimed run
   POST /runs/<id>/end        the run ended: outcome, cost, turns, denials...
   POST /runs/abandon         the runner restarted; unfinished runs are closed
@@ -507,14 +506,13 @@ def owner_prs(repo, owner, state):
 
 
 def may_push(agent):
-    """Whether an agent could still push: a run under way, or the human
-    active in its container."""
-    return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent)) or human_active(agent)
+    """Whether an agent could still push: a run under way. The human's
+    sessions in its container can't push (inkproof-hook)."""
+    return bool(q("SELECT 1 FROM runs WHERE agent=? AND ended IS NULL", agent))
 
 
 def busy(agent):
-    """Running, with work queued, or with the human in its container: what it
-    leaves undone may yet be done."""
+    """Running, or with work queued: what it leaves undone may yet be done."""
     return bool(may_push(agent) or q("SELECT 1 FROM triggers WHERE agent=? AND run_id IS NULL", agent))
 
 
@@ -1872,8 +1870,7 @@ def ci_running():
 
 def check_idle():
     """Once the kit has gone quiet (no run, no queued work except an agent's
-    held by its cap, which is the human's to lift, the human active nowhere,
-    no CI, and nothing new for IDLE seconds): wake whoever should move on
+    held by its cap, which is the human's to lift, no CI, and nothing new for IDLE seconds): wake whoever should move on
     any stalled item, or if none, the coordinator to tell the human what it
     needs from them. Once per quiet spell."""
     # Draining looks quiet, but only because nothing may start: neither the
@@ -1883,8 +1880,6 @@ def check_idle():
     if q("SELECT 1 FROM runs WHERE ended IS NULL"):
         return
     if any(not capped(r["agent"]) for r in q("SELECT DISTINCT agent FROM triggers WHERE run_id IS NULL")):
-        return
-    if any(human_active(a) for a in AGENTS):
         return
     last = last_activity()
     if now() - last < IDLE or float(kv_get("idle-summary", 0)) >= last:
@@ -1966,10 +1961,6 @@ def capped(agent):
     return None
 
 
-def human_active(agent):
-    return now() - float(kv_get(f"human:{agent}", 0)) < 90
-
-
 # An idle runner asks for work every RUNNER_TICK_SECONDS (15): one silent this
 # long can't take the work queued for it.
 RUNNER_SILENT = 180
@@ -1997,8 +1988,6 @@ def agent_state(agent):
         return "draining"
     if capped(agent):
         return "capped"
-    if human_active(agent):
-        return "human active"
     return "idle"
 
 
@@ -2148,9 +2137,9 @@ def retry(agent, run_id, outcome):
                  f"{agent}'s work failed {attempt} times (run {run_id})", {
         "Question": f"Run {run_id} of `{agent}` ended `{outcome}`, the last of {attempt} tries at the same work. "
                     "It won't be tried again by itself. What should happen to it?",
-        "Options": f"- Find out why from the run's log (`scripts/activity.sh {agent}`), fix the cause, and "
-                   f"continue the run yourself: `scripts/open.sh {agent}`, then resume it in the Claude "
-                   "extension.\n"
+        "Options": f"- Find out why from the run's log (`scripts/activity.sh {agent}`), or by opening the run "
+                   f"in the Claude extension (`scripts/open.sh {agent}`) and asking it, then fix the cause. Your "
+                   "session can't do the run's work itself: file what remains as an issue for the agent.\n"
                    "- Leave it: some of it (pull requests, untriaged requests, stalled work) is found again "
                    "by the dispatcher's reconciliation; the rest waits for the next event on it.",
         "Recommendation": "Find out why first: a run that fails every time is usually a cause outside it, such "
@@ -2215,7 +2204,7 @@ def end_run(agent, run_id, r):
     elif idle:
         env_retry(agent, run_id, outcome)
     elif outcome in ("completed", "interrupted") or not retry(agent, run_id, outcome):
-        # Done; or stopped by the human, who may continue it; or given up on.
+        # Done; or stopped by the human; or given up on.
         # A retried run may still push, so its reviews wait for that.
         release_reviews(agent)
         later(evaluate_after_run, agent)
@@ -2224,7 +2213,7 @@ def end_run(agent, run_id, r):
         notify_agent(agent, f"not-listed:{agent}:{run_id}", "transcript-rewrite",
                      f"Run {run_id} of {agent} isn't listed in the Claude extension", {
             "Question": f"Run {run_id} of `{agent}` isn't listed in the Claude extension in its container, because "
-                        "its transcript couldn't be rewritten. Do you need to continue that conversation?",
+                        "its transcript couldn't be rewritten. Do you need to open that conversation?",
             "Options": f"- Resume it by its session ID: `claude --resume {sid}` in `{agent}`'s container.\n"
                        "- Leave it: its log and transcript are in the run archive.",
             "Recommendation": "Leave it unless you need that conversation. If this keeps happening, the "
@@ -2295,7 +2284,6 @@ def kit_summary():
     capped_agents = sorted({t["agent"] for t in queued if capped(t["agent"])})
     queued = [t for t in queued if t["agent"] not in capped_agents]
     later_ids = {t["id"] for t in queued if t["not_before"] and t["not_before"] > now()}
-    yours = [a for a in AGENTS if human_active(a)]
     work, stuck = [], []
     for r in runs:
         if r["started"]:
@@ -2327,8 +2315,6 @@ def kit_summary():
     notes = []
     if capped_agents:
         notes.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
-    if yours:
-        notes.append(f"you're active in {', '.join(yours)}, whose runs wait for you")
     if stuck:
         head = "stuck"
     elif work:
@@ -2483,7 +2469,7 @@ def activity(after=0.0, limit=40, tz=0):
     for s in q("SELECT * FROM sessions WHERE started>? OR ended>? ORDER BY id DESC LIMIT ?", after, after, limit):
         if s["started"] and s["started"] > after:
             out.append({"id": f"s{s['id']}s", "at": s["started"], "who": "you",
-                        "text": f"session started in {s['agent']}'s container: {s['agent']} starts no run while you're active"})
+                        "text": f"session started in {s['agent']}'s container"})
         if s["ended"] and s["ended"] > after:
             out.append({"id": f"s{s['id']}e", "at": s["ended"], "who": "you", "text": f"session ended in {s['agent']}'s container"})
     for n in q("SELECT * FROM notices WHERE at>? ORDER BY id DESC LIMIT ?", after, limit):
@@ -2532,10 +2518,6 @@ class Handler(BaseHTTPRequestHandler):
                     # The runner gave up waiting: no one will run it.
                     undo_claim(c["run"], f"the claim's reply didn't reach the runner ({e!r})")
                     return
-            if self.path == "/heartbeat":
-                if data.get("human_active"):
-                    kv_set(f"human:{agent}", now())
-                return self.reply(200, {})
             if self.path == "/runs/abandon":
                 for r in q("SELECT id FROM runs WHERE agent=? AND ended IS NULL", agent):
                     q("UPDATE runs SET ended=?, outcome=? WHERE id=?", now(),

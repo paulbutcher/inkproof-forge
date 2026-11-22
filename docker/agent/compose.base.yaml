@@ -33,9 +33,7 @@ x-agent-env: &agent-env
   HUMAN_USER: ${HUMAN_USER}
   # Whose issues and comments count; everyone else's are ignored.
   TRUSTED_AUTHORS: ${HUMAN_USER} {{AGENTS}} gatekeeper dispatcher
-  # How long after the human's last activity a run may start, and the
-  # longest a run may last.
-  HUMAN_GRACE_SECONDS: ${HUMAN_GRACE_SECONDS:-600}
+  # The longest a run may last.
   MAX_RUN_MINUTES: ${MAX_RUN_MINUTES:-240}
   REPO_PREFIX: ${REPO_PREFIX:-inkproof-}
 

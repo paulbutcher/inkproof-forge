@@ -5,15 +5,16 @@
 #     schedules its merge, which waits for your approval;
 #   - the ledger records the run, the run archive holds its log and
 #     transcript, and the transcript is rewritten for the extension;
-#   - while you're active in core's container no run starts, and work starts
-#     after the grace period; an interrupted run is recorded and resumes;
+#   - your session in core's container is told it only consults, its guard
+#     refuses changes to the checkout and Forgejo writes beyond issues and
+#     comments, and a run starts while it is open; an interrupted run is
+#     recorded and resumes;
 #   - core's change to CLAUDE.md waits for you; a blocking upstream issue
 #     mentions you.
 # It runs real Claude runs (a few dollars at most) and leaves closed test
 # issues and pull requests on inkproof-core and inkproof-coordination.
 # Before it: scripts/setup-repo.sh inkproof-core 1 reports no changes needed,
-# and core is running (scripts/up.sh). It takes the grace period
-# (HUMAN_GRACE_SECONDS, 10 minutes by default) plus a few runs.
+# and core is running (scripts/up.sh). It takes a few runs.
 #   scripts/test-stage3.sh        KEEP=1 keeps the test's issues open
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -116,24 +117,31 @@ echo "== You at work in core's container"
 human="kit-test-$(date +%s)"
 in_core sh -c "echo '{}' > /tmp/$human.jsonl"
 printf '{"session_id":"%s","transcript_path":"/tmp/%s.jsonl","source":"startup"}' "$human" "$human" \
-  | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook session-start
-printf '{"session_id":"%s"}' "$human" | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook prompt
+  | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook session-start \
+  | grep -q 'Sessions with the human' && pass "your session is told it only consults" \
+  || fail "your session wasn't told it only consults"
+# The guard, as Claude Code calls it in your session: a refusal is printed, an allowed call prints nothing.
+guarded() {
+  printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"/workspace/inkproof-core"}' "$1" \
+    | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook pre-tool | grep -q '"deny"'
+}
+for c in "git checkout -b kit-test" "lake build" "tea issues close $issue" "forge pr automerge 1"; do
+  guarded "$c" && pass "refused in your session: $c" || fail "not refused in your session: $c"
+done
+for c in "git status" "tea comment $issue x" "tea issues create --title x"; do
+  guarded "$c" && fail "refused in your session: $c" || pass "allowed in your session: $c"
+done
+printf '{"tool_name":"Bash","tool_input":{"command":"git checkout -b kit-test"},"cwd":"/workspace/inkproof-core"}' \
+  | docker compose exec -T -e INKPROOF_RUN=1 core inkproof-hook pre-tool | grep -q '"deny"' \
+  && fail "a run's git checkout was refused" || pass "runs aren't guarded"
 before="$(latest_run)"
 kit test-stage3 comment "$issue" | grep -v '^$' || true
-sleep 120
-[ "$(latest_run)" = "$before" ] && pass "no run started while you were busy, with work waiting" \
-  || fail "a run started while you were busy"
-printf '{"session_id":"%s","stop_hook_active":false}' "$human" | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook stop
+info "your session is open; work should start anyway"
+run2="$(wait_new_run "$before" 1200)" || run2=""
 printf '{"session_id":"%s","transcript_path":"/tmp/%s.jsonl"}' "$human" "$human" \
   | docker compose exec -T -e CLAUDE_CODE_ENTRYPOINT=cli core inkproof-hook session-end
-grace="$(in_core printenv HUMAN_GRACE_SECONDS)"
-info "you're idle now; work should wait ${grace}s, then start"
-t0="$(date +%s)"
-run2="$(wait_new_run "$before" $(( grace + 600 )))" || run2=""
 if [ -n "$run2" ]; then
-  waited=$(( $(date +%s) - t0 ))
-  [ "$waited" -ge $(( grace - 30 )) ] && pass "the waiting work started run $run2 after the grace period (${waited}s)" \
-    || fail "run $run2 started after ${waited}s, inside the ${grace}s grace period"
+  pass "run $run2 started while your session was open"
   sleep 2   # runs can be quick: interrupt it straight away
   bash "$(dirname "$0")/stop-run.sh" core >/dev/null
   wait_run_end "$run2" 300 || fail "run $run2 didn't stop after stop-run.sh"
@@ -149,7 +157,7 @@ if [ -n "$run2" ]; then
   printf '%s' "$resumed" | grep -q RESUMED && pass "the interrupted run resumes from its history" \
     || fail "resuming the interrupted run failed: $resumed"
 else
-  fail "no run started within ${grace}s plus 10 minutes after you went idle"
+  fail "no run started within 20 minutes, with your session open"
 fi
 status | jqt -e --arg s "$human" '[.sessions[] | select(.session_id == $s and .started and .ended)] | length == 1' >/dev/null \
   && pass "the ledger recorded your session's start and end" || fail "the ledger has no complete record of your session"

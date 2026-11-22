@@ -154,13 +154,13 @@ With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0,
   - A claim no runner will start would keep the agent from every other run, so it is closed unstarted and its work queued again as it was: at once if its reply doesn't reach the runner (which gave up waiting), and otherwise once it has gone unstarted for `CLAIM_START_SECONDS` (default 900, above the ten minutes the runner may spend cloning new repositories before it starts).
   - The dispatcher records when each runner last called in. Queued work for an agent with no run open, whose runner has been silent for three minutes (an idle runner calls in every 15 seconds; one running a run doesn't), and a claim unstarted for two, make the status line say "Kit: stuck".
   - At most `FORGE_CONCURRENCY` (default 8) of the dispatcher's requests to Forgejo run at once, so that a slow Forgejo isn't given more work. Lists are read page by page, except issue comments, which Forgejo serves all at once and doesn't page; a list that serves the same page again ends there.
-- **Starting.** The runner starts a run only when no human session is active. It runs `claude -p --permission-mode dontAsk --output-format stream-json --name "<agent>: <triggers>" --session-id <uuid>` in the agent's workspace. The prompt lists the triggers as pointers, and says that no one can approve anything for it.
+- **Starting.** The runner starts a run whenever the dispatcher grants one, whether or not the human has a session open in the container (Sessions with the human). It runs `claude -p --permission-mode dontAsk --output-format stream-json --name "<agent>: <triggers>" --session-id <uuid>` in the agent's workspace. The prompt lists the triggers as pointers, and says that no one can approve anything for it.
 - **First-run prompts.** `agent-init` marks each agent's folder as trusted in `.claude.json`. The managed `CLAUDE.md` is generated as one file (role followed by protocol), so there is no external include to approve.
 - **Logging.** The stream becomes a Markdown log under `.inkproof/runs/` in the workspace, plus `current.md`, which updates live in a VS Code tab. `.inkproof/` is excluded from git.
-- **Ending.** When a run ends, the runner records its outcome, then rewrites `"entrypoint":"sdk-cli"` to `"entrypoint":"claude-vscode"` in the run's transcript, so that the Claude extension lists it. If the rewrite matched nothing, the run record says so and the human is notified; the run can still be resumed by ID.
+- **Ending.** When a run ends, the runner records its outcome, then rewrites `"entrypoint":"sdk-cli"` to `"entrypoint":"claude-vscode"` in the run's transcript, so that the Claude extension lists it, and the human can open it and ask about it. If the rewrite matched nothing, the run record says so and the human is notified; the run can still be resumed by ID.
 - **Retries.** A run that fails, times out or exits before finishing a reply may have left its work undone, and most triggers are queued only once. So its triggers are queued again after `RETRY_DELAY_SECONDS` (default 300) times the attempt number, at most `MAX_RUN_RETRIES` times (default 2). After that, the dispatcher opens a decision for the human with the run and its work.
   - A run that failed before it got going (one turn at most, nothing spent, no change in Forgejo) failed for its environment: an outage, the proxy or the API. It doesn't count as an attempt, or against the daily run cap. Its work is queued again after 5 minutes, then 15, then every hour (`ENV_RETRY_DELAYS`), until one of the agent's runs gets going, so it outlasts an outage without filling the human's queue with decisions. The human gets one notice while runs keep failing this way (`env-failing`).
-  - A run the human stops isn't retried: they may continue it.
+  - A run the human stops isn't retried.
   - A run that ends while the kit is paused is queued again as it was, without counting as an attempt.
   - So is a run abandoned by a restarting runner.
 - **The record.** For each run, the ledger keeps:
@@ -171,7 +171,7 @@ With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0,
   - whether it changed anything in Forgejo, from the webhooks its account caused.
 
   It also records the human's sessions in each container: start, end and session ID.
-- **Retention.** The runner copies each run's log and transcript, and each of the human's session transcripts, to `run-archive`, where they are kept for at least two milestones. Managed settings raise `cleanupPeriodDays` to 365, so Claude Code doesn't delete transcripts that runs and take-overs still need.
+- **Retention.** The runner copies each run's log and transcript, and each of the human's session transcripts, to `run-archive`, where they are kept for at least two milestones. Managed settings raise `cleanupPeriodDays` to 365, so Claude Code doesn't delete transcripts that runs and the human's questions about them still need.
 - **Bounds.**
   - At most one run per agent at a time.
   - Configurable caps per agent per UTC day on runs (default 20; the coordinator 40, because every other agent's work wakes it), and optionally on spend, from the stream's reported cost.
@@ -180,13 +180,17 @@ With no earlier tag, the first release is v0.1.0. A new major line, such as 1.0,
   - A run starts within a configurable delay of its event, at most 15 minutes by default.
 
   A reached cap is a decision for the human.
-- **Interrupting.** `scripts/stop-run.sh <agent>` interrupts a run, which is then recorded and rewritten like any other, so the human can continue it.
+- **Interrupting.** `scripts/stop-run.sh <agent>` interrupts a run, which is then recorded and rewritten like any other.
 
-## Stepping aside for the human
+## Sessions with the human
 
-- Managed hooks record human activity in the agent's container whenever `CLAUDE_CODE_ENTRYPOINT` is `claude-vscode` or `cli`. The container is busy from a prompt until Claude stops, then for a grace period (default 10 minutes). Runs, whose entrypoint is `sdk-cli`, don't count, and extension processes are ignored.
-- While the human is active, the runner starts nothing and pending work waits. A run already under way when the human arrives continues, unless the human interrupts it.
-- A busy mark with no stop is treated as stale after the maximum run length, so an interrupted session can't block runs for ever.
+The human talks to an agent directly in a session of their own in its container, to ask about its work or have it look into something. Runs go on beside such a session, in the same checkouts, so the session only consults: it looks, tries things in a clone of its own, and advises. What should change goes to the agent's runs as an issue.
+
+- **Which sessions.** A session is the human's when `CLAUDE_CODE_ENTRYPOINT` is `claude-vscode` or `cli` and the runner didn't start it (`INKPROOF_RUN`). Runs, whose entrypoint is `sdk-cli`, aren't, and neither are extension processes. A run's transcript opened in the extension becomes one of the human's sessions.
+- **Told at the start.** The managed `SessionStart` hook records the session and tells the agent that it is in one, which points it at the protocol's "Sessions with the human": read anything, build and test only in a clone outside `/workspace`, file issues and comment in Forgejo, nothing else.
+- **A guard.** The managed `PreToolUse` hook refuses, in the human's sessions only: edits under `/workspace`; git commands that change a checkout there (`checkout`, `switch`, `commit`, `stash`, `reset`, `pull` and the like) or its branches; `git push` anywhere; builds there (`lake build`, `npm`, `npx`, `build-site.sh`, `lean_build`); file writes and redirects into it; and in Forgejo anything but filing issues and commenting (`tea issues create`, `tea comment`), and every `forge` command but those that read (`ci` without `--rerun`, `reviews`, `ledger`). Each refusal says what to do instead. It catches mistakes, not intent: it is no sandbox, and the Lean language server may still build what a file it opens imports.
+- **No waiting.** Nothing holds runs back for the human: the runner claims work while their session is open, and the idle checks don't wait for it. The agent's comments in the session wake no one, so a decision or go-ahead it needs from the human is a comment the human posts in their own name.
+- **Recorded.** The runner reports each session's start and end to the dispatcher, on a thread of its own so that it does so during a run, and archives its transcript.
 - `scripts/open.sh <agent>` attaches VS Code to the running container. `scripts/up.sh` builds every image, and Dev Containers never builds one. Managed settings and hooks apply to the human's sessions too. Host credential, git config and SSH agent forwarding are turned off.
 
 ## Pause and resume
@@ -487,7 +491,7 @@ The kit is working when these hold.
 
 - **End to end.** On a level-3 library, a brief filed by the coordinator goes through every step with no human action: implemented, reviewed for conformance, approved, merged, released, picked up by its consumer and marked `verified`. Every step shows in Forgejo, and each run's log and conversation open in VS Code.
 - **Milestones.** At a milestone's end, the three reviews report with recommendations the human can accept or reject one by one, and the next milestone's reviews respect those decisions.
-- **Taking over.** The human can open any finished or interrupted run in the extension and continue it. While they are active, no run starts for that agent.
+- **Consulting.** The human can talk to any agent, and open any finished or interrupted run in the extension and ask about it, while that agent's runs go on. Their session changes no checkout and, in Forgejo, only files issues and comments.
 - **Failing safely.** Each of these fails safely:
   - an `API.lock` change without the required approval doesn't merge;
   - a status posted under CI's name doesn't get a broken build approved or merged;
@@ -516,4 +520,5 @@ The kit is working when these hold.
 - **Notifications are Forgejo mentions plus a macOS notifier.** SMTP is optional.
 - **Each reviewer is its own agent and account.**
 - **The process review may read the human's own sessions**, through the run archive.
+- **The human's sessions consult; they don't take over.** Runs once waited while the human was active in a container, and the human could continue a run themselves. In practice taking over wasn't used, the waiting held the kit up, and a run already under way shared its checkout with the human's session, which changed it beneath the run (inkproof-web#95's follow-up, 2026-11-22). So runs no longer wait, and the human's sessions change nothing but issues and comments.
 - **Lasm stays outside Forgejo**, fetched from GitHub. Its issues go through the upstream tracker, and the human unblocks.

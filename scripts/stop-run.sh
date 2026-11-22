@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Interrupt an agent's current run. It is recorded and rewritten like any
-# other, so you can open it in the extension and continue it.
+# other, so you can open it in the extension and ask about it.
 #   scripts/stop-run.sh core
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"

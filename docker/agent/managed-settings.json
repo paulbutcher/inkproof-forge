@@ -70,16 +70,6 @@
         ]
       }
     ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/local/bin/inkproof-hook prompt"
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [

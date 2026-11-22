@@ -5,8 +5,8 @@ the life of the container.
   agent-runner          the loop: claim work from the dispatcher, run it
   agent-runner stop     interrupt the current run (scripts/stop-run.sh)
 
-Each run is a fresh `claude -p` conversation in dontAsk mode, started only
-while the human isn't active here. Its stream becomes a Markdown log under
+Each run is a fresh `claude -p` conversation in dontAsk mode. Runs don't
+wait for the human: their sessions here only consult (inkproof-hook). Its stream becomes a Markdown log under
 .inkproof/runs/ in the workspace, and .inkproof/current.md follows it live.
 When it ends, the transcript is rewritten so the VS Code extension lists it,
 the log and transcript go to the run archive, and the dispatcher records the
@@ -36,7 +36,6 @@ LOGS = f"{WORKSPACE}/.inkproof"
 ARCHIVE = "/var/lib/inkproof/archive"
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
 DISPATCHER = os.environ.get("DISPATCHER_URL", "http://dispatcher:8080")
-GRACE = int(os.environ.get("HUMAN_GRACE_SECONDS", "600"))
 MAX_MINUTES = int(os.environ.get("MAX_RUN_MINUTES", "240"))
 TICK = int(os.environ.get("RUNNER_TICK_SECONDS", "15"))
 PIDFILE = f"{STATE}/runner.pid"
@@ -70,19 +69,6 @@ def call(method, path, body=None):
 
 # --- The human ----------------------------------------------------------------
 
-def human_active():
-    try:
-        with open(f"{STATE}/activity") as f:
-            a = json.load(f)
-    except Exception:
-        return False
-    age = time.time() - a.get("at", 0)
-    if a.get("state") == "busy":
-        # A busy mark with no stop is stale after the maximum run length.
-        return age < MAX_MINUTES * 60
-    return age < GRACE
-
-
 def sync_sessions():
     """Report the human's session starts and ends, and archive transcripts."""
     path, offset_file = f"{STATE}/sessions.jsonl", f"{STATE}/sessions.offset"
@@ -109,6 +95,15 @@ def sync_sessions():
         offset += len(line.encode())
         with open(offset_file, "w") as f:
             f.write(str(offset))
+
+
+def sessions_loop():
+    while True:
+        try:
+            sync_sessions()
+        except Exception as e:
+            log(f"sessions: {e!r}")
+        time.sleep(TICK)
 
 
 def archive(src, rel):
@@ -321,16 +316,15 @@ def loop():
     signal.signal(signal.SIGUSR1, interrupt)
     # A run claimed before a restart can't be finished; tell the dispatcher.
     call("POST", "/runs/abandon", {})
+    # The human's sessions may come and go while a run is under way, so they
+    # are reported on a thread of their own, not between runs.
+    threading.Thread(target=sessions_loop, daemon=True).start()
     while True:
         try:
-            sync_sessions()
-            if human_active():
-                call("POST", "/heartbeat", {"human_active": True})
-            else:
-                s, claim = call("POST", "/claim", {})
-                if s == 200 and claim:
-                    run(claim)
-                    continue
+            s, claim = call("POST", "/claim", {})
+            if s == 200 and claim:
+                run(claim)
+                continue
         except Exception as e:
             log(f"error: {e!r}")
         time.sleep(TICK)

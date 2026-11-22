@@ -1,69 +1,36 @@
 #!/usr/bin/env python3
 """Claude Code hooks for agent containers (managed settings call these).
 
-  inkproof-hook pre-tool        while paused, refuse every tool call in a run
-  inkproof-hook session-start   a human session opened: record it
-  inkproof-hook prompt          a human prompt: the human is busy
-  inkproof-hook stop            Claude stopped: a human is idle from now;
-                                a run may not stop with untriaged requests
-  inkproof-hook session-end     a human session closed: record it; the human
-                                is idle at once unless still here (see below)
+  inkproof-hook pre-tool        in a run, while paused, refuse every tool call;
+                                in a human session, refuse writes (see guard)
+  inkproof-hook session-start   a human session opened: record it, and say
+                                that it only consults
+  inkproof-hook stop            a run may not stop with untriaged requests
+  inkproof-hook session-end     a human session closed: record it
 
 A session is the human's when CLAUDE_CODE_ENTRYPOINT is claude-vscode or
-cli and the runner didn't start it. The runner reads what these write in
-/workspace/.inkproof: `activity` decides whether a run may start, and
-`sessions.jsonl` goes into the dispatcher's ledger and the run archive.
+cli and the runner didn't start it. The human's sessions consult: runs go on
+beside them in the same checkouts, so a session changes nothing there, and in
+Forgejo only files issues and comments (Protocol: Sessions with the human).
+`sessions.jsonl` in /workspace/.inkproof goes into the dispatcher's ledger
+and the run archive.
 """
 import json
 import os
+import re
+import shlex
 import sys
 import time
 import urllib.request
 
 STATE = "/workspace/.inkproof"
-GRACE = int(os.environ.get("HUMAN_GRACE_SECONDS", "600"))
-# Ends that hand straight over to another session of the human's.
-CONTINUING = ("clear", "resume")
+# Every checkout the agent's runs use is under here.
+SHARED = "/workspace"
 
 
 def human():
     return (os.environ.get("CLAUDE_CODE_ENTRYPOINT") in ("claude-vscode", "cli")
             and not os.environ.get("INKPROOF_RUN"))
-
-
-def write_activity(state, at=None):
-    os.makedirs(STATE, exist_ok=True)
-    tmp = f"{STATE}/activity.tmp"
-    with open(tmp, "w") as f:
-        json.dump({"state": state, "at": int(time.time()) if at is None else at}, f)
-    os.replace(tmp, f"{STATE}/activity")
-
-
-def other_session_live(ended):
-    """Whether the human has another session open here that was in use
-    within the grace period: started, not ended, and its transcript written
-    lately. A session that crashed without an end stops counting once its
-    transcript has been quiet that long, as its activity would have."""
-    last = {}
-    try:
-        with open(f"{STATE}/sessions.jsonl") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                last[e.get("session", "")] = e
-    except OSError:
-        return False
-    for sid, e in last.items():
-        if sid == ended or e.get("event") != "start":
-            continue
-        try:
-            if time.time() - os.path.getmtime(e.get("transcript") or "") < GRACE:
-                return True
-        except OSError:
-            continue
-    return False
 
 
 def record_session(event, data):
@@ -96,6 +63,232 @@ def untriaged_requests():
             and {"request", "new"} <= {l["name"] for l in i.get("labels") or []}]
 
 
+# --- The guard on the human's sessions ------------------------------------------
+#
+# It catches the usual ways a session would change a shared checkout or act in
+# Forgejo beyond issues and comments. It is not a sandbox: a determined command
+# gets past it. Each refusal says what to do instead.
+
+SCRATCH = ("Make your own clone outside /workspace and work there: "
+           "`git clone --shared /workspace/<repo> /tmp/<name>`, then `cd` into it.")
+NOT_HERE = ("This is a session with the human, and your runs use the checkouts under /workspace while "
+            "it lasts. ")
+
+GIT_WRITES = {"add", "am", "apply", "bisect", "checkout", "cherry-pick", "clean", "commit", "filter-branch",
+              "gc", "merge", "mv", "notes", "prune", "pull", "rebase", "replace", "reset", "restore", "revert",
+              "rm", "sparse-checkout", "stash", "submodule", "switch", "update-index", "update-ref", "worktree"}
+LAKE_WRITES = {"build", "update", "upgrade", "exe", "test", "lint", "clean", "run", "script", "pack", "unpack",
+               "cache", "new", "init"}
+NPM_WRITES = {"install", "i", "ci", "run", "run-script", "test", "t", "exec", "x", "rebuild", "update", "up",
+              "uninstall", "rm", "link", "prune", "dedupe"}
+FILE_WRITERS = {"rm", "rmdir", "mv", "touch", "mkdir", "ln", "chmod", "chown", "truncate", "tee", "install",
+                "unlink"}
+WRAPPERS = {"env", "time", "nohup", "nice", "timeout", "command", "exec", "xargs"}
+
+TEA_ISSUES = {"issue", "issues", "i"}
+TEA_PULLS = {"pr", "pull", "pulls"}
+TEA_COMMENT = {"comment", "comments", "c"}
+TEA_READS = {"ls", "list", "search"}
+TEA_HARMLESS = {"whoami", "open", "o", "help", "h", "--help", "-h", "--version", "-v"}
+# tea's flags that take a value, so that the value isn't taken for a subcommand.
+TEA_VALUE_FLAGS = {"--repo", "-r", "--remote", "-R", "--login", "-l", "--output", "-o", "--limit", "--lm",
+                   "--page", "-p", "--state", "--labels", "-L", "--title", "-t", "--description", "-d", "--body",
+                   "--assignees", "-a", "--milestone", "-m", "--fields", "-f", "--kind", "-K", "--keyword", "-k",
+                   "--author", "-A", "--mentions", "-M", "--base", "-b", "--head", "--owner", "-O",
+                   "--deadline", "-D", "--referenced-version"}
+FORGE_READS = {"reviews", "ledger"}
+
+
+def shared(path):
+    p = os.path.realpath(path)
+    return p == SHARED or p.startswith(SHARED + "/")
+
+
+def resolve(path, cwd):
+    return os.path.join(cwd, os.path.expanduser(path))
+
+
+def strip_heredocs(command):
+    """A heredoc's body is data, not commands: drop it."""
+    lines, out, end = command.split("\n"), [], None
+    for line in lines:
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if m:
+            end = m.group(1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def simple_commands(command):
+    """The command's simple commands in order, each a list of words with its
+    redirect targets apart: [(words, targets)]."""
+    lexer = shlex.shlex(strip_heredocs(command), posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    cmds, words, targets, redirect = [], [], [], False
+    for tok in lexer:
+        if redirect:
+            targets.append(tok)
+            redirect = False
+        elif tok in (">", ">>", ">|", "&>", "&>>"):
+            redirect = True
+            if words and words[-1].isdigit():
+                words.pop()
+        elif tok and set(tok) <= set(";&|()<>"):
+            if words or targets:
+                cmds.append((words, targets))
+            words, targets = [], []
+        else:
+            words.append(tok)
+    if words or targets:
+        cmds.append((words, targets))
+    return cmds
+
+
+def check_tea(args):
+    words, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            skip = a in TEA_VALUE_FLAGS
+            if a in TEA_HARMLESS and not words:
+                return None
+        else:
+            words.append(a)
+    if not words or words[0] in TEA_HARMLESS or words[0] in TEA_COMMENT:
+        return None
+    first, second = words[0], (words[1] if len(words) > 1 else None)
+    if second is None or second.isdigit() or second in TEA_READS:
+        return None
+    if first in TEA_ISSUES and second in ("create", "c"):
+        return None
+    return (f"In a session with the human you may file issues and comment, nothing else in Forgejo "
+            f"(`tea {first} {second}` refused). Your own comments wake no one: draft what the human should "
+            f"post, or file an issue for your runs to act on.")
+
+
+def check_forge(args):
+    words = [a for a in args if not a.startswith("-")]
+    if not words or words[0] in FORGE_READS or (words[0] == "ci" and "--rerun" not in args):
+        return None
+    return (f"In a session with the human, `forge {words[0]}` is refused: only `forge ci` (without "
+            f"`--rerun`), `forge reviews` and `forge ledger`, which read. File an issue for your runs instead.")
+
+
+def check_words(words, targets, cwd):
+    """A refusal for one simple command, or None. Returns (refusal, new cwd)."""
+    for t in targets:
+        if not t.startswith("/dev/") and not t.startswith("&") and shared(resolve(t, cwd)):
+            return NOT_HERE + f"Don't write to `{t}` there. " + SCRATCH, cwd
+    wrapped = False
+    while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in WRAPPERS
+                     or (wrapped and re.match(r"^(-.*|\d+(\.\d+)?[smhd]?)$", words[0]))):
+        wrapped = wrapped or words[0] in WRAPPERS
+        words = words[1:]
+    if not words:
+        return None, cwd
+    name, args = os.path.basename(words[0]), words[1:]
+    if name in ("cd", "pushd"):
+        dest = next((a for a in args if not a.startswith("-")), os.path.expanduser("~"))
+        return None, os.path.normpath(resolve(dest, cwd))
+    if name in ("bash", "sh") and "-c" in args and args.index("-c") + 1 < len(args):
+        return check_bash(args[args.index("-c") + 1], cwd), cwd
+    if name in ("bash", "sh") and any(not a.startswith("-") for a in args):
+        # A script run through its shell is judged as the script.
+        i = next(i for i, a in enumerate(args) if not a.startswith("-"))
+        name, args = os.path.basename(args[i]), args[i + 1:]
+    if name == "tea":
+        return check_tea(args), cwd
+    if name == "forge":
+        return check_forge(args), cwd
+    if name == "git":
+        where = cwd
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            flag = rest.pop(0)
+            if flag == "-C" and rest:
+                where = os.path.normpath(resolve(rest.pop(0), where))
+            elif flag in ("-c", "--git-dir", "--work-tree") and rest:
+                rest.pop(0)
+        sub = rest[0] if rest else ""
+        if sub == "push":
+            return ("In a session with the human nothing is pushed: what should change goes to your runs "
+                    "as an issue."), cwd
+        if not shared(where):
+            return None, cwd
+        branch_writes = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+                         "-u", "--set-upstream-to", "--unset-upstream"}
+        branch_lists = {"-l", "--list", "-a", "--all", "-r", "--remotes", "--contains", "--no-contains",
+                        "--merged", "--no-merged", "--points-at", "--show-current", "-v", "-vv"}
+        second = next((a for a in rest[1:] if not a.startswith("-")), "")
+        if sub in ("stash", "worktree", "submodule", "notes", "bisect") and second in ("list", "show", "status",
+                                                                                         "log"):
+            return None, cwd
+        if (sub in GIT_WRITES
+                or (sub == "branch" and (any(a in branch_writes for a in rest[1:])
+                                         or (second and not branch_lists & set(rest[1:]))))
+                or (sub == "tag" and any(not a.startswith("-") for a in rest[1:])
+                    and not {"-l", "--list"} & set(rest[1:]))):
+            return NOT_HERE + f"`git {sub}` there would change their checkout. " + SCRATCH, cwd
+        return None, cwd
+    builds = ((name == "lake" and any(a in LAKE_WRITES for a in args[:1]))
+              or (name in ("npm", "pnpm", "yarn") and any(a in NPM_WRITES for a in args[:1]))
+              or name in ("npx", "make") or name.endswith("build-site.sh"))
+    if builds and shared(cwd):
+        return NOT_HERE + "A build there writes its shared build output. " + SCRATCH, cwd
+    inplace = ((name == "sed" and any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args))
+               or (name == "perl" and any(re.match(r"^-\w*i", a) for a in args)))
+    if inplace and (shared(cwd) or any(a.startswith(SHARED + "/") for a in args)):
+        return NOT_HERE + "Don't edit files there. " + SCRATCH, cwd
+    paths = [a for a in args if not a.startswith("-")]
+    if name in ("cp", "rsync") and paths:
+        paths = paths[-1:]  # only the destination is written
+    if (name in FILE_WRITERS or name in ("cp", "rsync")) and any(shared(resolve(p, cwd)) for p in paths):
+        return NOT_HERE + f"`{name}` there would change their files. " + SCRATCH, cwd
+    return None, cwd
+
+
+def check_bash(command, cwd):
+    try:
+        cmds = simple_commands(command)
+    except ValueError:
+        return None  # unparseable: let it through rather than guess
+    for words, targets in cmds:
+        refusal, cwd = check_words(words, targets, cwd)
+        if refusal:
+            return refusal
+    return None
+
+
+def guard(data):
+    """Why the human's session may not make this tool call, or None."""
+    tool, inp = data.get("tool_name", ""), data.get("tool_input") or {}
+    cwd = data.get("cwd") or os.getcwd()
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        if path and shared(resolve(path, cwd)):
+            return NOT_HERE + "Don't edit files there. " + SCRATCH
+        return None
+    if tool == "mcp__lean-lsp__lean_build":
+        return NOT_HERE + "A build there writes its shared build output. " + SCRATCH
+    if tool == "Bash":
+        return check_bash(inp.get("command") or "", cwd)
+    return None
+
+
+def deny(reason, stop=False):
+    out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                  "permissionDecisionReason": reason}}
+    if stop:
+        out.update({"continue": False, "stopReason": reason})
+    print(json.dumps(out))
+
+
 def main():
     event = sys.argv[1] if len(sys.argv) > 1 else ""
     try:
@@ -104,38 +297,31 @@ def main():
         data = {}
 
     if event == "pre-tool":
-        # While the human has paused the kit, a run does nothing more: every
-        # tool call is refused and the run is told to stop. The human's own
-        # sessions are not affected.
-        if not human() and os.environ.get("INKPROOF_RUN") and os.path.exists("/etc/inkproof/control/paused"):
-            print(json.dumps({
-                "continue": False,
-                "stopReason": "The kit is paused by the human.",
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "The kit is paused by the human: stop now and do nothing more.",
-                },
-            }))
+        if human():
+            reason = guard(data)
+            if reason:
+                deny(reason)
+        elif os.environ.get("INKPROOF_RUN") and os.path.exists("/etc/inkproof/control/paused"):
+            # While the human has paused the kit, a run does nothing more: every
+            # tool call is refused and the run is told to stop.
+            deny("The kit is paused by the human: stop now and do nothing more.", stop=True)
         return 0
     if event == "session-start":
         if human():
             record_session("start", data)
-    elif event == "prompt":
-        if human():
-            write_activity("busy")
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": (
+                    "This session is the human's, not one of your runs, and your runs go on beside it in the "
+                    "same checkouts. Follow \"Sessions with the human\" in your protocol: look, try things in "
+                    "your own clone outside /workspace, and advise; file issues and comment, and change "
+                    "nothing else. The rest of the protocol's actions are for your runs."),
+            }}))
     elif event == "session-end":
         if human():
-            # Closing the session means the human has gone: queued work may
-            # start now rather than after the grace period, unless the session
-            # was cleared or resumed into another, or another is still in use.
-            gone = (data.get("reason") not in CONTINUING
-                    and not other_session_live(data.get("session_id", "")))
-            write_activity("idle", 0 if gone else None)
             record_session("end", data)
     elif event == "stop":
         if human():
-            write_activity("idle")
             return 0
         if (data.get("stop_hook_active") or not os.environ.get("AGENT_REPO")
                 or os.path.exists("/etc/inkproof/control/paused")):

@@ -135,20 +135,23 @@ A comment wakes the agent that owns the repository. To reach any other agent, su
 
 A run starts once the events have settled for a minute (`DEBOUNCE_SECONDS`), and within 15 minutes at most (`MAX_DELAY_SECONDS`). A comment whose first line is `(no reply needed)` starts nothing.
 
-### You come first
+### Talking to an agent
 
-While you're using Claude in an agent's container, through the extension or a terminal, no run starts there. Queued work starts 10 minutes after your last prompt finishes (`HUMAN_GRACE_SECONDS`), or as soon as you close the session, unless another of your sessions there was in use in those 10 minutes. `/clear` doesn't count as closing. A run already under way carries on.
+You can talk to any agent in its container (`scripts/open.sh <agent>`, then Claude in the extension or a terminal), to ask about its work or have it look into something. Its runs carry on meanwhile, in the same checkouts, so your session only consults. It reads anything, and builds or tries changes only in a clone of its own outside `/workspace`. In Forgejo it files issues and comments, nothing else. A guard refuses the rest, saying what to do instead.
+
+- To have something changed, ask the agent to file it as an issue on its own repository. One of its runs then takes it up like any task of its own, without this conversation, so the issue must say everything.
+- Its comments wake no one, itself included. A decision or go-ahead from you is a comment you post in Forgejo in your own name: ask the agent to draft it.
 
 ### Putting work first
 
 Label an issue `priority` to have it done before anything new. Its owner is woken at once, and until it's done, the owner starts no other new task, though work already open keeps moving. Owners pass the label on to the issues a priority item waits on, so a request it depends on is put first too. Take the label off to undo it. The coordinator may also set it, saying why.
 
-### Following and taking over runs
+### Following runs
 
 - `scripts/open.sh <agent>` opens VS Code attached to that agent's container, at its workspace. The first time, VS Code installs its server and the Claude and Lean extensions there.
 - To follow the current run live, open `.inkproof/current.md`.
-- Every run is logged to `.inkproof/runs/` in the workspace. It's also listed in the Claude extension's past sessions, where you can open it and continue the conversation.
-- `scripts/stop-run.sh <agent>` interrupts a run. The run is recorded, and you can continue it like any other.
+- Every run is logged to `.inkproof/runs/` in the workspace. It's also listed in the Claude extension's past sessions, where you can open it and ask about it, as in any session of yours.
+- `scripts/stop-run.sh <agent>` interrupts a run. The run is recorded, and its work isn't retried.
 - Every run's log and transcript, and your own sessions' transcripts, are kept in the `run-archive` volume.
 
 ### What waits on you
@@ -186,7 +189,7 @@ When the kit goes quiet with nothing stalled, the coordinator writes you a summa
 - what it needs from you, most important first, with links;
 - what everything else is waiting on.
 
-Open it with `scripts/open.sh coordinator`. It's the session named like "coordinator: the kit is idle; 2 items wait on you" in the Claude extension's list. Reply there and the conversation carries on with you present.
+Open it with `scripts/open.sh coordinator`. It's the session named like "coordinator: the kit is idle; 2 items wait on you" in the Claude extension's list. Ask it about the summary there. Answer each decision on its issue in Forgejo.
 
 ### Seeing what's happening
 
@@ -312,9 +315,10 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 | Test | Checks |
 | --- | --- |
 | `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out. Quick, isolated, and safe anywhere. |
+| `scripts/test-hook.sh` | Unit tests for the guard on your sessions in agents' containers. Quick, isolated, and safe anywhere. |
 | `scripts/test-stage1.sh` | Bootstrap, networks and proxies, CI in its own engine, that agents can't tag or release, and Actions webhooks. |
 | `scripts/test-stage2.sh` | Migration from GitHub, attribution, mirrors, and dependencies fetched from Forgejo. With `MIRROR_TEST_REPO`, a round trip through a scratch GitHub repository. |
-| `scripts/test-stage3.sh` | One agent at level 1: unattended runs, deny rules, the ledger and archive, the transcript rewrite, and stepping aside for you. Starts real Claude runs, costing a few dollars. |
+| `scripts/test-stage3.sh` | One agent at level 1: unattended runs, deny rules, the ledger and archive, the transcript rewrite, and the guard on your sessions. Starts real Claude runs, costing a few dollars. |
 | `scripts/test-stage4.sh` | The dispatcher's triggers, reconciliation, caps, pause and resume, status and notifications. |
 | `scripts/test-stage5.sh` | Conformance reviews and their rounds limit, milestone reviews, and code owners blocking merges. |
 | `scripts/test-stage6.sh` | Level 2: the gatekeeper approves only on a real Actions run. |
