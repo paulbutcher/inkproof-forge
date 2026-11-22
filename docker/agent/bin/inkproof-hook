@@ -96,7 +96,7 @@ TEA_VALUE_FLAGS = {"--repo", "-r", "--remote", "-R", "--login", "-l", "--output"
                    "--assignees", "-a", "--milestone", "-m", "--fields", "-f", "--kind", "-K", "--keyword", "-k",
                    "--author", "-A", "--mentions", "-M", "--base", "-b", "--head", "--owner", "-O",
                    "--deadline", "-D", "--referenced-version"}
-FORGE_READS = {"reviews", "ledger"}
+FORGE_READS = {"reviews", "ledger", "version"}
 
 
 def shared(path):
@@ -177,7 +177,8 @@ def check_forge(args):
     if not words or words[0] in FORGE_READS or (words[0] == "ci" and "--rerun" not in args):
         return None
     return (f"In a session with the human, `forge {words[0]}` is refused: only `forge ci` (without "
-            f"`--rerun`), `forge reviews` and `forge ledger`, which read. File an issue for your runs instead.")
+            f"`--rerun`), `forge reviews`, `forge ledger` and `forge version`, which read. File an issue for your "
+            f"runs instead.")
 
 
 def check_words(words, targets, cwd):

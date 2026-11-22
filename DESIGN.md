@@ -328,7 +328,9 @@ Each item that isn't waiting for any of these has someone who should move it on:
 
 Where that would be an author outside the kit (neither an agent nor the human), it is the repository's owner, to take the item on or close it.
 
-The dispatcher's tests check this on random worlds of issues and pull requests (`NobodyOrphaned` in `test_dispatcher.py`): in each, every open item either waits for one of the above, by a definition written apart from the stall check's, or the stall check wakes someone who can move it on, the agent a `Waiting-on:` line names among them. It isn't a proof, but a new rule or exemption that leaves an item orphaned fails it.
+A repository's `main` is checked as an item is. Work merged and described in `CHANGELOG.md` waits for a release, and only something labelled `ready-for-release` asks for one (15). So if `CHANGELOG.md`'s newest heading on `main` is above the latest release (or there is none), nothing open on the repository is labelled `ready-for-release` and no pull request is open, its owner is woken to label the issue that work finishes, or to file one of its own for it and label that. A consumer action merged for a request on another repository is the usual case (demos#105: the site's fix for gpu#59 merged, with its entry, and was never released or deployed). Its count starts again whenever `main` moves. Being no issue, it gets a notice rather than a comment, and after `STALL_ROUNDS` spells the decision `Stalled: <repo>`.
+
+The dispatcher's tests check this on random worlds of issues, pull requests and repositories' releases and changelogs (`NobodyOrphaned` in `test_dispatcher.py`): in each, every open item, and every `main` with unreleased work, either waits for one of the above, by a definition written apart from the stall check's, or the stall check wakes someone who can move it on, the agent a `Waiting-on:` line names among them. It isn't a proof, but a new rule or exemption that leaves an item orphaned fails it.
 
 Once per quiet spell, the stall check wakes the supervisor once for all of them, with each item, what should move it and whose that is. The supervisor reads each item, its timeline and the latest runs of the agents concerned, finds out why it stalled, and moves it on with the smallest step: a comment @-mentioning the agent that should act, saying what to do and why, which wakes that agent (26), or reopening an issue closed by mistake, or taking off a stale label. It never does an agent's work. Where a rule or the protocol should have caught the stall, it files a recommendation for the human, so the kit is fixed rather than the stall worked around. Without a supervisor, or with it capped, the stall check wakes whoever should move each item on, as before.
 
@@ -436,6 +438,7 @@ Agents get `tea` for issues, labels, comments and pull requests, and a kit comma
 - `forge review <repo> <n> <findings>` (`conformance`): approve or request changes from structured findings, only once CI has passed. After the rounds limit, it labels the pull request `needs-human` instead for the findings the author disputes, once per head;
 - `forge reviews <repo> <n>`: a pull request's reviews and their findings, which `tea` doesn't show;
 - `forge ledger [days]` (`process`): the run ledger;
+- `forge version`, in a checkout: the next release's version, from `API.lock` in the working tree against the highest `vX.Y.Z` tag, by the gatekeeper's rule (Releases), so an owner heads its `CHANGELOG.md` entry with the version the release will check for. `test_forge.py` holds it to the gatekeeper's own function;
 - `forge release <repo> '<note>' <issue>...` (coordinator, level 3): ask the gatekeeper to release.
 
 Managed settings deny these, with every alias:

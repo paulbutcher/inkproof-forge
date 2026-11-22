@@ -63,7 +63,7 @@ class Forge:
 
     def __init__(self):
         self.items, self.statuses, self.mains, self.milestones, self.writes = {}, {}, {}, {}, []
-        self.codeowners, self.releases = {}, {}
+        self.codeowners, self.releases, self.changelogs = {}, {}, {}
 
     def release(self, repo, tag, ago, draft=False):
         """Publish a release: the newest first, as Forgejo lists them."""
@@ -147,6 +147,10 @@ class Forge:
             if repo not in self.codeowners:
                 raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
             return {"content": base64.b64encode(self.codeowners[repo].encode()).decode()}
+        if rest == "contents/CHANGELOG.md":
+            if repo not in self.changelogs:
+                raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            return {"content": base64.b64encode(self.changelogs[repo].encode()).decode()}
         if rest == "releases":
             return self.releases.get(repo, [])
         if rest == "milestones":
@@ -1222,6 +1226,26 @@ class Stalls(Case):
                                         ("core", f"{CORE}#15"), ("core", f"{CORE}#16")]))
         self.assertEqual(n, 9)
 
+    def test_unreleased_work_on_main_wakes_its_owner_demos_105(self):
+        # A consumer action merged with its changelog entry, for a request
+        # on another repository: nothing on this one is ready-for-release.
+        self.f.release(CORE, "v0.2.0", 9000)
+        self.f.changelogs[CORE] = "# Changelog\n\n## v0.3.0\n\n- Exact strokes.\n\n## v0.2.0\n\n- Earlier.\n"
+        self.f.changelogs[SCALE] = "# Changelog\n\n## [0.1.0]\n\n- First.\n"  # never released
+        self.f.release("inkproof-demos", "v1.0.0", 9000)
+        self.f.changelogs["inkproof-demos"] = "## v1.0.0\n\n- Released.\n"  # nothing above it
+        n, found = self.spell()
+        self.assertEqual(found, [("core", f"{CORE}#0"), ("scale", f"{SCALE}#0")])
+        self.assertIn("`CHANGELOG.md` on main heads v0.3.0, above its last release",
+                      d.q("SELECT description FROM triggers WHERE agent='core'")[0]["description"])
+        self.assertEqual([w for w in self.f.writes if w[1].endswith("/comments")], [], "main has no issue to comment on")
+        # Once something carries it to a release, or a pull request is open, it waits visibly.
+        self.f.issue(CORE, 1, "core", ["ready-for-release"])
+        self.f.pull(SCALE, 2, "scale", ci="success")
+        d.q("DELETE FROM kv WHERE key LIKE 'stall:%'")
+        _, found = self.spell()
+        self.assertEqual([f for f in found if f[1].endswith("#0")], [])
+
     def test_twice_without_moving_then_the_humans_and_a_fix_starts_again(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])
         self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
@@ -1765,6 +1789,15 @@ class NobodyOrphaned(Case):
             else:
                 i = self.f.issue(s["repo"], s["n"], s["author"], s["labels"], state, body, events=events)
             i["assignees"] = [{"login": "human"}] if s["human_assigned"] else []
+        # Each repository's last release and CHANGELOG.md's newest entry.
+        self.mains = {}
+        for repo in (CORE, SCALE):
+            released, entry = rng.choice((None, "v0.2.0")), rng.choice((None, "v0.2.0", "v0.3.0"))
+            if released:
+                self.f.release(repo, released, 9000)
+            if entry:
+                self.f.changelogs[repo] = f"# Changelog\n\n## {entry}\n\n- Work.\n"
+            self.mains[repo] = (released, entry)
         return specs
 
     @staticmethod
@@ -1834,6 +1867,17 @@ class NobodyOrphaned(Case):
                 if not who and not self.visible(s, specs):
                     failures.append(f"seed {seed}: {at_} is orphaned: "
                                     f"{ {k: (v and f'{v['repo']}#{v['n']}') if k in ('blocked_by', 'refs') else v for k, v in s.items()} }")
+            # A repository's main with work described above its last release
+            # waits for a release: something must carry it there.
+            for repo, (released, entry) in self.mains.items():
+                who = woken.get(f"{repo}#0", set())
+                if who - {d.OWNER_OF[repo]}:
+                    failures.append(f"seed {seed}: {repo}'s main woke {sorted(who)}")
+                carried = any(s["open"] and s["repo"] == repo and (s["pr"] or "ready-for-release" in s["labels"])
+                              for s in specs)
+                if entry and (released is None or entry > released) and not carried and not who:
+                    failures.append(f"seed {seed}: {repo}'s main has {entry} unreleased (last {released}), "
+                                    "and nothing carries it to a release")
         if os.environ.get("ORPHAN_VERBOSE"):
             print("\n".join(failures))
         self.maxDiff = None

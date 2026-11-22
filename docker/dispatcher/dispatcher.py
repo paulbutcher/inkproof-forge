@@ -426,6 +426,35 @@ def latest_release(repo):
     return cached(("release", repo), 20, read)
 
 
+# A CHANGELOG.md version heading, in either form the libraries use.
+CHANGELOG_VERSION = re.compile(r"(?m)^##[ \t]+\[?v?(\d+)\.(\d+)\.(\d+)\]?")
+
+
+def version(tag):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def unreleased_entry(repo):
+    """CHANGELOG.md's newest heading on main, as `vX.Y.Z`, if it is above
+    the latest release (or there is none): work merged and described, waiting
+    for a release. None if it isn't, or there is no CHANGELOG.md."""
+    def read():
+        try:
+            f = forge("GET", f"/repos/{ORG}/{repo}/contents/CHANGELOG.md?ref=main") or {}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+        m = CHANGELOG_VERSION.search(base64.b64decode(f.get("content") or "").decode(errors="replace"))
+        if not m:
+            return None
+        top = tuple(int(x) for x in m.groups())
+        last = version((latest_release(repo) or {}).get("tag_name"))
+        return "v%d.%d.%d" % top if last is None or top > last else None
+    return cached(("unreleased", repo), 60, read)
+
+
 def ci_state(repo, sha):
     """success, failure, running or none: the commit statuses branch
     protection requires (contexts starting "checks"), as it sees them."""
@@ -1817,6 +1846,40 @@ def stall_owners(it, blocked):
     return [(it.owner, "nothing is moving it on")]
 
 
+class MainOf:
+    """A repository's main, stalled as an item is: what the stall check
+    needs of it."""
+    kind = "the main branch of"
+
+    def __init__(self, repo):
+        self.repo, self.at = repo, repo
+        self.issue = {"html_url": f"{FORGE}/{ORG}/{repo}"}
+
+    def moved(self):
+        """When main last changed: a merge starts its count again."""
+        return when(main_of(self.repo)["timestamp"])
+
+
+def main_stall_owners(repo, items):
+    """Who should move a repository's main on: work merged and described in
+    CHANGELOG.md above the last release, with nothing labelled
+    ready-for-release and no pull request open to carry it there, waits for
+    a release nobody has asked for (gpu#59's consumer action, demos#105).
+    Its owner, to label what it finishes or file an issue for it."""
+    owner = OWNER_OF.get(repo)
+    if not owner or not has_ci(repo):
+        return []
+    if any(i.get("pull_request") is not None or "ready-for-release" in {l["name"] for l in i.get("labels") or []}
+           for i in items):
+        return []
+    entry = unreleased_entry(repo)
+    if not entry:
+        return []
+    return [(owner, f"`CHANGELOG.md` on main heads {entry}, above its last release, and nothing on it is labelled "
+                    "ready-for-release, so nothing will release it: label the issue that work finishes "
+                    "`ready-for-release`, or file an issue of your own for it and label that")]
+
+
 # Timeline entries that only mention an item from elsewhere: no progress on it.
 MENTIONS = {"comment", "comment_ref", "issue_ref"}
 
@@ -1841,7 +1904,8 @@ def check_stalls():
     for repo in OWNER_OF:
         if forge_missing(repo):
             continue
-        for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all"):
+        items = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
+        for i in items:
             try:
                 it = Item(repo, i["number"])
                 owners = [(a, why) for a, why in stall_owners(it, blocked_rules(it)[1]) if a in AGENTS]
@@ -1849,6 +1913,12 @@ def check_stalls():
                     stalled[(repo, it.n)] = (it, owners)
             except Exception as e:
                 log(f"checking {repo}#{i['number']} for a stall failed: {e!r}")
+        try:
+            owners = [(a, why) for a, why in main_stall_owners(repo, items) if a in AGENTS]
+            if owners:
+                stalled[(repo, 0)] = (MainOf(repo), owners)
+        except Exception as e:
+            log(f"checking {repo}'s main for unreleased work failed: {e!r}")
     # An item no longer stalled starts again from nothing.
     for row in q("SELECT key FROM kv WHERE key LIKE 'stall:%'"):
         repo, _, n = row["key"][len("stall:"):].partition("#")
@@ -1862,7 +1932,7 @@ def check_stalls():
     for (repo, n), (it, owners) in stalled.items():
         key = f"stall:{repo}#{n}"
         rounds, first, mark = (json.loads(kv_get(key, "[0, 0]")) + [None])[:3]
-        moved = moved_at(it)
+        moved = it.moved() if n == 0 else moved_at(it)
         # Moved on since the last wake, if only between two checks (a pull
         # request opened and merged while the kit was busy): it starts again
         # from nothing, a gap of its own (demos#22).
@@ -1871,22 +1941,22 @@ def check_stalls():
         if rounds >= STALL_ROUNDS:
             names = ", ".join(sorted({a for a, _ in owners}))
             decision_issue(COORDINATION, f"stalled-item:{repo}#{n}:{first}", "stalled",
-                           f"Stalled: {repo}#{n}", {
-                "Question": f"Nothing is moving {it.kind} [{repo}#{n}]({it.issue.get('html_url', '')}) on, and it "
+                           f"Stalled: {it.at}", {
+                "Question": f"Nothing is moving {it.kind} [{it.at}]({it.issue.get('html_url', '')}) on, and it "
                             f"waits for nothing the kit can see: {'; '.join(why for _, why in owners)}. "
                             f"{names} {'was' if len(owners) == 1 else 'were'} woken for it in {rounds} quiet "
                             "spells without moving it on. What should happen?",
-                "Options": f"- Find out why: `scripts/activity.sh {repo}#{n}` shows what happened to it; if the "
+                "Options": f"- Find out why: `scripts/activity.sh {it.at}` shows what happened to it; if the "
                            "kit lacks a step, fix the kit.\n"
                            f"- Tell {names} on the item what to do.\n"
                            "- Close it, saying why.",
                 "Recommendation": "Find out why first: a stall the kit can't see is a gap in its rules.",
                 "If you say go ahead": "Nothing changes by itself: say on the item what should happen, then "
                                        "close this issue.",
-                "Blocked on this": f"{repo}#{n}."})
+                "Blocked on this": f"{it.at}."})
             continue
         if supervised:
-            for_supervisor.append(f"{repo}#{n} ({'; '.join(f'{why}: {a}' for a, why in owners)})")
+            for_supervisor.append(f"{it.at} ({'; '.join(f'{why}: {a}' for a, why in owners)})")
             kv_set(key, json.dumps([rounds + 1, first or spell, moved]))
             add_notice(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
                        f"the stall check woke the supervisor for this {it.kind}: it waited for nothing the kit can "
@@ -1897,7 +1967,7 @@ def check_stalls():
             if capped(agent):
                 continue
             add_trigger(agent, f"stalled:{repo}#{n}:{spell}",
-                        f"the kit is quiet and nothing is moving {it.kind} {repo}#{n} on ({why}): move it on, "
+                        f"the kit is quiet and nothing is moving {it.kind} {it.at} on ({why}): move it on, "
                         "or record what it waits for (a `Blocked-by:` line, or `needs-human` with a decision)")
             queued += 1
             woke = True
@@ -1906,7 +1976,8 @@ def check_stalls():
             # No rule woke anyone for it, so the rules have a gap: the human
             # hears of each one, once, and the process review looks into it.
             names = ", ".join(sorted({a for a, _ in owners if not capped(a)}))
-            notify(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
+            # main has no issue to comment on: a notice alone.
+            (notify if n else add_notice)(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
                    f"the stall check woke {names} for this {it.kind}: it waited for nothing the kit can see "
                    f"({'; '.join(why for _, why in owners)}), and no rule had woken anyone for it. That is a gap "
                    "in the kit's rules; the process review looks into each one at the milestone's end.")

@@ -40,6 +40,11 @@ follow a rule tea can't enforce. Uses the agent's own token.
   forge ledger [days]             (process, the supervisor) the run ledger for the last days
                                   (default 30): runs, the human's sessions,
                                   notices, as JSON
+  forge version                   in your checkout: the version the next
+                                  release will have, from API.lock in your
+                                  working tree against the last vX.Y.Z tag, as
+                                  the gatekeeper computes it. Head your
+                                  CHANGELOG.md entry with it
   forge release <repo> <note> [<issue>...]
                                   (coordinator, level 3) ask the gatekeeper to
                                   release <repo>: it computes the version from
@@ -53,6 +58,7 @@ follow a rule tea can't enforce. Uses the agent's own token.
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -325,6 +331,60 @@ def release(repo, note, issues):
     print(f"Released {repo} {p['version']} at {p['sha'][:12]}: {p['reason']}. {p.get('url', '')}")
 
 
+TAG = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+
+def api_lines(text):
+    return {line.rstrip() for line in (text or "").splitlines() if line.strip()}
+
+
+def next_version(prev, old_lock, new_lock):
+    """The next version and why, from the API.lock diff since prev: the
+    gatekeeper's rule (gatekeeper.next_version, which test_forge holds this
+    to). Before 1.0: minor if API.lock changed, patch otherwise. From 1.0:
+    major if a line was removed or changed, minor if lines were only added,
+    patch otherwise."""
+    if prev is None:
+        return (0, 1, 0), "the first release"
+    old, new = api_lines(old_lock), api_lines(new_lock)
+    removed, added = old - new, new - old
+    x, y, z = prev
+    since = f"v{x}.{y}.{z}"
+    if x == 0:
+        if removed or added:
+            return (0, y + 1, 0), f"API.lock changed since {since}: before 1.0, that's a minor release"
+        return (0, y, z + 1), f"API.lock is unchanged since {since}: a patch release"
+    if removed:
+        return (x + 1, 0, 0), f"API.lock lost or changed {len(removed)} line(s) since {since}: a major release"
+    if added:
+        return (x, y + 1, 0), f"API.lock only gained lines since {since}: a minor release"
+    return (x, y, z + 1), f"API.lock is unchanged since {since}: a patch release"
+
+
+def git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def version():
+    """The next release's version, for the checkout in the current directory."""
+    if git("rev-parse", "--show-toplevel")[0] != 0:
+        die("forge version runs in a checkout: cd into your repository first")
+    git("fetch", "--quiet", "--tags", "origin")  # a release since the clone; offline, the tags it has
+    tags = [(tuple(int(x) for x in m.groups()), t) for t in git("tag", "-l", "v*")[1].split()
+            if (m := TAG.match(t))]
+    try:
+        with open(os.path.join(git("rev-parse", "--show-toplevel")[1].strip(), "API.lock")) as f:
+            new = f.read()
+    except OSError:
+        die("this checkout has no API.lock, so the version can't be computed: write it with "
+            "`bash scripts/api-lock.sh > API.lock`, as CI checks it")
+    prev = max(tags) if tags else None
+    old = git("show", f"{prev[1]}:API.lock")[1] if prev else None
+    v, why = next_version(prev and prev[0], old, new)
+    print(f"v{v[0]}.{v[1]}.{v[2]}: {why} (API.lock in your working tree)")
+
+
 def ledger(days):
     if ME != "process":
         die("only the supervisor (process) reads the ledger")
@@ -379,6 +439,8 @@ def main(argv):
             print((r.get("body") or "").strip() + "\n")
     elif len(argv) >= 3 and argv[0] == "release":
         release(repo_name(argv[1]), argv[2], [number(n) for n in argv[3:]])
+    elif argv == ["version"]:
+        version()
     elif len(argv) in (1, 2) and argv[0] == "ledger":
         ledger(int(argv[1]) if len(argv) == 2 and argv[1].isdigit() else 30)
     elif len(argv) >= 5 and argv[0] == "pr" and argv[1] == "approve":
