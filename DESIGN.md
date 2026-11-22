@@ -256,7 +256,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 ### Every agent, on a request it filed
 
-- **(10)** A `Released in vX.Y.Z` comment, from the gatekeeper, the human or the repository's owner, while the request is open and not verified, and again a day after the release (`UNVERIFIED_NUDGE_SECONDS`). The coordinator verifies its own requests in the run that asked for the release, so its trigger is dropped when it is claimed if it did; if it didn't, the trigger wakes it as it would any requester.
+- **(10)** A `Released in vX.Y.Z` comment, from the gatekeeper, the human or the repository's owner, while the request is open and not verified, once more as soon as the run woken for it ends without the requester commenting on it (a run that only upgraded, gpu#59), and again a day after the release (`UNVERIFIED_NUDGE_SECONDS`). The coordinator verifies its own requests in the run that asked for the release, so its trigger is dropped when it is claimed if it did; if it didn't, the trigger wakes it as it would any requester.
 - **(11)** On someone else's repository, a counter-proposal, or the request being closed without `verified` by someone other than the agent itself.
 
 ### The coordinator, across the `inkproof-` repositories
@@ -301,7 +301,7 @@ The dispatcher keeps each issue's `blocked` label in step with its `Blocked-by:`
 
 ### Any agent, when the human mentions it
 
-- **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). The supervisor's @-mentions wake too, the owner's included, since its comments start `(no reply needed)` and so don't wake the owner by (2); at most `SUPERVISOR_NUDGES` (default 3) of its comments a day on one item wake anyone. Any other agent's @-mentions wake no one.
+- **(26)** A comment by the human that @-mentions the agent, on any issue or pull request, if the agent hasn't commented or acted there since. This is how the human reaches an agent other than the repository's owner, whom any comment wakes (2). The supervisor's @-mentions wake too, the owner's included, since its comments start `(no reply needed)` and so don't wake the owner by (2); at most `SUPERVISOR_NUDGES` (default 3) of its comments a day on one item wake anyone. On a request, the owner's comment that wants a reply and @-mentions the requester wakes the requester: it is the owner's way to ask what only the requester knows, such as its reproduction, which nothing else carries to it (gpu#59). The owner's other comments, such as accepting or `Ready for release`, don't wake the requester unless they mention it. Any other agent's @-mentions wake no one.
 
 ### Stalls
 

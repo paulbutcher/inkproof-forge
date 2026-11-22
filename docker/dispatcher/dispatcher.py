@@ -777,7 +777,7 @@ Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(No
 # Kinds of trigger a rule queues, which a claim checks are still owed.
 RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci", "merged",
               "idle-request",
-              "unblocked", "upstream-comment", "released", "unverified", "answered", "filed", "pr-opened",
+              "unblocked", "upstream-comment", "released", "unanswered", "unverified", "answered", "filed", "pr-opened",
               "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention",
               "overtaken", "priority", "closed-unreleased"}
 # Kinds whose state, when the rules first run on an existing ledger, was
@@ -976,6 +976,12 @@ def acted_in_earlier_run(agent, asked, acted):
                   agent, asked, acted))
 
 
+def trigger_run_ended(agent, key):
+    """When the last run that took a trigger ended; None if none has."""
+    return q("SELECT MAX(r.ended) AS e FROM triggers t JOIN runs r ON r.id = t.run_id "
+             "WHERE t.agent=? AND t.key=? AND r.ended IS NOT NULL", agent, key)[0]["e"]
+
+
 def follow_ups(agent, base):
     """How many follow-ups (7) were ever queued after the same merge or unblocking."""
     prefix = base + ":"
@@ -1143,6 +1149,16 @@ def requester_rules(it):
             o.append(Owed(req, f"released:{at}:{tag}",
                           f"your request {at} was released in {tag}: upgrade to it, check its acceptance "
                           "criteria, and verify it"))
+            # And once more as soon as the run woken for it has ended without
+            # a word on it: a run that only upgrades leaves it waiting a day
+            # for the nudge (gpu#59).
+            ended = trigger_run_ended(req, f"released:{at}:{tag}")
+            if ended and it.by(req, {"comment"}) <= when(c["created_at"]):
+                o.append(Owed(req, f"unanswered:{at}:{tag}",
+                              f"your request {at} was released in {tag}, and the run woken for it ended without "
+                              "verifying it or saying on it what stops you: verify it now, or say on it what it "
+                              "waits for (a `Blocked-by:` line, or a decision for the human if only a device you "
+                              "don't have shows it)"))
             age = now() - when(c["created_at"])
             if age > NUDGE:
                 o.append(Owed(req, f"unverified:{at}:{tag}",
@@ -1319,24 +1335,34 @@ def mention_rules(it):
     # 26. A comment by the human that @-mentions an agent, which that agent
     #     hasn't commented on or acted on the item since: the human's way to
     #     reach an agent other than the owner, whom any comment wakes (2).
-    #     An agent's mentions wake no one.
     #     The supervisor's mentions wake too, the owner's included, since its
     #     comments ask no reply of the owner (2); at most SUPERVISOR_NUDGES
     #     of its comments a day on one item, so it can't keep an agent busy.
+    #     The owner's mention of a request's requester wakes the requester,
+    #     if it wants a reply: the owner's way to ask what only the requester
+    #     knows, which nothing else carries to it (gpu#59). Any other
+    #     agent's mentions wake no one.
     mine = [c for c in it.comments() if SUPERVISOR and login(c) == SUPERVISOR]
+    requester = it.author if (not it.is_pr and "request" in it.labels and it.author != it.owner) else None
     for c in it.comments():
         who = login(c)
         if who == SUPERVISOR:
             day = [m for m in mine if when(c["created_at"]) - 86400 < when(m["created_at"]) <= when(c["created_at"])]
             if len(day) > SUPERVISOR_NUDGES:
                 continue
+        elif who == it.owner and requester and who != HUMAN:
+            if not wants_reply(c.get("body")):
+                continue
         elif who != HUMAN:
             continue
+        by = "the human" if who == HUMAN else "the supervisor" if who == SUPERVISOR else f"{who}, its owner,"
         for name in dict.fromkeys(MENTION.findall(c.get("body") or "")):
+            if who not in (HUMAN, SUPERVISOR) and name != requester:
+                continue
             if (name in AGENTS and name != who and (name != it.owner or who == SUPERVISOR)
                     and it.by(name) < when(c["created_at"])):
                 o.append(Owed(name, f"mention:{at}:{c['id']}",
-                              f"{'the human' if who == HUMAN else 'the supervisor'} mentioned you on {it.kind} {at}: "
+                              f"{by} mentioned you on {it.kind} {at}: "
                               f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"))
     return o
 

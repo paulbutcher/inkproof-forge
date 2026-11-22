@@ -241,6 +241,22 @@ class OwnerRules(Case):
         self.f.items[(CORE, 9)]["events"].append(comment("coordinator", 50, "(no reply needed)\nApproved."))
         self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
 
+    def test_26_the_owners_mention_wakes_its_requester_gpu_59(self):
+        # core asks scale, its request's requester, for what only scale
+        # knows. Its mentions of anyone else, a mention that wants no reply,
+        # or one on an issue that isn't a request, wake no one.
+        self.f.issue(CORE, 9, "scale", ["request", "accepted"], events=[
+            comment("core", 300, "I can't reproduce it. @scale, can you attach the frame? @gpu might know too.", cid=59),
+            comment("core", 250, "(no reply needed)\n\n@scale, merged.")])
+        self.f.issue(CORE, 10, "scale", events=[comment("core", 300, "@scale, what's this?")])
+        self.f.issue(CORE, 11, "scale", ["request", "accepted"],
+                     events=[comment("core", 300, "@scale, the frame?"), comment("scale", 200, "Attached.")])
+        for n in (9, 10, 11):
+            d.evaluate(CORE, n)
+        self.assertEqual(sorted(k for k in self.queued() if k[1] == "mention"), [("scale", "mention")])
+        self.assertIn(f"core, its owner, mentioned you on issue {CORE}#9: "
+                      f"http://forge/org/{CORE}/issues/9#issuecomment-59", self.descriptions("scale"))
+
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
         self.f.issue(CORE, 1, "core", events=[comment("scale", 300, cid=1)])
         self.f.issue(CORE, 2, "core", events=[comment("scale", 300), comment("core", 200, "Answered.")])
@@ -735,6 +751,29 @@ class RequesterRules(Case):
         self.assertEqual([t for t in d.claim("coordinator")["triggers"] if t.startswith("your request")],
                          [f"your request {CORE}#10 was released in v1.2.4: upgrade to it, check its acceptance "
                           "criteria, and verify it"])
+
+    def test_10_again_once_its_run_ends_without_a_word_gpu_59(self):
+        # The run woken for the release only upgraded (a pull request that
+        # refers to it), so the requester is woken again, once; a comment
+        # on the request (verifying, or what it waits for) answers it.
+        released = comment("gatekeeper", 3600, "(no reply needed)\n\nReleased in v1.2.3: ...")
+        self.f.issue(CORE, 9, "scale", ["request", "accepted"],
+                     events=[released, {"type": "pull_ref", "user": {"login": "scale"}, "created_at": at(1800)}])
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.queued("scale"), ["released"])
+        run = d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('scale', '[]', ?) RETURNING id",
+                  d.now() - 2000)[0]["id"]
+        d.q("UPDATE triggers SET run_id=?", run)
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.queued("scale"), [], "not while the run is under way")
+        d.q("UPDATE runs SET ended=? WHERE id=?", d.now() - 1000, run)
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.queued("scale"), ["unanswered"])
+        d.q("DELETE FROM triggers WHERE key LIKE 'unanswered:%'")
+        self.f.issue(SCALE, 4, "scale")
+        self.f.items[(CORE, 9)]["events"].append(comment("scale", 500, "Blocked-by: org/inkproof-scale#4"))
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.queued("scale"), [])
 
     def test_10_still_unverified_a_day_later(self):
         self.f.issue(CORE, 9, "scale", ["request"],
