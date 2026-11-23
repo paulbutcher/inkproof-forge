@@ -22,12 +22,13 @@ agent's own actions, and never a comment whose first line is
 `(no reply needed)`. Trigger descriptions carry only numbers, names and
 links, never issue text, because they become a run's prompt.
 
-What an agent owes comes from rules over each issue and pull request as it
-is now (see Rules), never from the events themselves: a webhook only says
-which items to evaluate again, and every RECONCILE_SECONDS, and on start, a
-sweep evaluates them all. Each rule queues a trigger once per version of the
-state it looks at, so nothing is lost to a missed webhook and nothing wakes
-an agent twice for the same state.
+What an agent owes comes from each unit of work as it is now (an issue,
+a pull request, a repository's release, a milestone, the kit itself): its
+state (states.py), whose holders owe its next step, and what is asked of
+agents on it (see What is owed). A webhook only says which units to evaluate
+again, and every RECONCILE_SECONDS, and on start, a sweep evaluates them all,
+so nothing is lost to a missed webhook. Each obligation wakes its agent, and
+again while it stands, then it is the human's (see Obligations).
 
 A claim is granted only when the agent has no run, is under its daily caps,
 the kit isn't paused, and its newest trigger has settled for the debounce
@@ -36,12 +37,9 @@ becomes one run; and only for triggers whose items still owe them. A run
 that fails, times out or exits early has its work queued again, up to
 MAX_RUN_RETRIES times; then it's the human's.
 
-The rules can't foresee everything, so once the kit has been quiet for
-IDLE_SECONDS (no run, no queued work, no CI), every open issue and pull
-request must be waiting for something the kit can see (see Stalls); whoever
-should move on one that isn't is woken, and after STALL_ROUNDS quiet spells
-it is the human's. With nothing stalled, it wakes the coordinator to tell the
-human what it needs from them. Once per quiet spell.
+Once the kit has been quiet for IDLE_SECONDS (no run, no queued work, no
+CI), it wakes the coordinator to tell the human what it needs from them.
+Once per quiet spell.
 """
 
 import base64
@@ -61,6 +59,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import states as ST
 
 STATE = Path(os.environ.get("STATE_DIR", "/state"))
 SECRETS = Path(os.environ.get("DISPATCHER_SECRETS", "/run/secrets/dispatcher"))
@@ -99,11 +99,6 @@ RETRY_DELAY = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))
 # API. It isn't counted against RETRIES; its work waits these delays in turn,
 # then the last one each time, until the agent's runs get going again.
 ENV_DELAYS = [int(s) for s in os.environ.get("ENV_RETRY_DELAYS", "300,900,3600").split(",")]
-# An accepted request its owner worked on and left unfinished, with nothing
-# merged for it, wakes the owner again when its run ends, at most this many
-# times since the last merge for it or its unblocking (7); after that, the
-# stall check takes it (demo#2).
-FOLLOW_UPS = int(os.environ.get("FOLLOW_UP_RUNS", "3"))
 REVIEWER = "conformance"
 MILESTONE_REVIEWERS = ("architecture", "process", "lasm")
 KEEP_PAYLOADS = 500
@@ -152,8 +147,8 @@ TRUSTED = set(AGENTS) | {"gatekeeper", "dispatcher", HUMAN}
 OWNER_OF = {a["own"]: name for name, a in AGENTS.items()
             if a["own"] and a["kind"] in ("library", "site", "coordinator")}
 COORDINATOR = next((n for n, a in AGENTS.items() if a["kind"] == "coordinator"), None)
-# The supervisor: woken when the kit is quiet with work stalled, to find out
-# why, move it on and report the gap (Stalls). None without one.
+# The supervisor: woken when an obligation becomes the human's, to find out
+# why, move it on and report the gap (Obligations). None without one.
 SUPERVISOR = next((n for n, a in AGENTS.items() if a["kind"] == "supervisor"), None)
 # How many of the supervisor's comments on one item a day may wake someone.
 SUPERVISOR_NUDGES = int(os.environ.get("SUPERVISOR_NUDGES", "3"))
@@ -231,6 +226,12 @@ CREATE INDEX IF NOT EXISTS triggers_key ON triggers (agent, key);
 CREATE INDEX IF NOT EXISTS events_sender ON events (sender, at);
 CREATE TABLE IF NOT EXISTS blocked_by (repo TEXT, number INTEGER, on_repo TEXT, on_number INTEGER);
 CREATE INDEX IF NOT EXISTS blocked_by_on ON blocked_by (on_repo, on_number);
+CREATE TABLE IF NOT EXISTS units (
+  unit TEXT PRIMARY KEY, kind TEXT, state TEXT, holders TEXT, step TEXT, since REAL, seen REAL);
+CREATE TABLE IF NOT EXISTS shadow (
+  id INTEGER PRIMARY KEY, unit TEXT, agent TEXT, side TEXT, state TEXT, rules TEXT,
+  first REAL, last REAL, resolved REAL);
+CREATE INDEX IF NOT EXISTS shadow_unit ON shadow (unit, resolved);
 """)
 for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
                "events ADD COLUMN detail TEXT",      # ledgers from before the activity stream
@@ -260,8 +261,8 @@ def add_trigger(agent, key, description, once=False, not_before=None):
     """Queue work for an agent, unless the same key is already waiting; with
     once, unless it was ever queued. With not_before, it waits until then to
     be claimed. Queued again without one while it waits, it waits no longer
-    (a review whose author's run has ended, a pull request whose CI has
-    finished), unless it waits to be retried."""
+    (a pull request whose CI has finished), unless it waits to be retried.
+    Returns the new trigger's id, or None."""
     if agent not in AGENTS:
         return
     with LOCK:
@@ -271,9 +272,10 @@ def add_trigger(agent, key, description, once=False, not_before=None):
             if (dup["run_id"] is None and dup["not_before"] and not_before is None and not dup["attempts"]):
                 DB.execute("UPDATE triggers SET not_before=NULL WHERE id=?", (dup["id"],))
             return
-        DB.execute("INSERT INTO triggers (agent, key, description, created, not_before) VALUES (?,?,?,?,?)",
-                   (agent, key, description, now(), not_before))
+        cur = DB.execute("INSERT INTO triggers (agent, key, description, created, not_before) VALUES (?,?,?,?,?)",
+                         (agent, key, description, now(), not_before))
     log(f"queued for {agent}: {description}")
+    return cur.lastrowid
 
 
 # --- Forgejo --------------------------------------------------------------------
@@ -432,6 +434,20 @@ def latest_release(repo):
     return cached(("release", repo), 20, read)
 
 
+def last_tag(repo):
+    """The highest `vX.Y.Z` tag, as the gatekeeper finds it (last_tag there):
+    (name, (x, y, z)), or None. Tags, not releases, since a repository's tags
+    may predate its releases in Forgejo."""
+    def read():
+        best = None
+        for t in forge_all(f"/repos/{ORG}/{repo}/tags"):
+            v = version(t.get("name"))
+            if v and (best is None or v > best[1]):
+                best = (t["name"], v)
+        return best
+    return cached(("tag", repo), 20, read)
+
+
 # A CHANGELOG.md version heading, in either form the libraries use.
 CHANGELOG_VERSION = re.compile(r"(?m)^##[ \t]+\[?v?(\d+)\.(\d+)\.(\d+)\]?")
 
@@ -443,8 +459,8 @@ def version(tag):
 
 def unreleased_entry(repo):
     """CHANGELOG.md's newest heading on main, as `vX.Y.Z`, if it is above
-    the latest release (or there is none): work merged and described, waiting
-    for a release. None if it isn't, or there is no CHANGELOG.md."""
+    the last release's tag (or there is none): work merged and described,
+    waiting for a release. None if it isn't, or there is no CHANGELOG.md."""
     def read():
         try:
             f = forge("GET", f"/repos/{ORG}/{repo}/contents/CHANGELOG.md?ref=main") or {}
@@ -456,7 +472,7 @@ def unreleased_entry(repo):
         if not m:
             return None
         top = tuple(int(x) for x in m.groups())
-        last = version((latest_release(repo) or {}).get("tag_name"))
+        last = (last_tag(repo) or (None, None))[1]
         return "v%d.%d.%d" % top if last is None or top > last else None
     return cached(("unreleased", repo), 60, read)
 
@@ -554,26 +570,6 @@ def busy(agent):
     return bool(may_push(agent) or q("SELECT 1 FROM triggers WHERE agent=? AND run_id IS NULL", agent))
 
 
-def release_reviews(agent):
-    """The agent's run has ended: the reviews of its pull requests that wait
-    to settle can start now."""
-    if may_push(agent):
-        return
-    for t in q("SELECT id, key FROM triggers WHERE agent=? AND run_id IS NULL AND key LIKE 'conf:%' "
-               "AND not_before>?", REVIEWER, now()):
-        m = re.match(r"conf:([^#]+)#(\d+):", t["key"])
-        if not m:
-            continue
-        try:
-            pr = forge("GET", f"/repos/{ORG}/{m[1]}/pulls/{m[2]}")
-        except Exception as e:
-            log(f"couldn't read {m[1]}#{m[2]} to release its review: {e!r}")
-            continue
-        if login(pr) == agent:
-            q("UPDATE triggers SET not_before=NULL WHERE id=?", t["id"])
-            log(f"{agent}'s run ended: conformance may review {m[1]}#{m[2]} now")
-
-
 # --- What waits on the human ------------------------------------------------------
 #
 # Everything waiting on the human is an open issue or pull request assigned to
@@ -583,8 +579,6 @@ def release_reviews(agent):
 
 DECISION = ("Question", "Options", "Recommendation", "If you say go ahead", "Blocked on this")
 RELEASED = re.compile(r"^Released in (v\d+\.\d+\.\d+)\b", re.M)
-NUDGE = int(os.environ.get("UNVERIFIED_NUDGE_SECONDS", "86400"))
-STALL = int(os.environ.get("UNVERIFIED_STALL_SECONDS", "172800"))
 
 
 def missing_sections(text):
@@ -673,41 +667,6 @@ def waiting_on_human():
     return len(waiting_for_human())
 
 
-def check_unverified_stalls(repo):
-    """Open requests released but never verified: the requester was woken
-    again after NUDGE seconds (rule 10); after STALL, the stall is the human's."""
-    for issue in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=request"):
-        labels = {l["name"] for l in issue.get("labels") or []}
-        if "request" not in labels or "verified" in labels:
-            continue
-        n = issue["number"]
-        released = [(c, RELEASED.search(c.get("body") or "")) for c in
-                    forge_comments(repo, n)
-                    if login(c) in ("gatekeeper", HUMAN, OWNER_OF.get(repo))]
-        released = [(c, m) for c, m in released if m]
-        if not released:
-            continue
-        c, m = released[-1]
-        tag = m[1]
-        age = now() - when(c["created_at"])
-        requester = login(issue) or "?"
-        if age > STALL:
-            decision_issue(COORDINATION, f"stalled:{repo}#{n}:{tag}", "stalled",
-                           f"Released but never verified: {repo}#{n}", {
-                "Question": f"[{repo}#{n}]({issue.get('html_url', '')}) was released in {tag} "
-                            f"{int(age // 86400)} days ago, and its requester, `{requester}`, hasn't verified it, "
-                            "even after being woken again a day later. Something has stalled: what should happen?",
-                "Options": f"- Find out why: `scripts/activity.sh {repo}#{n}` and `scripts/activity.sh {requester}` "
-                           "show what happened to it, and fix the kit if a step is missing.\n"
-                           "- Verify it yourself against its acceptance criteria, add `verified` and close it.\n"
-                           "- Close it as no longer needed, saying why.",
-                "Recommendation": "Find out why first: a release nobody verifies is usually a missing wake-up, "
-                                  "an upgrade the requester can't make, or a requester that isn't an agent.",
-                "If you say go ahead": "Nothing happens on its own: the kit has already done what it can. "
-                                       "Close this issue once you've dealt with it.",
-                "Blocked on this": f"{repo}#{n}, and anything whose `Blocked-by:` line names it."})
-
-
 def later(fn, *args, delay=30):
     def run():
         try:
@@ -757,15 +716,16 @@ def handle(event, payload):
                    f"`recommendation` and `review:{sender}`: close each as accepted, or label it `declined`, "
                    "say why and close it.")
     elif event == "release" and action == "published":
-        # The one wake-up that is an event, not a state: the coordinator
-        # hears of a release it didn't ask the gatekeeper for.
+        # 18. The one notice that is an event, not a state: the coordinator
+        #     hears of a release it didn't ask the gatekeeper for.
         tag = (payload.get("release") or {}).get("tag_name", "")
         if COORDINATOR and trusted and sender not in ("gatekeeper", COORDINATOR):
             add_trigger(COORDINATOR, f"released:{repo}:{tag}", f"{repo} released {tag}", once=True)
-        # And a `Release <repo>` decision it overtook (27).
+        # And a `Release <repo>` decision it overtook, and the release itself.
         _cache.pop(("release", repo), None)
         if kv_get("rules-seeded"):
             evaluate_labelled(repo, "needs-human")
+            evaluate_release(repo)
         return
 
     if not kv_get("rules-seeded"):
@@ -780,10 +740,9 @@ def handle(event, payload):
         # event: look again a little later too.
         run = payload.get("run") or {}
         if run.get("event") == "push":
-            # CI on main: and the requests waiting on it to be released.
-            evaluate_repo(repo)
-            later(evaluate_repo, repo)
-            later(evaluate_labelled, repo, "ready-for-release")
+            # CI on main: the release waits on it.
+            evaluate_release(repo)
+            later(evaluate_release, repo)
             return
         try:
             n = (json.loads(run.get("event_payload") or "{}").get("pull_request") or {}).get("number")
@@ -793,38 +752,177 @@ def handle(event, payload):
             later(evaluate, repo, n)
     if n:
         evaluate(repo, n)
-    if event == "issues" and action == "closed":
-        evaluate_repo(repo)  # its milestone may be done
+    if event == "issues":
+        labels = {l["name"] for l in item.get("labels") or []}
+        if "ready-for-release" in labels or action in ("closed", "reopened", "label_updated", "label_cleared"):
+            evaluate_release(repo)
+        if action in ("opened", "closed", "reopened", "milestoned", "demilestoned"):
+            evaluate_milestones()  # a milestone's work, and so the kit's
 
 
-# --- Rules ------------------------------------------------------------------------
+# --- What is owed -----------------------------------------------------------------
 #
-# Every wake-up is a rule over an issue or pull request as it is now, or over
-# a repository (its main, its milestones). A rule names the agent that owes
-# something and a version: the state that makes it new, such as a head
-# commit, a comment or a time. A trigger is queued once per version, so an
-# agent that looks and leaves things as they are isn't woken again until
-# something changes, and a run that doesn't finish gives its triggers back
-# (retry). Webhooks only say which items to look at again; the sweep looks at
-# all of them every RECONCILE seconds; and a claim looks again at the items
-# behind its triggers, dropping what is no longer owed. The numbers are the
-# rules' in DESIGN.md (Triggers).
+# proposals/explicit-state.md. Every issue, pull request, repository's
+# release, milestone and the kit itself is a unit with a state (states.py),
+# derived from facts read here (Facts, below). Each agent that holds a state
+# that isn't finished owes its step; each agent asked something on an item (a
+# reply, a mention, a closed item's Waiting-on: line) owes an answer until it
+# acts there. Both are obligations, and all obligations are woken alike
+# (Obligations, below): at once, again as each run ends with the obligation
+# still standing, OBLIGATION_BACKOFF apart, then the human's.
+#
+# Notices are something to look at once, never progress, so never what work
+# waits on: each is queued once per version of the state it reads, and a
+# claim drops one no longer owed. The numbers are DESIGN.md's (Triggers).
+#
+# A webhook only says which units to evaluate again; the sweep evaluates
+# them all every RECONCILE seconds; a claim evaluates again the units behind
+# its work; and nothing is owed because of an event, only because of a state.
 
 Owed = namedtuple("Owed", "agent key description not_before quiet", defaults=(None, False))
 
-# Kinds of trigger a rule queues, which a claim checks are still owed.
-RULE_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci", "merged",
-              "idle-request",
-              "unblocked", "upstream-comment", "released", "unanswered", "unverified", "answered", "filed", "pr-opened",
-              "review-requested", "rfr", "nh", "reviewed", "conf", "conf-reply", "milestone", "lasm-blocking", "mention",
-              "overtaken", "priority", "closed-unreleased", "waiting"}
-# Kinds whose state, when the rules first run on an existing ledger, was
-# already acted on under the old event-driven triggers, or only reports what
-# happened: recorded as handled rather than queued. The others are work still
-# to do, which the old triggers may have missed.
-SEED_KINDS = {"comment", "review", "merged", "unblocked", "upstream-comment", "answered", "filed", "pr-opened",
-              "nh", "milestone", "lasm-blocking", "milestone-done"}
+# Kinds of notice, which a claim checks are still owed.
+RULE_KINDS = {"upstream-comment", "rejected", "filed", "pr-opened", "nh", "lasm-blocking", "priority"}
+# Kinds whose state, when the notices first run on an existing ledger, was
+# already reported under the old event-driven triggers: recorded as handled.
+SEED_KINDS = {"upstream-comment", "rejected", "filed", "pr-opened", "nh", "lasm-blocking"}
 RULE_KEY = re.compile(r"^([a-z-]+):([\w.-]+)#(\d+):")
+# Kinds of trigger the rules queued before the states replaced them: those
+# still waiting are dropped once, at start, as obligations take their place.
+RETIRED_KINDS = {"request", "comment", "review", "ci-failed", "conflicts", "unscheduled", "stuck-merge", "no-ci",
+                 "merged", "idle-request", "unblocked", "released", "unanswered", "unverified", "answered",
+                 "review-requested", "rfr", "reviewed", "conf", "conf-reply", "milestone", "mention", "overtaken",
+                 "closed-unreleased", "waiting", "main-failed", "milestone-done", "next-milestone", "stalled"}
+
+
+def notices(it):
+    """What an item asks agents to look at, once."""
+    o, at, c, owner = [], it.at, COORDINATOR, it.owner
+    # 28. Made a priority by someone else: before anything new.
+    added = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == PRIORITY
+             and (e.get("body") or "") == "1"]
+    if owner and it.open and not it.is_pr and PRIORITY in it.labels and added and login(added[-1]) != owner:
+        o.append(Owed(owner, f"priority:{at}:{added[-1]['created_at']}",
+                      f"{at} is now a priority: it comes before anything new (Protocol: Priority)"))
+    # 11. A request closed without being verified, by someone else: rejected.
+    req = it.author
+    if (not it.is_pr and not it.open and "request" in it.labels and "verified" not in it.labels
+            and req in AGENTS and AGENTS[req]["own"] and req != owner):
+        closes = [e for e in it.events if e.get("type") == "close"]
+        if closes and login(closes[-1]) != req:
+            o.append(Owed(req, f"rejected:{at}:{closes[-1]['created_at']}",
+                          f"your request {at} was closed without being verified"))
+    if c:
+        # 12. A request filed by someone else: check it's well formed and placed.
+        if it.open and not it.is_pr and "request" in it.labels and it.author in TRUSTED and it.author != c:
+            o.append(Owed(c, f"filed:{at}:", f"request filed: {at}"))
+        if (it.is_pr and it.author in TRUSTED and it.author not in (c, HUMAN) and (it.open or it.pr.get("merged"))
+                and it.files() != {"CHANGELOG.md"}):
+            # 13. A pull request opened by an agent: check its scope. Held a
+            #     while, or until CI has finished, so that a review asked of
+            #     the coordinator shares the run. Not the human's, nor one
+            #     that changes only CHANGELOG.md, which the coordinator checks
+            #     when it releases; its files are read again at the claim, so
+            #     one that grows beyond CHANGELOG.md wakes it then
+            #     (coordination#171).
+            settled = not it.open or not has_ci(it.repo) or it.ci() in ("success", "failure")
+            o.append(Owed(c, f"pr-opened:{at}:", f"pull request opened: {at}",
+                          None if settled else when(it.pr["created_at"]) + OPENED_HOLD))
+        # 16. needs-human added or removed by someone else (not the kit), and
+        #     it hasn't looked since. Not on a process or Lasm recommendation:
+        #     those change the kit or go upstream, which is the human's, never
+        #     its own remit (coordination#128).
+        nh = [e for e in it.events if e.get("type") == "label"
+              and (e.get("label") or {}).get("name") == "needs-human"]
+        theirs = "recommendation" in it.labels and it.labels & {"review:process", "review:lasm"}
+        if (nh and not theirs and login(nh[-1]) not in (c, "dispatcher")
+                and it.by(c, ("comment", "label")) < when(nh[-1]["created_at"])):
+            added = (nh[-1].get("body") or "") == "1"
+            o.append(Owed(c, f"nh:{at}:{nh[-1]['created_at']}",
+                          f"needs-human {'added to' if added else 'removed from'} {it.kind} {at}"))
+    # 22. A Lasm issue that blocks an agent.
+    if (it.repo == COORDINATION and not it.is_pr and it.open and {"upstream", "upstream:lasm", "blocking"} <= it.labels
+            and "lasm" in AGENTS):
+        o.append(Owed("lasm", f"lasm-blocking:{at}:", f"blocking Lasm issue {at}"))
+    return [x for x in o if x.agent in AGENTS]
+
+
+MENTION = re.compile(r"(?<![\w@/.-])@([\w.-]+)")
+
+
+def asks(it):
+    """What is asked of agents on an item, as (agent, what, description):
+    each owes an answer until it acts there."""
+    o, at, owner = [], it.at, it.owner
+    link = lambda c: f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"
+    # 2. A comment or review from someone else that wants a reply, newer than
+    #    anything the owner has done here, or answered only by a run that
+    #    started before it, which never saw it (coordination#140). An approval
+    #    asks nothing, whatever it says; a request for changes always asks.
+    #    Timestamps are to the second, so ties go by the timeline's order.
+    #    It names who asked and links the comment, so a run reads that one
+    #    rather than looking for it (web#94).
+    if owner and it.open:
+        order = lambda e, i: (when(e["created_at"]), i)
+        placed = lambda r: (when(r["submitted_at"]), next(
+            (i for i, e in enumerate(it.events) if e.get("type") == "review" and login(e) == login(r)
+             and e["created_at"] == r["submitted_at"]), -1))
+        found = [(order(c, i), f"reply:{c['id']}", f"comment on {it.kind} {at} from {login(c)}: {link(c)}")
+                 for i, c in enumerate(it.events) if c.get("type") == "comment"
+                 and login(c) in TRUSTED and login(c) != owner and wants_reply(c.get("body"))]
+        found += [(placed(r), f"reply:review-{r['id']}",
+                   f"{'changes requested on' if r['state'] == 'REQUEST_CHANGES' else 'review on'} pull request {at} "
+                   f"by {login(r)} (`forge reviews {it.repo} {it.n}`)")
+                  for r in it.reviews if login(r) in TRUSTED and login(r) != owner and r.get("submitted_at")
+                  and (r.get("state") == "REQUEST_CHANGES"
+                       or (r.get("state") == "COMMENT" and wants_reply(r.get("body"))))]
+        if found:
+            t, what, desc = max(found)
+            acted = max([order(e, i) for i, e in enumerate(it.events) if login(e) == owner]
+                        + [placed(r) for r in it.reviews if login(r) == owner and r.get("submitted_at")]
+                        or [(0, 0)])
+            if t > acted or acted_in_earlier_run(owner, t[0], acted[0]):
+                o.append((owner, what, desc))
+    # 26. A comment by the human that @-mentions an agent, which that agent
+    #     hasn't acted on since: the human's way to reach an agent other than
+    #     the owner, whom any comment reaches (2). The supervisor's mentions
+    #     reach the owner too, since its comments ask no reply (2); at most
+    #     SUPERVISOR_NUDGES of its comments a day on one item, so it can't
+    #     keep an agent busy. The owner's mention of a request's requester
+    #     reaches the requester, if it wants a reply: the owner's way to ask
+    #     what only the requester knows (gpu#59). Any other agent's mentions
+    #     reach no one.
+    mine = [c for c in it.comments() if SUPERVISOR and login(c) == SUPERVISOR]
+    requester = it.author if (not it.is_pr and "request" in it.labels and it.author != owner) else None
+    mentioned = {}  # the newest mention of each agent: acting answers them all
+    for c in it.comments():
+        who = login(c)
+        if who == SUPERVISOR:
+            day = [m for m in mine if when(c["created_at"]) - 86400 < when(m["created_at"]) <= when(c["created_at"])]
+            if len(day) > SUPERVISOR_NUDGES:
+                continue
+        elif who == owner and requester and who != HUMAN:
+            if not wants_reply(c.get("body")):
+                continue
+        elif who != HUMAN:
+            continue
+        by = "the human" if who == HUMAN else "the supervisor" if who == SUPERVISOR else f"{who}, its owner,"
+        for name in dict.fromkeys(MENTION.findall(c.get("body") or "")):
+            if who not in (HUMAN, SUPERVISOR) and name != requester:
+                continue
+            if (name in AGENTS and name != who and (name != owner or who == SUPERVISOR)
+                    and it.by(name) < when(c["created_at"])):
+                mentioned[name] = (name, f"mention:{c['id']}", f"{by} mentioned you on {it.kind} {at}: {link(c)}")
+    o += mentioned.values()
+    # 30. A closed item's `Waiting-on: <agent>` line, the latest on it, which
+    #     that agent hasn't acted on since: a verified request is where the
+    #     talk after it goes on (gpu#59, the coordinator asking demos there
+    #     for its release). On an open item it is a hold (Facts).
+    waiting = it.waiting_on() if not it.open else None
+    if waiting:
+        who, c = waiting
+        o.append((who, f"waiting:{c['id']}", f"{login(c)} is waiting on you on {it.kind} {it.at}: {link(c)}"))
+    return [x for x in o if x[0] in AGENTS]
 
 
 class Item:
@@ -989,11 +1087,10 @@ def blocker_state(repo, n):
 
 
 def blocked_rules(it):
-    """Rule 8: an issue whose Blocked-by: lines name only issues now closed or
-    released wakes its owner, once; and the human's comment on an upstream
-    issue it waits on, once per comment. Returns those, whether it is blocked
-    (None if it names nothing), when it last stopped being blocked, and what
-    it names."""
+    """Whether an item is blocked by its Blocked-by: lines (None if it names
+    nothing), when it last stopped being blocked, and what it names; and
+    rule 8: the human's comment on an upstream issue it waits on, once per
+    comment, for its owner to read."""
     found = blockers(it)
     if not found or not it.open or not it.owner:
         return [], None, None, found
@@ -1001,18 +1098,8 @@ def blocked_rules(it):
     done = sorted((when(s["done"]), s["what"]) for s in states.values() if s["done"])
     blocked = len(done) < len(found)
     owed = []
-    if not blocked:
-        t, what = done[-1]
-        # A released request its requester holds back from verifying, with a
-        # line of its own, waits on the requester, not the owner, who has
-        # nothing left to do (scene#51, web#86).
-        req = it.author
-        if (not it.is_pr and "request" in it.labels and "verified" not in it.labels and it.released()
-                and req in AGENTS and req != it.owner):
-            owed.append(Owed(req, f"unblocked:{it.at}:{iso(t)}",
-                             f"{what}; your request {it.at}, released and not yet verified, waits on it: verify it"))
-        else:
-            owed.append(Owed(it.owner, f"unblocked:{it.at}:{iso(t)}", f"{what}; {it.at} is blocked on it"))
+    # 8. The human's comment on an open upstream issue a line names, for the
+    #    owner to read: it may say what to do about it.
     for (r, k), at in found.items():
         h = states[(r, k)]["human"]
         if h and when(h["created_at"]) >= when(at):  # to the second, on another issue
@@ -1029,475 +1116,295 @@ def acted_in_earlier_run(agent, asked, acted):
                   agent, asked, acted))
 
 
-def trigger_run_ended(agent, key):
-    """When the last run that took a trigger ended; None if none has."""
-    return q("SELECT MAX(r.ended) AS e FROM triggers t JOIN runs r ON r.id = t.run_id "
-             "WHERE t.agent=? AND t.key=? AND r.ended IS NOT NULL", agent, key)[0]["e"]
+# --- Facts ------------------------------------------------------------------------
+#
+# What states.py reads, from Forgejo: each unit's facts, reduced to its
+# enums and booleans, and who each of its roles is.
+
+# CI that has been running this long without a change is late.
+CI_LATE = int(os.environ.get("CI_LATE_SECONDS", "3600"))
+ROADMAP_FINISHED = re.compile(r"(?im)^[ \t]*Status:[ \t]*finished\b")
+PRIORITY = "priority"
 
 
-def follow_ups(agent, base):
-    """How many follow-ups (7) were ever queued after the same merge or unblocking."""
-    prefix = base + ":"
-    return q("SELECT COUNT(*) AS n FROM triggers WHERE agent=? AND substr(key, 1, ?)=?",
-             agent, len(prefix), prefix)[0]["n"]
+def open_refs(repo):
+    """The issues on repo that open pull requests, anyone's, refer to."""
+    return cached(("refs", repo), 30, lambda: {n for p in forge_all(f"/repos/{ORG}/{repo}/pulls?state=open")
+                                                for n in pr_refs(repo, p)})
 
 
-def owner_rules(it, blocked, unblocked_at):
-    """What the repository's owner owes on an item in it."""
-    o, owner, at = [], it.owner, it.at
-    if not owner or not it.open:
-        return o
-    # 28. Made a priority, by someone else: before anything new.
-    added = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == PRIORITY
-             and (e.get("body") or "") == "1"]
-    if not it.is_pr and PRIORITY in it.labels and added and login(added[-1]) != owner:
-        o.append(Owed(owner, f"priority:{at}:{added[-1]['created_at']}",
-                      f"{at} is now a priority: it comes before anything new (Protocol: Priority)"))
-    # 1. An untriaged request from someone else.
-    if (not it.is_pr and {"request", "new"} <= it.labels and it.author in TRUSTED and it.author != owner):
-        since = it.label_event("new") or it.issue["created_at"]
-        o.append(Owed(owner, f"request:{at}:{since}", f"untriaged request {at}"))
-    #    Or an issue from someone else with no labels at all that the owner
-    #    hasn't touched: Forgejo drops the labels of anyone without write
-    #    access to issues here, and a request can be filed without them.
-    elif (not it.is_pr and not it.labels and it.author in TRUSTED and it.author != owner
-          and not it.by(owner)):
-        o.append(Owed(owner, f"request:{at}:{it.issue['created_at']}",
-                      f"untriaged issue {at}, filed without labels: if it's a request, add `request` and `new` "
-                      "and handle it as one; otherwise answer it or close it"))
-    # 2. A comment or review from someone else that wants a reply, newer than
-    #    anything the owner has done here, or answered only by a run that
-    #    started before it, which never saw it (coordination#140). An approval
-    #    asks nothing, whatever it says; a request for changes always asks.
-    #    Timestamps are to the second, so ties go by the timeline's order.
-    order = lambda e, i: (when(e["created_at"]), i)
-    placed = lambda r: (when(r["submitted_at"]), next(
-        (i for i, e in enumerate(it.events) if e.get("type") == "review" and login(e) == login(r)
-         and e["created_at"] == r["submitted_at"]), -1))
-    #    The trigger names who asked and links the comment, so a run reads
-    #    that one rather than looking for it (web#94: a run that couldn't
-    #    list the comments took an approval for the one that woke it).
-    link = lambda c: f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"
-    asks = [(order(c, i), f"comment:{at}:{c['id']}", f"comment on {it.kind} {at} from {login(c)}: {link(c)}")
-            for i, c in enumerate(it.events) if c.get("type") == "comment"
-            and login(c) in TRUSTED and login(c) != owner and wants_reply(c.get("body"))]
-    asks += [(placed(r), f"review:{at}:{r['id']}",
-              f"{'changes requested on' if r['state'] == 'REQUEST_CHANGES' else 'review on'} pull request {at} "
-              f"by {login(r)} (`forge reviews {it.repo} {it.n}`)")
-             for r in it.reviews if login(r) in TRUSTED and login(r) != owner and r.get("submitted_at")
-             and (r.get("state") == "REQUEST_CHANGES" or (r.get("state") == "COMMENT" and wants_reply(r.get("body"))))]
-    if asks:
-        t, key, what = max(asks)
-        acted = max([order(e, i) for i, e in enumerate(it.events) if login(e) == owner]
-                    + [placed(r) for r in it.reviews if login(r) == owner and r.get("submitted_at")]
-                    or [(0, 0)])
-        if t > acted or acted_in_earlier_run(owner, t[0], acted[0]):
-            o.append(Owed(owner, key, what))
-    if it.is_pr and it.author == owner:
-        head = it.head[:12]
-        # 3. CI failed on its head.
-        if it.ci() == "failure":
-            o.append(Owed(owner, f"ci-failed:{at}:{head}", f"CI failed on pull request {at}"))
-        # 25. No CI run at all for its head NO_CI after it was pushed: the
-        #     branch has no workflow, such as one started from a library's
-        #     seed before CI reached main, and nothing reviews it until CI passes.
-        if has_ci(it.repo) and it.ci() == "none":
-            pushes = [e["created_at"] for e in it.events if e.get("type") == "pull_push"]
-            pushed = when(pushes[-1] if pushes else it.pr["created_at"])
-            o.append(Owed(owner, f"no-ci:{at}:{head}",
-                          f"CI has never run on your pull request {at} at {head}, so nothing reviews it: its branch "
-                          "probably lacks `.forgejo/workflows/`. Merge `origin/main` into it and push", pushed + NO_CI))
-        # 4. It conflicts with main. One merely behind merges as it is.
-        if it.pr.get("mergeable") is False:
-            o.append(Owed(owner, f"conflicts:{at}:{head}:{main_of(it.repo)['id'][:12]}",
-                          f"pull request {at} conflicts with main"))
-        # 5. No merge scheduled, so it would never merge, once the owner can
-        #    no longer schedule it (looked at again when its run ends); or one
-        #    scheduled that hasn't gone through STUCK after nothing stood in
-        #    its way.
-        if not wip(it.pr.get("title")) and not it.merge_scheduled():
-            if not may_push(owner):
-                o.append(Owed(owner, f"unscheduled:{at}:{head}",
-                              f"your pull request {at} has no merge scheduled, so it won't merge: schedule it "
-                              "(`forge pr automerge`), or close it if it's no longer wanted"))
-        elif (not wip(it.pr.get("title")) and it.merge_scheduled()
-              and (ready := it.ready_since()) and now() >= ready + STUCK):
-            o.append(Owed(owner, f"stuck-merge:{at}:{head}:{iso(ready)}",
-                          f"your pull request {at} has every approval it needs and CI passed, but its scheduled "
-                          f"merge hasn't gone through: merge it now (`forge pr merge {it.n}`)"))
-    request = not it.is_pr and "request" in it.labels and not it.labels & {"ready-for-release", "verified"}
-    # An issue a library's (or site's) owner filed for itself: finished as a
-    # request is, through ready-for-release, and its release closes it (demos#22).
-    task = (not it.is_pr and it.author == owner and AGENTS[owner]["kind"] != "coordinator"
-            and not it.labels & {"request", "ready-for-release", "verified", "upstream", "needs-human"})
-    # Blocked by its Blocked-by: lines, or (naming none) by the label.
-    held = blocked if blocked is not None else "blocked" in it.labels and not stale_blocked(it)
-    released = it.released()
-    if request or task:
-        # Since it was last unblocked (or accepted): earlier work was only part
-        # of it. Once released, since its last release: work merged after that
-        # is what its requester found missing when they checked the release
-        # (web#20), and nothing else wakes anyone to release it.
-        since = (unblocked_at and iso(unblocked_at)) or it.label_event("blocked", False) \
-            or it.label_event("accepted") or it.issue["created_at"]
-        if released:
-            since = max(since, released[-1][0]["created_at"], key=when)
-        # Merged at the moment it was unblocked counts: the pull request a
-        # Blocked-by: line names unblocks it by merging (gpu#59).
-        merged = [(p, refs) for p, refs in owner_prs(it.repo, owner, "merged")
-                  if it.n in refs and when(p["merged_at"]) >= when(since)]
-        # 6. Merged work it still has to finish: CHANGELOG.md and ready-for-release.
-        if merged and not held:
-            p = max(merged, key=lambda m: m[0]["merged_at"])[0]
-            o.append(Owed(owner, f"merged:{at}:{p['number']}",
-                          f"your pull request {it.repo}#{p['number']} merged after {at} was released in "
-                          f"{released[-1][1]}: if it changes what {at} asked for, it needs ready-for-release again; "
-                          "if it only refers to it (an upgrade, a refactor), leave it to its requester"
-                          if released else
-                          f"your pull request {it.repo}#{p['number']} merged; it answers {at}, "
-                          "not yet labelled ready-for-release"))
-    if (request or task) and not released:
-        # 7. Accepted (or its own task, which it accepted by filing it:
-        #    demos#74), nothing in its way and nothing under way, while the
-        #    owner has nothing to do: once each time it's unblocked, and once
-        #    after each merge for it. Quiet, so it comes after the merge's own
-        #    trigger (6), if that run left part of it to do (demo#3). And
-        #    again whenever the owner has acted on it since then, up to
-        #    FOLLOW_UPS times: a run that worked on it and stopped short, with
-        #    nothing merged for it, otherwise waits for the stall check
-        #    (demo#2). A run that looks and does nothing isn't woken again.
-        last_merge = max((when(p["merged_at"]) for p, _ in merged), default=0)
-        what = "accepted request" if request else "issue"
-        if (("accepted" in it.labels or task) and not held
-                and not it.labels & {"new", "needs-human", "counter-proposal"}
-                and not any(it.n in refs for _, refs in owner_prs(it.repo, owner, "open"))
-):
-            started = iso(last_merge) if merged else since
-            base, acted = f"idle-request:{at}:{started}", it.by(owner)
-            if acted <= when(started):
-                o.append(Owed(owner, base,
-                              f"your {what} {at} isn't blocked and has no pull request under way: work "
-                              "on it, or say on it what it waits for (a `Blocked-by:` line)", quiet=True))
-            elif follow_ups(owner, base) < FOLLOW_UPS:
-                o.append(Owed(owner, f"{base}:{iso(acted)}",
-                              f"your {what} {at} isn't finished: you last acted on it at {iso(acted)}, "
-                              "and it has no pull request under way. Carry on with it, or say on it what it waits "
-                              "for (a `Blocked-by:` line, or `needs-human`)", quiet=True))
-    return o
+def file_text(repo, path, ref):
+    """A file's text at ref, or None."""
+    try:
+        f = forge("GET", f"/repos/{ORG}/{repo}/contents/{path}?ref={urllib.parse.quote(ref)}") or {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    return base64.b64decode(f.get("content") or "").decode(errors="replace")
 
 
-def requester_rules(it):
-    """What an agent that filed a request on someone else's repository owes,
-    or should hear."""
-    o, req, at = [], it.author, it.at
-    if (it.is_pr or "request" not in it.labels or req not in AGENTS or not AGENTS[req]["own"]
-            or "verified" in it.labels):
-        return o
-    if it.open:
-        released = it.released()
-        # 10. Released: upgrade, check, verify; and again a day later. The
-        #     The coordinator verifies its own requests in the run that released
-        #     them, so its trigger is dropped at the claim if it did; if it
-        #     didn't, this is what wakes it (gpu#57).
-        if released:
-            c, tag = released[-1]
-            o.append(Owed(req, f"released:{at}:{tag}",
-                          f"your request {at} was released in {tag}: upgrade to it, check its acceptance "
-                          "criteria, and verify it"))
-            # And once more as soon as the run woken for it has ended without
-            # a word on it: a run that only upgrades leaves it waiting a day
-            # for the nudge (gpu#59).
-            ended = trigger_run_ended(req, f"released:{at}:{tag}")
-            if ended and it.by(req, {"comment"}) <= when(c["created_at"]):
-                o.append(Owed(req, f"unanswered:{at}:{tag}",
-                              f"your request {at} was released in {tag}, and the run woken for it ended without "
-                              "verifying it or saying on it what stops you: verify it now, or say on it what it "
-                              "waits for (a `Blocked-by:` line, or a decision for the human if only a device you "
-                              "don't have shows it)"))
-            age = now() - when(c["created_at"])
-            if age > NUDGE:
-                o.append(Owed(req, f"unverified:{at}:{tag}",
-                              f"your request {at} was released in {tag} {int(age // 3600)} hours ago and you "
-                              "haven't verified it: upgrade, check its acceptance criteria and verify it, or say "
-                              "on the issue what stops you"))
-        # 11. Counter-proposed.
-        t = it.label_event("counter-proposal")
-        if t and "counter-proposal" in it.labels and req != it.owner:
-            o.append(Owed(req, f"answered:{at}:{t}", f"your request {at} has a counter-proposal"))
-    elif req != it.owner:
-        # 11. Closed without being verified, by someone else: rejected.
-        closes = [e for e in it.events if e.get("type") == "close"]
-        if closes and login(closes[-1]) != req:
-            o.append(Owed(req, f"answered:{at}:{closes[-1]['created_at']}",
-                          f"your request {at} was closed without being verified"))
-    return o
+def expected_version(repo):
+    """The version the gatekeeper would give a release of main now, as
+    `vX.Y.Z`, or None if it can't be told (no API.lock on main)."""
+    main = main_of(repo)
+    tag, prev = last_tag(repo) or (None, None)
+
+    def read():
+        lock = file_text(repo, "API.lock", main["id"])
+        if lock is None:
+            return None
+        old = file_text(repo, "API.lock", tag) if prev else None
+        return "v%d.%d.%d" % ST.next_version(prev, old, lock)
+    return cached(("expected", repo, tag, main["id"]), 3600, read)
 
 
-def coordinator_rules(it):
-    """What the coordinator owes on any item."""
-    o, c, at = [], COORDINATOR, it.at
-    if not c:
-        return o
-    # 12. A request filed by someone else: check it's well formed and placed.
-    if it.open and not it.is_pr and "request" in it.labels and it.author in TRUSTED and it.author != c:
-        o.append(Owed(c, f"filed:{at}:", f"request filed: {at}"))
-    if (it.is_pr and it.author in TRUSTED and it.author not in (c, HUMAN) and (it.open or it.pr.get("merged"))
-            and it.files() != {"CHANGELOG.md"}):
-        # 13. A pull request opened by an agent: check its scope. Held a
-        #     while, or until CI has finished, so that a review requested of
-        #     the coordinator (14) shares the run. Not the human's (setup
-        #     pull requests), nor one that changes only CHANGELOG.md, which
-        #     the coordinator checks when it releases (15). Its files are
-        #     read on every evaluation, and again when the trigger is
-        #     claimed, so one that grows beyond CHANGELOG.md wakes it then
-        #     (coordination#171).
-        settled = not it.open or not has_ci(it.repo) or it.ci() in ("success", "failure")
-        o.append(Owed(c, f"pr-opened:{at}:", f"pull request opened: {at}",
-                      None if settled else when(it.pr["created_at"]) + OPENED_HOLD))
-    # Forgejo lists a reviewer as requested only until it reviews, and a push
-    # that dismisses its approval doesn't request it again: the timeline's
-    # requests still stand (web#8).
-    requested = it.requested() | {u["login"] for u in it.pr.get("requested_reviewers") or []} if it.is_pr else set()
-    if it.is_pr and it.open and c in requested:
-        # 14. Its review is requested (at level 3, API.lock), CI passed on the
-        #     head, and it hasn't approved that head.
-        approved = any(login(r) == c and r.get("state") == "APPROVED" and r.get("commit_id") == it.head
-                       and not r.get("dismissed") for r in it.reviews)
-        if not approved and (not has_ci(it.repo) or it.ci() == "success"):
-            # Said outright, from CODEOWNERS on main, since a stale clone
-            # (from before the setup pull request merged) suggests otherwise.
-            whose = (f"{it.repo} is at level 3: CODEOWNERS on main gives `API.lock` to you, so this pull request "
-                     "waits for your review. Approve it, request changes, or put a trade-off to the human as a "
-                     "decision; a comment alone leaves it waiting" if at_level_3(it.repo) else
-                     f"{it.repo} is below level 3, so the human approves its `API.lock`; your review is advisory")
-            o.append(Owed(c, f"review-requested:{at}:{it.head[:12]}",
-                          f"review requested from you on pull request {at}, whose CI passed at {it.head[:12]}. "
-                          f"{whose}"))
-    if it.open and "ready-for-release" in it.labels:
-        # 15. Ready for release, CI on main finished and passed (the
-        #     gatekeeper releases nothing else), and it hasn't looked since
-        #     the label was added or main last changed, its CI included (an
-        #     owner may fix what a refused release asked for and leave the
-        #     label on).
-        labelled = it.label_event("ready-for-release") or it.issue["created_at"]
-        main = main_of(it.repo)
-        ci, ci_at = ci_settled(it.repo, main["id"]) if has_ci(it.repo) else ("none", 0)
-        changed = max(when(labelled), when(main["timestamp"]), ci_at)
-        looked = it.by(c, ("comment", "label"))
-        if ci in ("success", "none") and looked < changed:
-            what = (f"ready-for-release added to {it.kind} {at}" if looked < when(labelled) else
-                    f"{at} is still labelled ready-for-release, and main has changed or its CI has finished "
-                    "since you last looked at it")
-            # Said outright, as for 14: the coordinator's own reading of
-            # CODEOWNERS went wrong (gpu#27, export#20: `grep API.lock`
-            # doesn't match the escaped `API\.lock`).
-            whose = (f"{it.repo} is at level 3: CODEOWNERS on main gives `API.lock` to you, so you release it "
-                     "with `forge release`" if at_level_3(it.repo) else
-                     f"{it.repo} is below level 3, so the human releases it: put the release to them as a decision")
-            o.append(Owed(c, f"rfr:{at}:{labelled}:{main['id'][:12]}:{ci}", f"{what}. {whose}"))
-    if it.open and not it.is_pr and it.author == c and it.issue.get("title") == f"Release {it.repo}":
-        # 27. Its `Release <repo>` decision, overtaken by a release published
-        #     since it last acted there: nothing else closes it (gpu#27, which
-        #     the gatekeeper's release overtook, so 18 didn't fire).
-        rel = latest_release(it.repo)
-        if rel and when(rel["published_at"]) > max(when(it.issue["created_at"]), it.by(c)):
-            o.append(Owed(c, f"overtaken:{at}:{rel['tag_name']}",
-                          f"{it.repo} released {rel['tag_name']} after your decision {at} asked the human to "
-                          "release it: close the decision if that release covers it, or update it for what's left"))
-    if not it.open and not it.is_pr and "ready-for-release" in it.labels and not it.released():
-        # 29. Closed while ready for release, and never released: nothing
-        #     would release it, and what waits on it waits for nothing
-        #     (coordination#208: scene#62, closed by its requester as a
-        #     duplicate of the issue it blocked). Once per close.
-        closes = [e for e in it.events if e.get("type") == "close"]
-        if closes:
-            o.append(Owed(c, f"closed-unreleased:{at}:{closes[-1]['created_at']}",
-                          f"{at} was closed by {login(closes[-1]) or 'someone'} while labelled ready-for-release, "
-                          "and hasn't been released: reopen it and release it, or, if its work truly isn't "
-                          "wanted, take the label off and say why on it"))
-    # 16. needs-human added or removed by someone else (not the kit), and it
-    #     hasn't looked since. Not on a process or Lasm recommendation: those
-    #     change the kit or go upstream, which is the human's, never its own
-    #     remit (coordination#128).
-    nh = [e for e in it.events if e.get("type") == "label" and (e.get("label") or {}).get("name") == "needs-human"]
-    theirs = "recommendation" in it.labels and it.labels & {"review:process", "review:lasm"}
-    if nh and not theirs and login(nh[-1]) not in (c, "dispatcher") and it.by(c, ("comment", "label")) < when(nh[-1]["created_at"]):
-        added = (nh[-1].get("body") or "") == "1"
-        o.append(Owed(c, f"nh:{at}:{nh[-1]['created_at']}",
-                      f"needs-human {'added to' if added else 'removed from'} {it.kind} {at}"))
-    # 24. An open milestone issue on which every milestone review has reported
-    #     since it was labelled, and the coordinator hasn't commented since the
-    #     last report: their reports want no reply, so nothing else wakes it
-    #     to accept the milestone.
-    if it.repo == COORDINATION and it.open and not it.is_pr and "milestone-review" in it.labels:
-        labelled = when(it.label_event("milestone-review") or it.issue["created_at"])
-        reviewers = [r for r in MILESTONE_REVIEWERS if r in AGENTS]
-        reported = [it.by(r, ("comment",)) for r in reviewers]
-        if reviewers and min(reported) > labelled and it.by(c, ("comment",)) < max(reported):
-            o.append(Owed(c, f"reviewed:{at}:{iso(max(reported))}",
-                          f"every milestone review has reported on {at}: accept the milestone (say what you "
-                          "checked, close the issue and its Forgejo milestones, record it in ROADMAP.md), or say "
-                          "on it what it waits for"))
-    return o
+def blocked_by_lines(it):
+    """Every Blocked-by: line from a trusted author, oldest first: (repo, n,
+    writer)."""
+    texts = [(it.author, it.issue.get("body") or "")] if it.author in TRUSTED else []
+    texts += [(login(c), c.get("body") or "") for c in it.comments() if login(c) in TRUSTED]
+    return [(r, int(k), who) for who, text in texts for org, r, k in BLOCKED_BY.findall(text)
+            if org.lower() == ORG.lower() and project_repo(r)]
 
 
-def reviewer_rules(it):
-    """What conformance and the milestone reviewers owe."""
-    o, at = [], it.at
-    if REVIEWER in AGENTS and it.is_pr and it.open and not wip(it.pr.get("title")):
-        head = it.head
-        # 19. A head that passed CI (or a repository without it) and that it
-        #     hasn't reviewed, once the head has settled: at once if the author
-        #     is an agent that can't push any more, else SETTLE after the last push.
-        if (not has_ci(it.repo) or it.ci() == "success") and \
-                not any(login(r) == REVIEWER and r.get("commit_id") == head for r in it.reviews):
-            settled = it.author in AGENTS and not may_push(it.author)
-            pushes = [e["created_at"] for e in it.events if e.get("type") == "pull_push"]
-            pushed = when(pushes[-1] if pushes else it.pr["created_at"])
-            o.append(Owed(REVIEWER, f"conf:{at}:{head[:12]}", f"review pull request {at} at {head[:12]}",
-                          None if settled else pushed + SETTLE))
-        # 20. The author answered its request for changes at this head in a
-        #     comment, without pushing; not while the pull request is
-        #     blocked, since its head will change first (demo#35).
-        mine = [r for r in it.reviews if login(r) == REVIEWER]
-        if (mine and mine[-1].get("state") == "REQUEST_CHANGES" and mine[-1].get("commit_id") == head
-                and "blocked" not in it.labels):
-            replies = [c for c in it.comments() if login(c) == it.author and login(c) != REVIEWER
-                       and wants_reply(c.get("body")) and when(c["created_at"]) > when(mine[-1]["submitted_at"])]
-            if replies:
-                o.append(Owed(REVIEWER, f"conf-reply:{at}:{replies[-1]['id']}",
-                              f"the author replied on pull request {at}, which you asked to change"))
-    if it.repo == COORDINATION and not it.is_pr:
-        # 21. A milestone review requested that a reviewer hasn't reported on
-        #     since, open or closed: the coordinator accepts a milestone and
-        #     closes its issue without waiting for the reviews.
-        if "milestone-review" in it.labels:
-            labelled = it.label_event("milestone-review") or it.issue["created_at"]
-            o += [Owed(r, f"milestone:{at}:{labelled}", f"milestone review requested on {at}")
-                  for r in MILESTONE_REVIEWERS if r in AGENTS and it.by(r, ("comment",)) < when(labelled)]
-        # 22. A Lasm issue that blocks an agent.
-        if it.open and {"upstream", "upstream:lasm", "blocking"} <= it.labels and "lasm" in AGENTS:
-            o.append(Owed("lasm", f"lasm-blocking:{at}:", f"blocking Lasm issue {at}"))
-    return o
-
-
-MENTION = re.compile(r"(?<![\w@/.-])@([\w.-]+)")
-
-
-def mention_rules(it):
-    """What the human's @-mentions ask of agents other than the owner."""
-    o, at = [], it.at
-    # 26. A comment by the human that @-mentions an agent, which that agent
-    #     hasn't commented on or acted on the item since: the human's way to
-    #     reach an agent other than the owner, whom any comment wakes (2).
-    #     The supervisor's mentions wake too, the owner's included, since its
-    #     comments ask no reply of the owner (2); at most SUPERVISOR_NUDGES
-    #     of its comments a day on one item, so it can't keep an agent busy.
-    #     The owner's mention of a request's requester wakes the requester,
-    #     if it wants a reply: the owner's way to ask what only the requester
-    #     knows, which nothing else carries to it (gpu#59). Any other
-    #     agent's mentions wake no one.
-    mine = [c for c in it.comments() if SUPERVISOR and login(c) == SUPERVISOR]
-    requester = it.author if (not it.is_pr and "request" in it.labels and it.author != it.owner) else None
-    for c in it.comments():
-        who = login(c)
-        if who == SUPERVISOR:
-            day = [m for m in mine if when(c["created_at"]) - 86400 < when(m["created_at"]) <= when(c["created_at"])]
-            if len(day) > SUPERVISOR_NUDGES:
-                continue
-        elif who == it.owner and requester and who != HUMAN:
-            if not wants_reply(c.get("body")):
-                continue
-        elif who != HUMAN:
+def loops_back(start, first):
+    """Whether the open items' Blocked-by: lines (the blocked_by index) lead
+    from first back to start."""
+    seen, todo = set(), [first]
+    while todo:
+        cur = todo.pop()
+        if cur == start:
+            return True
+        if cur in seen:
             continue
-        by = "the human" if who == HUMAN else "the supervisor" if who == SUPERVISOR else f"{who}, its owner,"
-        for name in dict.fromkeys(MENTION.findall(c.get("body") or "")):
-            if who not in (HUMAN, SUPERVISOR) and name != requester:
-                continue
-            if (name in AGENTS and name != who and (name != it.owner or who == SUPERVISOR)
-                    and it.by(name) < when(c["created_at"])):
-                o.append(Owed(name, f"mention:{at}:{c['id']}",
-                              f"{by} mentioned you on {it.kind} {at}: "
-                              f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}"))
-    return o
+        seen.add(cur)
+        todo += [(d["on_repo"], d["on_number"]) for d in
+                 q("SELECT on_repo, on_number FROM blocked_by WHERE repo=? AND number=?", *cur)]
+    return False
 
 
-def waiting_rules(it):
-    """What an item that says who it waits on asks of them."""
-    # 30. A `Waiting-on: <agent>` line, the latest on an item, which that
-    #     agent hasn't acted on since: whoever wrote it can't go on until
-    #     that agent answers or acts there, and says so in a way the kit can
-    #     see (gpu#59, where gpu waited on demos's reproduction and nothing
-    #     told demos). Closed items too: a verified request is where the
-    #     talk after it goes on (gpu#59 again, the coordinator asking demos
-    #     for its release). The owner, whom a comment wanting a reply
-    #     already wakes (2), isn't woken twice.
-    waiting = it.waiting_on()
-    if not waiting:
-        return []
-    who, c = waiting
-    if who == it.owner and wants_reply(c.get("body")):
-        return []
-    return [Owed(who, f"waiting:{it.at}:{c['id']}",
-                 f"{login(c)} is waiting on you on {it.kind} {it.at}: "
-                 f"{it.issue.get('html_url', '')}#issuecomment-{c['id']}")]
+def blocker_fact(it, blocked):
+    """The blockers fact, and who wrote an invalid line. A line naming the
+    item itself is invalid while it is the newest; one that closes a loop of
+    items each blocked by the next, while they wait."""
+    me, lines = (it.repo, it.n), blocked_by_lines(it)
+    if lines and lines[-1][:2] == me:
+        return "invalid", lines[-1][2]
+    if blocked:
+        for r, k, who in lines:
+            if (r, k) != me and loops_back(me, (r, k)):
+                return "invalid", who
+        return "pending", None
+    if blocked is False:
+        return "done", None
+    if "blocked" in it.labels and not stale_blocked(it):
+        return "bare-label", None
+    return "none", None
 
 
-def owed_on(it):
-    """Everything owed on an item, and whether it is blocked (None if it
-    names no blocker), with the issues it names."""
-    owed, blocked, unblocked_at, found = blocked_rules(it)
-    owed += owner_rules(it, blocked, unblocked_at)
-    owed += requester_rules(it)
-    owed += coordinator_rules(it)
-    owed += reviewer_rules(it)
-    owed += mention_rules(it)
-    owed += waiting_rules(it)
-    return [o for o in owed if o.agent in AGENTS], blocked, found
+def merged_since(it, unblocked_at):
+    """Whether the owner merged work for it since it was last unblocked or
+    accepted, and since its latest release: rule 6's test."""
+    since = (unblocked_at and iso(unblocked_at)) or it.label_event("blocked", False) \
+        or it.label_event("accepted") or it.issue["created_at"]
+    released = it.released()
+    if released:
+        since = max(since, released[-1][0]["created_at"], key=when)
+    return any(it.n in refs and when(p["merged_at"]) >= when(since)
+               for p, refs in owner_prs(it.repo, it.owner, "merged"))
 
 
-def repo_rules(repo):
-    """What is owed on a repository itself."""
-    o, owner = [], OWNER_OF.get(repo)
-    # 9. CI failed on main: two pull requests that passed apart may fail
-    #    together, since one behind main may merge, and main can't be released.
-    if owner and has_ci(repo):
-        main = main_of(repo)
-        if ci_state(repo, main["id"]) == "failure":
-            o.append(Owed(owner, f"main-failed:{repo}:{main['id'][:12]}",
-                          f"CI failed on main of {repo} at {main['id'][:12]}: fix it before anything else"))
-    # 17. A milestone with nothing left open on any repository it spans:
-    #     once per milestone, not once per namesake, since until the last
-    #     namesake's work is done there is nothing to close out.
-    if COORDINATOR:
-        for ms in forge_all(f"/repos/{ORG}/{repo}/milestones?state=open"):
-            if ms.get("open_issues") == 0 and ms.get("closed_issues", 0) > 0:
-                spans = finished_namesakes(ms["title"])
-                if spans:
-                    newest = max(m["id"] for _, m in spans)
-                    o.append(Owed(COORDINATOR, f"milestone-done:{ms['title']}:{newest}",
-                                  f"the last open issue in milestone {ms['title']} was closed, on every repository it "
-                                  f"spans ({', '.join(sorted({r for r, _ in spans}))})"))
-    # 23. No milestone on any repository with an open issue: nothing in the
-    #     kit says what comes next, so the coordinator must, once per
-    #     milestone finished. A milestone left open with its work done
-    #     doesn't hold it back. Not while it runs, since it may be drafting
-    #     the next one.
-    if COORDINATOR and repo == COORDINATION:
-        last = next_milestone_due()
-        if last:
-            o.append(Owed(COORDINATOR, f"next-milestone:{last[0]}:{last[1]['id']}",
-                          f"no milestone has open work, the newest {last[1].get('title')} on {last[0]}: close "
-                          "out any milestone left open (its milestone issue and reviews, or close it if that's "
-                          "done), then draft the next one, or put to the human what it needs first (a repository, "
-                          "an agent, a decision), or record in ROADMAP.md that the project is finished", quiet=True))
-    return o
+def issue_kind(it):
+    if it.repo == COORDINATION and "milestone-review" in it.labels:
+        return "milestone"
+    if "recommendation" in it.labels:
+        return "recommendation"
+    if it.author == "dispatcher":
+        return "kit-decision"
+    if it.author == COORDINATOR and it.issue.get("title") == f"Release {it.repo}":
+        return "release-decision"
+    if "request" in it.labels and it.author != it.owner:
+        return "request"
+    return "task"
 
 
-def finished_namesakes(title):
-    """The (repository, milestone) pairs named title that had work, if none
-    of its namesakes on any repository has an open issue; None otherwise."""
-    found = []
+def author_of(it):
+    """Who does an author's part: an agent, the human, or for an outsider
+    (whom nothing wakes) the owner."""
+    return it.author if it.author in AGENTS else HUMAN if it.author == HUMAN else it.owner
+
+
+def hold_fact(it, blocked):
+    """What holds an issue or pull request (states.HOLDS), whatever its
+    kind; and the roles that names: who it waits on, who wrote an invalid
+    line."""
+    labels, who = it.labels, {}
+    nh = it.label_event("needs-human")
+    hand = HUMAN in {a.get("login") for a in it.issue.get("assignees") or []} and not waits_on_human(labels)
+    waiting = it.waiting_on() if it.open else None
+    blockers, writer = blocker_fact(it, blocked)
+    if "needs-human" in labels and not (nh and it.by(HUMAN, ("comment",)) > when(nh)) or hand:
+        hold = "human"
+    elif "upstream" in labels and not it.is_pr:
+        hold = "upstream"
+    elif waiting:
+        hold, who[ST.WAITED] = "waiting", [waiting[0]]
+    elif blockers == "invalid":
+        hold, who[ST.WRITER] = "invalid", [writer if writer in AGENTS or writer == HUMAN else it.owner]
+    elif blockers == "pending":
+        hold = "blocked"
+    elif blockers == "bare-label":
+        hold = "bare-label"
+    else:
+        hold = "none"
+    return hold, who
+
+
+def issue_facts(it, blocked, unblocked_at):
+    """An issue's facts, and who each of its roles is."""
+    kind, labels = issue_kind(it), it.labels
+    hold, held_by = hold_fact(it, blocked)
+    released = it.released()
+    nv = it.label_event("not-verified")
+    reviewers = []
+    if kind == "milestone":
+        labelled = when(it.label_event("milestone-review") or it.issue["created_at"])
+        reviewers = [r for r in MILESTONE_REVIEWERS if r in AGENTS and it.by(r, ("comment",)) < labelled]
+    overtaken = False
+    if kind == "release-decision":
+        rel = latest_release(it.repo)
+        overtaken = bool(rel) and when(rel["published_at"]) > max(when(it.issue["created_at"]), it.by(COORDINATOR))
+    # Labelled new (1), or someone else's that the owner has never touched:
+    # a request whose labels Forgejo dropped, or any other issue (1, again).
+    untriaged = "new" in labels if kind == "request" else False
+    untriaged = untriaged or (it.author != it.owner and not it.by(it.owner)
+                              and not labels & {"accepted", "counter-proposal"})
+    f = ST.IssueFacts(
+        open=it.open, kind=kind, untriaged=untriaged,
+        counter=kind == "request" and "counter-proposal" in labels, hold=hold,
+        # The coordination repository has no releases: its issues are
+        # decisions and records, which merged work doesn't finish.
+        open_pr=it.n in open_refs(it.repo),
+        merged=bool(it.owner) and has_ci(it.repo) and merged_since(it, unblocked_at),
+        rfr="ready-for-release" in labels, released=bool(released),
+        verified=kind == "request" and "verified" in labels,
+        not_verified=kind == "request" and bool(released) and "not-verified" in labels and bool(nv)
+        and when(nv) > when(released[-1][0]["created_at"]),
+        overtaken=overtaken, unreported=bool(reviewers))
+    who = {ST.OWNER: [it.owner], ST.REQUESTER: [author_of(it)], ST.COORDINATOR: [COORDINATOR or HUMAN],
+           ST.REVIEWERS: reviewers, **held_by}
+    if released:
+        who["notes"] = {ST.REQUESTER: f" (released in {released[-1][1]})"}
+    return f, who
+
+
+def pull_facts(it, blocked):
+    """A pull request's facts, and who each of its roles is."""
+    pushes = [e["created_at"] for e in it.events if e.get("type") == "pull_push"]
+    pushed = when(pushes[-1] if pushes else it.pr["created_at"])
+    if has_ci(it.repo):
+        ci, ci_at = ci_settled(it.repo, it.head)
+        late = (ci == "none" and now() >= pushed + NO_CI) or (ci == "running" and now() >= max(ci_at, pushed) + CI_LATE)
+    else:
+        ci, late = "unused", False
+    verdicts = it.verdicts()
+    asked = {w: r for w, r in verdicts.items() if r["state"] == "REQUEST_CHANGES"}
+
+    def replied(w, r):
+        since = max([when(r["submitted_at"])] + [when(c["created_at"]) for c in it.comments() if login(c) == w])
+        return any(login(c) == it.author and wants_reply(c.get("body")) and when(c["created_at"]) > since
+                   for c in it.comments())
+    at_head = {w: r for w, r in asked.items() if r.get("commit_id") == it.head}
+    if at_head:
+        changes = "replied" if all(replied(w, r) for w, r in at_head.items()) else "at-head"
+        changes_by = list(at_head)
+    else:
+        changes, changes_by = ("older", list(asked)) if asked else ("none", [])
+    if REVIEWER not in AGENTS or it.author == REVIEWER or \
+            any(login(r) == REVIEWER and r.get("commit_id") == it.head for r in it.reviews):
+        conformance = "reviewed"
+    elif not (it.author in AGENTS and not may_push(it.author)) and now() < pushed + SETTLE:
+        conformance = "settling"
+    else:
+        conformance = "due"
+    requested = it.requested() | {u["login"] for u in it.pr.get("requested_reviewers") or []}
+    approved = {w for w, r in verdicts.items() if r["state"] == "APPROVED" and r.get("commit_id") == it.head}
+    waiting = {w for w in requested - approved - {it.author} if w in AGENTS or w == HUMAN}
+    pending = frozenset("coordinator" if w == COORDINATOR else "human" if w == HUMAN else "agent" for w in waiting)
+    ready = it.ready_since() if it.open else None
+    # When a timer it waits on runs out: a head settling, CI that may be
+    # late, a scheduled merge that may be stuck.
+    times = []
+    if conformance == "settling":
+        times.append(pushed + SETTLE)
+    if ci == "none" and not late:
+        times.append(pushed + NO_CI)
+    if ci == "running" and not late:
+        times.append(max(ci_at, pushed) + CI_LATE)
+    if ready and it.merge_scheduled():
+        times.append(ready + STUCK)
+    hold, held_by = hold_fact(it, blocked)
+    f = ST.PullFacts(
+        open=it.open, hold=hold, wip=wip(it.pr.get("title")), ci=ci, ci_late=late,
+        mergeable={True: "yes", False: "no"}.get(it.pr.get("mergeable"), "unknown"),
+        changes=changes, conformance=conformance, pending=pending, approved=bool(approved),
+        scheduled=it.merge_scheduled(), stuck=it.merge_scheduled() and bool(ready) and now() >= ready + STUCK)
+    who = {ST.OWNER: [it.owner], ST.AUTHOR: [author_of(it)], ST.COORDINATOR: [COORDINATOR or HUMAN],
+           ST.CONFORMANCE: [REVIEWER], ST.CHANGES_BY: changes_by,
+           ST.PENDING: sorted(w for w in waiting if w in AGENTS and w != COORDINATOR), **held_by,
+           "recheck": min([t for t in times if t > now()] or [0]) or None}
+    if COORDINATOR in waiting:
+        # Said outright, from CODEOWNERS on main, since a stale clone (from
+        # before the setup pull request merged) suggests otherwise.
+        who["notes"] = {ST.COORDINATOR: (
+            f". {it.repo} is at level 3: CODEOWNERS on main gives `API.lock` to you, so it waits for your review. "
+            "Approve it, request changes, or put a trade-off to the human as a decision; a comment alone leaves "
+            "it waiting" if at_level_3(it.repo) else
+            f". {it.repo} is below level 3, so the human approves its `API.lock`; your review is advisory")}
+    return f, who
+
+
+def release_facts(repo, items):
+    """A repository's release: its facts, who its roles are, and the
+    ready-for-release items (for the rules' side)."""
+    main = main_of(repo)
+    ci, ci_at = ci_settled(repo, main["id"])
+    since = max(ci_at, when(main["timestamp"]))
+    late = (ci == "none" and now() >= since + NO_CI) or (ci == "running" and now() >= since + CI_LATE)
+    ready = [Item(repo, i["number"]) for i in items
+             if "ready-for-release" in {l["name"] for l in i.get("labels") or []}]
+    # What holds a ready-for-release issue (the human, a wait, a blocker)
+    # holds its release: the release waits for it, as the coordinator would.
+    held = [it for it in ready if hold_fact(it, blocked_rules(it)[1])[0] != "none"]
+    entry = unreleased_entry(repo)
+    expected = expected_version(repo) if entry else None
+    f = ST.ReleaseFacts(
+        main_ci=ci, main_ci_late=late, rfr=bool(ready),
+        heading="none" if not entry else "wrong" if expected and entry != expected else "right",
+        held=bool(held), level3=at_level_3(repo),
+        decision=any(i.get("pull_request") is None and (i.get("user") or {}).get("login") == COORDINATOR
+                     and i.get("title") == f"Release {repo}" for i in items))
+    who = {ST.OWNER: [OWNER_OF.get(repo)], ST.COORDINATOR: [COORDINATOR or HUMAN]}
+    names = " ".join(str(it.n) for it in ready)
+    level3 = f.level3
+    who["notes"] = {
+        ST.OWNER: f" (`forge version` gives {expected}; CHANGELOG.md heads {entry})" if f.heading == "wrong" else "",
+        ST.COORDINATOR: (
+            f": `forge release {repo} '<one-line note>' {names}`".rstrip() if level3 else
+            f", whose command is `scripts/release.sh {repo} '<one-line note>' {names}`".rstrip())
+        + (f", completing {', '.join(it.at for it in ready)}" if ready else
+           f"; nothing is labelled ready-for-release, but CHANGELOG.md on main heads {entry}, above its last "
+           "release"),
+    }
+    if ci in ("none", "running") and not late:
+        who["recheck"] = since + (NO_CI if ci == "none" else CI_LATE)
+    return f, who, ready
+
+
+def milestones_by_title():
+    """Every milestone on every repository, by title: [(repo, milestone)]."""
+    found = {}
     for repo in OWNER_OF:
         try:
             ms = forge_all(f"/repos/{ORG}/{repo}/milestones?state=all")
@@ -1506,35 +1413,231 @@ def finished_namesakes(title):
                 continue
             raise
         for m in ms:
-            if m.get("title") != title:
-                continue
-            if m.get("open_issues", 0) > 0:
-                return None
-            if m.get("closed_issues", 0) > 0:
-                found.append((repo, m))
-    return found or None
+            found.setdefault(m.get("title"), []).append((repo, m))
+    return found
 
 
-def next_milestone_due():
-    """The newest (repository, milestone) that had work, if no milestone
-    anywhere has an open issue; None otherwise, or if none ever had work.
-    Newest by creation, so that closing milestones left open, or empty ones,
-    doesn't make it due again."""
-    done = []
-    for repo in OWNER_OF:
+# --- Obligations ----------------------------------------------------------------
+#
+# Each agent that owes something on a unit has one row in `obligations`, per
+# state it holds there or ask it hasn't answered: its obligation. It is
+# discharged (deleted) as soon as the unit no longer owes it, when the
+# state, its holders or the ask change. Until then:
+#   1. a new one wakes its agent at once (a quiet one once the agent has
+#      nothing else queued or running);
+#   2. each time a run it woke ends with it still standing, it wakes the agent
+#      again after the next of OBLIGATION_BACKOFF (at once, 15 minutes, 15
+#      minutes): a run can stop short, and an agent that can't act yet must
+#      say why in a way that changes the state (Blocked-by:, Waiting-on:,
+#      needs-human with a decision, not-verified), not only in a comment;
+#   3. once that many runs have ended with it standing, and the last wait is
+#      over, it is the human's: a `Stalled:` decision, and the supervisor
+#      woken to find out why.
+# A wake counts once its run has ended, so an outage, a cap or a pause, which
+# hold the run back, uses up nothing.
+
+BACKOFF = [int(s) for s in os.environ.get("OBLIGATION_BACKOFF", "0,900,900").split(",")]
+TRIES = len(BACKOFF)
+Owe = namedtuple("Owe", "agent what description quiet")
+
+DB.executescript("""
+CREATE TABLE IF NOT EXISTS obligations (
+  id INTEGER PRIMARY KEY, agent TEXT, unit TEXT, what TEXT, description TEXT, quiet INTEGER,
+  since REAL, wakes INTEGER NOT NULL DEFAULT 0, trigger INTEGER, next_at REAL, escalated INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS obligations_key ON obligations (unit, agent, what);
+CREATE TABLE IF NOT EXISTS units (
+  unit TEXT PRIMARY KEY, kind TEXT, state TEXT, holders TEXT, step TEXT, since REAL, seen REAL);
+""")
+
+
+def resolve(role, who):
+    """The agents (or the human) a role names on a unit; a role that names
+    no one falls to the owner, then to the human. Roles that aren't agents
+    (the world, a timer, other units) stand for themselves."""
+    if role not in ST.AGENT_ROLES:
+        return [role]
+    names = [n for n in who.get(role) or [] if n] or [n for n in who.get(ST.OWNER) or [] if n] or [HUMAN]
+    return [ST.HUMAN if n == HUMAN else n for n in names]
+
+
+def state_owes(unit, kind, state, who, label):
+    """Record a unit's state, and return what its agent holders owe, each
+    described as `<label> (<state>): <step>`. label names the unit in a run's
+    prompt, such as `pull request inkproof-core#5`."""
+    holders = sorted({a for role in state.holders for a in resolve(role, who)})
+    t, encoded = now(), json.dumps(holders)
+    with LOCK:
+        row = DB.execute("SELECT state, holders FROM units WHERE unit=?", (unit,)).fetchone()
+        if row and (row["state"], row["holders"]) == (state.name, encoded):
+            DB.execute("UPDATE units SET seen=? WHERE unit=?", (t, unit))
+        else:
+            DB.execute("INSERT OR REPLACE INTO units (unit, kind, state, holders, step, since, seen) "
+                       "VALUES (?,?,?,?,?,?,?)", (unit, kind, state.name, encoded, state.step, t, t))
+    out = []
+    for role in state.holders:
+        for a in resolve(role, who):
+            if a in AGENTS:
+                more = (who.get("notes") or {}).get((role, a)) or (who.get("notes") or {}).get(role) or ""
+                out.append(Owe(a, state.name, f"{label} ({state.name}): {state.step}{more}", state.quiet))
+    return out
+
+
+def sync(unit, owes):
+    """What a unit owes now: what it no longer owes is discharged, and what
+    is new is woken."""
+    new = []
+    with LOCK:
+        rows = {(r["agent"], r["what"]): r for r in DB.execute("SELECT * FROM obligations WHERE unit=?", (unit,))}
+        want = {}
+        for o in owes:
+            want.setdefault((o.agent, o.what), o)
+        for k, r in rows.items():
+            if k not in want:
+                DB.execute("DELETE FROM obligations WHERE id=?", (r["id"],))
+        # What isn't quiet first, so that a quiet one waits for it.
+        for k, o in sorted(want.items(), key=lambda kv: kv[1].quiet):
+            if k in rows:
+                DB.execute("UPDATE obligations SET description=?, quiet=? WHERE id=?",
+                           (o.description, int(o.quiet), rows[k]["id"]))
+            else:
+                cur = DB.execute("INSERT INTO obligations (agent, unit, what, description, quiet, since, next_at) "
+                                 "VALUES (?,?,?,?,?,?,?)", (o.agent, unit, o.what, o.description, int(o.quiet),
+                                                            now(), now()))
+                new.append(cur.lastrowid)
+    for i in new:
+        advance(i, fresh=True)
+
+
+def obligation(i):
+    rows = q("SELECT * FROM obligations WHERE id=?", i)
+    return rows[0] if rows else None
+
+
+def advance(i, fresh=False):
+    """Move an obligation on: wake its agent when it is due, or put it to the
+    human once its tries are spent. Before a second wake, or the human, its
+    unit is evaluated again, so only what still stands goes further."""
+    r = obligation(i)
+    if not r or r["escalated"]:
+        return
+    if r["trigger"] is not None:
+        t = q("SELECT run_id FROM triggers WHERE id=?", r["trigger"])
+        run = t[0]["run_id"] if t else -1
+        if run is None:
+            return  # queued
+        if run > 0:
+            ended = q("SELECT ended FROM runs WHERE id=?", run)
+            if not ended or ended[0]["ended"] is None:
+                return  # under way
+            end = ended[0]["ended"]
+        else:
+            end = now()  # dropped by hand (scripts/drain.sh, /admin/drop)
+        q("UPDATE obligations SET trigger=NULL, next_at=? WHERE id=?", end + BACKOFF[min(r["wakes"], TRIES) - 1], i)
+        r = obligation(i)
+    if r["next_at"] is None or r["next_at"] > now():
+        return
+    if r["quiet"] and busy(r["agent"]):
+        return
+    if not fresh:
         try:
-            ms = forge_all(f"/repos/{ORG}/{repo}/milestones?state=all")
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                continue
-            raise
-        if any(m.get("open_issues", 0) > 0 for m in ms):
-            return None
-        done += [(when(m["created_at"]), m["id"], repo, m) for m in ms if m.get("closed_issues", 0) > 0]
-    if not done:
-        return None
-    _, _, repo, m = max(done, key=lambda c: c[:2])
-    return repo, m
+            evaluate_unit(r["unit"])
+        except Exception as e:
+            log(f"evaluating {r['unit']} again failed: {e!r}")
+            return
+        r = obligation(i)
+        if not r or r["escalated"] or r["trigger"] is not None:
+            return
+    if r["wakes"] >= TRIES:
+        escalate(r)
+        return
+    again = (f" (woken again, {r['wakes'] + 1} of {TRIES}, since nothing has changed: do it now, or record what it "
+             "waits for where the kit can see it, with a Blocked-by: line, Waiting-on:, or needs-human with a "
+             "decision; otherwise it becomes the human's)") if r["wakes"] else ""
+    tid = add_trigger(r["agent"], f"owe:{r['unit']}:{i}:{r['wakes'] + 1}", r["description"] + again)
+    if tid:
+        q("UPDATE obligations SET wakes=wakes+1, trigger=?, next_at=NULL WHERE id=?", tid, i)
+
+
+def escalate(r):
+    """An obligation its agent was woken for TRIES times without it going
+    away: the human's, and the supervisor's to find out why."""
+    q("UPDATE obligations SET escalated=1 WHERE id=?", r["id"])
+    link = unit_link(r["unit"])
+    decision_issue(COORDINATION, f"stalled:{r['unit']}:{r['what']}:{r['agent']}:{int(r['since'])}", "stalled",
+                   f"Stalled: {r['unit']}", {
+        "Question": f"`{r['agent']}` was woken {r['wakes']} times for [{r['unit']}]({link}), and it still owes the "
+                    f"same: {r['description']}. What should happen?",
+        "Options": f"- Find out why: `scripts/activity.sh {r['unit']}` and `scripts/activity.sh {r['agent']}` show "
+                   "what happened; if the kit lacks a step, fix the kit.\n"
+                   f"- Tell `{r['agent']}` on the item what to do.\n"
+                   "- Close the item, saying why.",
+        "Recommendation": "Find out why first: an agent that can't do a step should say what it waits for in a way "
+                          "the kit can see, and one that doesn't is a gap in the protocol or its role."
+                          + (" The supervisor has been woken to look into it too." if SUPERVISOR else ""),
+        "If you say go ahead": "Nothing changes by itself: say on the item what should happen, then close this "
+                               "issue. The kit doesn't wake anyone for it again until what it owes changes.",
+        "Blocked on this": f"{r['unit']}."})
+    log(f"{r['agent']} was woken {r['wakes']} times for {r['unit']} ({r['what']}): it is the human's")
+    if SUPERVISOR and SUPERVISOR != r["agent"] and not capped(SUPERVISOR):
+        add_trigger(SUPERVISOR, f"supervise:{r['unit']}:{r['id']}",
+                    f"{r['unit']} has stalled: {r['agent']} was woken {r['wakes']} times for it without it moving "
+                    f"on, and it is now a decision for the human. What it owes: {r['description']}. Find out why, "
+                    "move it on if you can, and report the gap (Role: Supervision)")
+
+
+def unit_link(unit):
+    m = re.fullmatch(r"([\w.-]+)#(\d+)", unit)
+    if m:
+        return f"{FORGE}/{ORG}/{m[1]}/issues/{m[2]}"
+    if unit.startswith("release:"):
+        return f"{FORGE}/{ORG}/{unit[len('release:'):]}"
+    return f"{FORGE}/{ORG}/{COORDINATION}/milestones"
+
+
+def wake_due():
+    """Move every obligation on that may be due."""
+    for r in q("SELECT id FROM obligations WHERE escalated=0 ORDER BY id"):
+        try:
+            advance(r["id"])
+        except Exception as e:
+            log(f"moving obligation {r['id']} on failed: {e!r}")
+
+
+def evaluate_unit(unit):
+    m = re.fullmatch(r"([\w.-]+)#(\d+)", unit)
+    if m:
+        evaluate(m[1], int(m[2]), dependents=False)
+    elif unit.startswith("release:"):
+        evaluate_release(unit[len("release:"):])
+    else:
+        evaluate_milestones()
+
+
+# Timers: a state held by a timer (a head settling, CI that may be late, a
+# scheduled merge that may be stuck) is evaluated again when it runs out.
+_rechecks = {}
+
+
+def recheck(unit, at):
+    if not at or at <= now():
+        return
+    with LOCK:
+        if unit in _rechecks and _rechecks[unit] <= at:
+            return
+        _rechecks[unit] = at
+
+    def run():
+        with LOCK:
+            if _rechecks.get(unit) != at:
+                return
+            del _rechecks[unit]
+        try:
+            evaluate_unit(unit)
+        except Exception as e:
+            log(f"evaluating {unit} again failed: {e!r}")
+    t = threading.Timer(at - now() + 1, run)
+    t.daemon = True
+    t.start()
 
 
 # --- Evaluation -------------------------------------------------------------------
@@ -1549,6 +1652,28 @@ def queue(o, seed=False):
     if o.quiet and busy(o.agent):
         return
     add_trigger(o.agent, o.key, o.description, once=True, not_before=o.not_before)
+
+
+def item_state(it):
+    """An item's state, its facts and roles, and what blocked_rules found:
+    its notices, whether it is blocked, and what it names."""
+    owed, blocked, unblocked_at, found = blocked_rules(it)
+    if it.is_pr:
+        facts, who = pull_facts(it, blocked)
+    else:
+        facts, who = issue_facts(it, blocked, unblocked_at)
+    return ST.state(facts), facts, who, owed, blocked, found
+
+
+def owed_on(it):
+    """Everything owed on an item: its obligations (Owe) and its notices
+    (Owed), whether it is blocked (None if it names no blocker), and the
+    issues it names."""
+    state, facts, who, owed, blocked, found = item_state(it)
+    owes = state_owes(it.at, "pull request" if it.is_pr else facts.kind, state, who, f"{it.kind} {it.at}")
+    owes += [Owe(a, what, desc, False) for a, what, desc in asks(it)]
+    recheck(it.at, who.get("recheck"))
+    return owes, owed + notices(it), blocked, found
 
 
 def stale_blocked(it):
@@ -1608,15 +1733,17 @@ def keep_blocking(repo, n):
 
 
 def evaluate(repo, n, dependents=True, seed=False):
-    """Queue what is owed on an item now, keep its `blocked` label and the
-    index of what it waits on, then do the same for the items waiting on it."""
+    """What an item owes now: its obligations, and its notices queued; keep
+    its `blocked` label and the index of what it waits on; then do the same
+    for the items waiting on it, and the issues a pull request refers to."""
     try:
         it = Item(repo, n)
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            sync(f"{repo}#{n}", [])
             return
         raise
-    owed, blocked, found = owed_on(it)
+    owes, owed, blocked, found = owed_on(it)
     # Only an open item waits: a closed one's lines block nothing.
     now_on = set(found) if it.open else set()
     with LOCK:
@@ -1633,13 +1760,15 @@ def evaluate(repo, n, dependents=True, seed=False):
             log(f"keeping blocking on {r}#{k} failed: {e!r}")
     for o in owed:
         queue(o, seed)
+    sync(it.at, owes)
     if not dependents:
         return
     if it.is_pr:
-        # A pull request opened or merged changes what is owed on the
-        # requests it refers to (6, 7).
+        # A pull request opened or merged changes what the requests it refers
+        # to owe.
         for state in ("open", "merged"):
             _cache.pop(("prs", repo, state), None)
+        _cache.pop(("refs", repo), None)
         for k in pr_refs(repo, it.pr):
             try:
                 evaluate(repo, k, dependents=False)
@@ -1652,15 +1781,175 @@ def evaluate(repo, n, dependents=True, seed=False):
             log(f"evaluating {d['repo']}#{d['number']} failed: {e!r}")
 
 
+def evaluate_release(repo):
+    """What a repository's release owes now."""
+    unit = f"release:{repo}"
+    if not OWNER_OF.get(repo) or not has_ci(repo):
+        return
+    items = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
+    facts, who, _ = release_facts(repo, items)
+    sync(unit, state_owes(unit, "release", ST.state(facts), who, f"the release of {repo}"))
+    recheck(unit, who.get("recheck"))
+
+
+def evaluate_milestones():
+    """What each milestone, and the kit itself, owes now."""
+    if not COORDINATOR or forge_missing(COORDINATION):
+        return
+    by_title = milestones_by_title()
+    issues = forge_all(f"/repos/{ORG}/{COORDINATION}/issues?state=all&type=issues&labels=milestone")
+    who = {ST.OWNER: [COORDINATOR], ST.COORDINATOR: [COORDINATOR]}
+    seen = set()
+    for title, spans in by_title.items():
+        mine = [i for i in issues if "milestone" in {l["name"] for l in i.get("labels") or []}
+                and (i.get("title") == f"Milestone: {title}" or (i.get("milestone") or {}).get("title") == title)]
+        f = ST.MilestoneFacts(
+            closed=all(m.get("state") == "closed" for _, m in spans),
+            open_work=any(m.get("open_issues", 0) > 0 for _, m in spans),
+            had_work=any(m.get("closed_issues", 0) > 0 for _, m in spans),
+            issue="none" if not mine else "open" if any(i.get("state") == "open" for i in mine) else "closed")
+        unit = f"milestone:{title}"
+        seen.add(unit)
+        repos = ", ".join(sorted({r for r, m in spans if m.get("state", "open") == "open"}))
+        notes = {ST.COORDINATOR: f" (open on {repos})" if repos else ""}
+        sync(unit, state_owes(unit, "milestone", ST.state(f), dict(who, notes=notes), f"milestone {title}"))
+    for r in q("SELECT DISTINCT unit FROM obligations WHERE unit LIKE 'milestone:%'"):
+        if r["unit"] not in seen:
+            sync(r["unit"], [])
+    every = [m for spans in by_title.values() for _, m in spans]
+    roadmap = file_text(COORDINATION, "ROADMAP.md", "main") or ""
+    decisions = [i for i in forge_list(f"/repos/{ORG}/{COORDINATION}/issues?state=open&type=issues&assigned_by={HUMAN}")
+                 if (i.get("user") or {}).get("login") == COORDINATOR
+                 and not {l["name"] for l in i.get("labels") or []} & {"recommendation", "milestone"}]
+    f = ST.KitFacts(
+        milestones="open-work" if any(m.get("open_issues", 0) > 0 for m in every)
+        else "done" if any(m.get("closed_issues", 0) > 0 for m in every) else "none-ever",
+        finished=bool(ROADMAP_FINISHED.search(roadmap)),
+        planning=bool(forge_list(f"/repos/{ORG}/{COORDINATION}/pulls?state=open")),
+        decision=bool(decisions))
+    sync("kit", state_owes("kit", "kit", ST.state(f), who, "the project"))
+
+
 def evaluate_repo(repo, items=False, seed=False):
-    for o in repo_rules(repo):
-        queue(o, seed)
+    """A repository's release, and with items, its open issues and pull
+    requests."""
+    try:
+        evaluate_release(repo)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
     if items:
         for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all"):
             try:
                 evaluate(repo, i["number"], dependents=False, seed=seed)
             except Exception as e:
                 log(f"evaluating {repo}#{i['number']} failed: {e!r}")
+
+
+def no_longer_owed(rows):
+    """The ids of queued triggers, among obligations and notices, that are no
+    longer owed: the pull request merged meanwhile, the comment was answered,
+    the head moved on. Each unit behind them is evaluated again first."""
+    units, items, stale = {}, {}, []
+    for r in rows:
+        if r["key"].startswith("owe:"):
+            unit, i, _ = r["key"][len("owe:"):].rsplit(":", 2)
+            units.setdefault(unit, []).append((r, int(i)))
+            continue
+        m = RULE_KEY.match(r["key"])
+        if m and m[1] in RULE_KINDS:
+            items.setdefault((m[2], int(m[3])), []).append(r)
+    for unit, rs in units.items():
+        try:
+            evaluate_unit(unit)
+        except Exception as e:
+            log(f"couldn't check {unit} is still owed: {e!r}")
+            continue
+        for r, i in rs:
+            o = obligation(i)
+            if not o or o["escalated"] or o["trigger"] != r["id"]:
+                stale.append(r["id"])
+    for (repo, n), rs in items.items():
+        try:
+            it = Item(repo, n)
+            keys = {o.key for o in blocked_rules(it)[0] + notices(it)}
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                continue
+            keys = set()
+        except Exception as e:
+            log(f"couldn't check {repo}#{n} is still owed: {e!r}")
+            continue
+        stale += [r["id"] for r in rs if r["key"] not in keys]
+    return stale
+
+
+def sweep(seed=False):
+    """Every repository's release and open issues and pull requests, issues
+    closed lately (a rejected request), the milestones and the kit
+    evaluated: what a missed webhook would have lost, and what no webhook
+    brings."""
+    since = iso(max(float(kv_get("reconciled", 0)) - RECONCILE, now() - 86400))
+    ok = True
+    for repo in OWNER_OF:
+        try:
+            evaluate_repo(repo, items=True, seed=seed)
+            for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}"):
+                evaluate(repo, i["number"], dependents=False, seed=seed)
+            # Upstream issues, once every item's Blocked-by: lines are read.
+            for item in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=upstream"):
+                if "upstream" in {l["name"] for l in item.get("labels") or []}:
+                    keep_blocking(repo, item["number"])
+            # What waits on the human but isn't assigned to them: from before
+            # assignment, or a missed webhook. Forgejo ignores a label filter
+            # naming a label the repository lacks, so check each item's own.
+            for labels in ("needs-human", "upstream,blocking"):
+                for item in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&labels={labels}"):
+                    if waits_on_human({l["name"] for l in item.get("labels") or []}):
+                        set_assigned(repo, item["number"], item, True)
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and forge_missing(repo):
+                log(f"{repo} is in agents.conf but not in Forgejo (or has no main): skipped")
+                continue
+            ok = False
+            log(f"sweeping {repo} failed: {e!r}")
+        except Exception as e:
+            ok = False
+            log(f"sweeping {repo} failed: {e!r}")
+    try:
+        evaluate_milestones()
+    except Exception as e:
+        ok = False
+        log(f"evaluating the milestones failed: {e!r}")
+    kv_set("reconciled", now())
+    return ok
+
+
+def retire_rule_triggers():
+    """Once, on a ledger from before the states: the work the old rules
+    queued and no run has taken is dropped, since obligations take its
+    place, with descriptions of their own."""
+    if kv_get("obligations-started"):
+        return
+    rows = [r for r in q("SELECT id, key FROM triggers WHERE run_id IS NULL")
+            if r["key"].split(":")[0] in RETIRED_KINDS]
+    for r in rows:
+        q("UPDATE triggers SET run_id=-1 WHERE id=?", r["id"])
+    kv_set("obligations-started", now())
+    if rows:
+        log(f"dropped {len(rows)} trigger(s) the old rules queued: obligations take their place")
+
+
+def reconcile():
+    """The first sweep on a ledger from before the notices records what they
+    find as handled where the old triggers covered it (SEED_KINDS)."""
+    retire_rule_triggers()
+    if not kv_get("rules-seeded"):
+        if sweep(seed=True):
+            kv_set("rules-seeded", now())
+            log("the rules' first sweep is done: from now on they queue work")
+    else:
+        sweep()
 
 
 def evaluate_after_run(agent):
@@ -1690,29 +1979,6 @@ def evaluate_labelled(repo, name):
             log(f"evaluating {repo}#{i['number']} failed: {e!r}")
 
 
-def no_longer_owed(rows):
-    """The ids of queued triggers, among those a rule queued, that their
-    item no longer owes: the pull request merged meanwhile, the comment was
-    answered, the head moved on."""
-    items, stale = {}, []
-    for r in rows:
-        m = RULE_KEY.match(r["key"])
-        if m and m[1] in RULE_KINDS:
-            items.setdefault((m[2], int(m[3])), []).append(r)
-    for (repo, n), rs in items.items():
-        try:
-            keys = {o.key for o in owed_on(Item(repo, n))[0]}
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                continue
-            keys = set()
-        except Exception as e:
-            log(f"couldn't check {repo}#{n} is still owed: {e!r}")
-            continue
-        stale += [r["id"] for r in rs if r["key"] not in keys]
-    return stale
-
-
 def forge_missing(repo):
     """Whether a repository, or its main, doesn't exist (yet)."""
     for path in (f"/repos/{ORG}/{repo}", f"/repos/{ORG}/{repo}/branches/main"):
@@ -1723,278 +1989,6 @@ def forge_missing(repo):
                 return True
             raise
     return False
-
-
-def sweep(seed=False):
-    """Every repository and every open issue and pull request evaluated, and
-    issues closed lately (a rejected request): what a missed webhook would
-    have lost, and what no webhook brings."""
-    since = iso(max(float(kv_get("reconciled", 0)) - RECONCILE, now() - 86400))
-    ok = True
-    for repo in OWNER_OF:
-        try:
-            evaluate_repo(repo, items=True, seed=seed)
-            for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}"):
-                evaluate(repo, i["number"], dependents=False, seed=seed)
-            check_unverified_stalls(repo)
-            # Upstream issues, once every item's Blocked-by: lines are read.
-            for item in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=upstream"):
-                if "upstream" in {l["name"] for l in item.get("labels") or []}:
-                    keep_blocking(repo, item["number"])
-            # What waits on the human but isn't assigned to them: from before
-            # assignment, or a missed webhook. Forgejo ignores a label filter
-            # naming a label the repository lacks, so check each item's own.
-            for labels in ("needs-human", "upstream,blocking"):
-                for item in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&labels={labels}"):
-                    if waits_on_human({l["name"] for l in item.get("labels") or []}):
-                        set_assigned(repo, item["number"], item, True)
-        except urllib.error.HTTPError as e:
-            if e.code == 404 and forge_missing(repo):
-                log(f"{repo} is in agents.conf but not in Forgejo (or has no main): skipped")
-                continue
-            ok = False
-            log(f"sweeping {repo} failed: {e!r}")
-        except Exception as e:
-            ok = False
-            log(f"sweeping {repo} failed: {e!r}")
-    kv_set("reconciled", now())
-    return ok
-
-
-def reconcile():
-    """The first sweep on a ledger from before the rules records what they
-    find as handled where the old triggers covered it (SEED_KINDS)."""
-    if not kv_get("rules-seeded"):
-        if sweep(seed=True):
-            kv_set("rules-seeded", now())
-            log("the rules' first sweep is done: from now on they queue work")
-    else:
-        sweep()
-
-
-# --- Stalls ---------------------------------------------------------------------
-#
-# The rules name what starts work, and anything they miss would leave the kit
-# quiet with work open. So once the kit has gone quiet, every open issue and
-# pull request must be waiting for something the kit can see: the human, an
-# open issue its Blocked-by: lines name, a reviewer, the world outside (an
-# upstream issue), CI, or its own pull request. One that isn't wakes whoever
-# should move it on, once per quiet spell; after STALL_ROUNDS spells it is
-# the human's. Nothing else is an excuse: a rule that ought to have woken
-# someone is no proof that it did (gpu#59), and test_dispatcher's
-# NobodyOrphaned checks this holds for every item it can generate.
-
-STALL_ROUNDS = int(os.environ.get("STALL_ROUNDS", "2"))
-
-
-def open_refs(repo):
-    """The issues on repo that open pull requests, anyone's, refer to."""
-    return cached(("refs", repo), 30, lambda: {n for p in forge_all(f"/repos/{ORG}/{repo}/pulls?state=open")
-                                                for n in pr_refs(repo, p)})
-
-
-def stall_owners(it, blocked):
-    """Who should move an open item on, each with why; none when it waits
-    for something the kit can see."""
-    labels = it.labels
-    if not it.open or "needs-human" in labels or HUMAN in {u.get("login") for u in it.issue.get("assignees") or []}:
-        return []
-    if "upstream" in labels or blocked:
-        return []
-    # Waiting on an agent, as its latest Waiting-on: line says (30): that
-    # agent's, whatever else would otherwise move it.
-    waiting = it.waiting_on()
-    if waiting:
-        return [(waiting[0], f"{login(waiting[1])} is waiting on you")]
-    # What its author must do falls to an agent author; the human's is
-    # theirs, which they can see; and an outsider's, which no rule answers,
-    # falls to the owner, to take on or close.
-    if it.author == HUMAN:
-        author = None
-    else:
-        author = it.author if it.author in AGENTS else it.owner
-    if it.is_pr:
-        if it.author == HUMAN:
-            return []
-        if wip(it.pr.get("title")):
-            return [(author, "it is marked work in progress")] if author else []
-        verdicts = it.verdicts()
-        if any(r["state"] == "REQUEST_CHANGES" and r.get("commit_id") == it.head for r in verdicts.values()):
-            return [(author, "changes were requested on its head")] if author else []
-        # Reviewers wait for CI to pass on the head, so until it does only the
-        # author can move it.
-        if has_ci(it.repo) and it.ci() in ("none", "failure"):
-            why = "CI has never run on its head" if it.ci() == "none" else "CI failed on its head"
-            return [(author, why)] if author else []
-        pending = {who for who in it.requested() if not (who in verdicts and verdicts[who].get("commit_id") == it.head)}
-        if HUMAN in pending:
-            return []
-        reviewers = sorted(p for p in pending if p in AGENTS)
-        if reviewers:
-            return [(r, "your review of its head is requested and not given") for r in reviewers]
-        return [(author, "it isn't merging, and no review or check is pending")] if author else []
-    # Work for it waiting to be released, even once released before: what
-    # its requester waits for next is that release (gpu#59).
-    if "ready-for-release" in labels:
-        return [(COORDINATOR, "it is labelled ready-for-release but hasn't been released")] if COORDINATOR else []
-    # A released request waits on its requester, and rule 10's nudges are
-    # no reason to wait: a run they woke can end without a word (gpu#59).
-    # A requester that verifies elsewhere says so with a Blocked-by: line,
-    # or puts it to the human.
-    if "request" in labels and it.released() and "verified" not in labels:
-        return [(author, f"it was released in {it.released()[-1][1]} and isn't verified")] if author else []
-    if "counter-proposal" in labels and it.author != it.owner:
-        return [(author, "its counter-proposal waits for an answer")] if author else []
-    if it.n in open_refs(it.repo):
-        return []  # its pull request is checked in its own right
-    if not it.owner:
-        return []
-    if "blocked" in labels:
-        return [(it.owner, "it is labelled blocked, but no Blocked-by: line names an open, unreleased issue")]
-    return [(it.owner, "nothing is moving it on")]
-
-
-class MainOf:
-    """A repository's main, stalled as an item is: what the stall check
-    needs of it."""
-    kind = "the main branch of"
-
-    def __init__(self, repo):
-        self.repo, self.at = repo, repo
-        self.issue = {"html_url": f"{FORGE}/{ORG}/{repo}"}
-
-    def moved(self):
-        """When main last changed: a merge starts its count again."""
-        return when(main_of(self.repo)["timestamp"])
-
-
-def main_stall_owners(repo, items):
-    """Who should move a repository's main on: work merged and described in
-    CHANGELOG.md above the last release, with nothing labelled
-    ready-for-release and no pull request open to carry it there, waits for
-    a release nobody has asked for (gpu#59's consumer action, demos#105).
-    Its owner, to label what it finishes or file an issue for it."""
-    owner = OWNER_OF.get(repo)
-    if not owner or not has_ci(repo):
-        return []
-    if any(i.get("pull_request") is not None or "ready-for-release" in {l["name"] for l in i.get("labels") or []}
-           for i in items):
-        return []
-    entry = unreleased_entry(repo)
-    if not entry:
-        return []
-    return [(owner, f"`CHANGELOG.md` on main heads {entry}, above its last release, and nothing on it is labelled "
-                    "ready-for-release, so nothing will release it: label the issue that work finishes "
-                    "`ready-for-release`, or file an issue of your own for it and label that")]
-
-
-# Timeline entries that only mention an item from elsewhere: no progress on it.
-MENTIONS = {"comment", "comment_ref", "issue_ref"}
-
-
-def moved_at(it):
-    """When anyone but the dispatcher last moved an item on: anything in its
-    timeline but a comment or a mention from elsewhere, such as a pull
-    request or commit referring to it, a label, a review or a push. A comment
-    alone doesn't count, so an agent that only says what it will do still
-    reaches the human; nor does a mention, which once filed the same stall
-    twice (coordination#209)."""
-    return max([when(e["created_at"]) for e in it.events
-                if e.get("type") not in MENTIONS and login(e) != "dispatcher"] or [0])
-
-
-def check_stalls():
-    """Wake whoever should move on each open item that waits for nothing the
-    kit can see; after STALL_ROUNDS quiet spells, ask the human instead.
-    Returns how many triggers it queued."""
-    spell = int(now())
-    stalled = {}
-    for repo in OWNER_OF:
-        if forge_missing(repo):
-            continue
-        items = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
-        for i in items:
-            try:
-                it = Item(repo, i["number"])
-                owners = [(a, why) for a, why in stall_owners(it, blocked_rules(it)[1]) if a in AGENTS]
-                if owners:
-                    stalled[(repo, it.n)] = (it, owners)
-            except Exception as e:
-                log(f"checking {repo}#{i['number']} for a stall failed: {e!r}")
-        try:
-            owners = [(a, why) for a, why in main_stall_owners(repo, items) if a in AGENTS]
-            if owners:
-                stalled[(repo, 0)] = (MainOf(repo), owners)
-        except Exception as e:
-            log(f"checking {repo}'s main for unreleased work failed: {e!r}")
-    # An item no longer stalled starts again from nothing.
-    for row in q("SELECT key FROM kv WHERE key LIKE 'stall:%'"):
-        repo, _, n = row["key"][len("stall:"):].partition("#")
-        if (repo, int(n)) not in stalled:
-            q("DELETE FROM kv WHERE key=?", row["key"])
-    queued = 0
-    # With a supervisor that can run, it is woken once for them all, to find
-    # out why each stalled, move it on and report the gap; else each owner.
-    supervised = SUPERVISOR if SUPERVISOR and not capped(SUPERVISOR) else None
-    for_supervisor = []
-    for (repo, n), (it, owners) in stalled.items():
-        key = f"stall:{repo}#{n}"
-        rounds, first, mark = (json.loads(kv_get(key, "[0, 0]")) + [None])[:3]
-        moved = it.moved() if n == 0 else moved_at(it)
-        # Moved on since the last wake, if only between two checks (a pull
-        # request opened and merged while the kit was busy): it starts again
-        # from nothing, a gap of its own (demos#22).
-        if mark is not None and moved > mark:
-            rounds, first = 0, 0
-        if rounds >= STALL_ROUNDS:
-            names = ", ".join(sorted({a for a, _ in owners}))
-            decision_issue(COORDINATION, f"stalled-item:{repo}#{n}:{first}", "stalled",
-                           f"Stalled: {it.at}", {
-                "Question": f"Nothing is moving {it.kind} [{it.at}]({it.issue.get('html_url', '')}) on, and it "
-                            f"waits for nothing the kit can see: {'; '.join(why for _, why in owners)}. "
-                            f"{names} {'was' if len(owners) == 1 else 'were'} woken for it in {rounds} quiet "
-                            "spells without moving it on. What should happen?",
-                "Options": f"- Find out why: `scripts/activity.sh {it.at}` shows what happened to it; if the "
-                           "kit lacks a step, fix the kit.\n"
-                           f"- Tell {names} on the item what to do.\n"
-                           "- Close it, saying why.",
-                "Recommendation": "Find out why first: a stall the kit can't see is a gap in its rules.",
-                "If you say go ahead": "Nothing changes by itself: say on the item what should happen, then "
-                                       "close this issue.",
-                "Blocked on this": f"{it.at}."})
-            continue
-        if supervised:
-            for_supervisor.append(f"{it.at} ({'; '.join(f'{why}: {a}' for a, why in owners)})")
-            kv_set(key, json.dumps([rounds + 1, first or spell, moved]))
-            add_notice(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
-                       f"the stall check woke the supervisor for this {it.kind}: it waited for nothing the kit can "
-                       f"see ({'; '.join(why for _, why in owners)})")
-            continue
-        woke = False
-        for agent, why in owners:
-            if capped(agent):
-                continue
-            add_trigger(agent, f"stalled:{repo}#{n}:{spell}",
-                        f"the kit is quiet and nothing is moving {it.kind} {it.at} on ({why}): move it on, "
-                        "or record what it waits for (a `Blocked-by:` line, or `needs-human` with a decision)")
-            queued += 1
-            woke = True
-        if woke:
-            kv_set(key, json.dumps([rounds + 1, first or spell, moved]))
-            # No rule woke anyone for it, so the rules have a gap: the human
-            # hears of each one, once, and the process review looks into it.
-            names = ", ".join(sorted({a for a, _ in owners if not capped(a)}))
-            # main has no issue to comment on: a notice alone.
-            (notify if n else add_notice)(f"stall-caught:{repo}#{n}:{first or spell}", "stall", repo, n,
-                   f"the stall check woke {names} for this {it.kind}: it waited for nothing the kit can see "
-                   f"({'; '.join(why for _, why in owners)}), and no rule had woken anyone for it. That is a gap "
-                   "in the kit's rules; the process review looks into each one at the milestone's end.")
-    if for_supervisor:
-        add_trigger(supervised, f"supervise:{spell}",
-                    "the kit is quiet, and these wait for nothing the kit can see: " + "; ".join(for_supervisor)
-                    + ". Find out why each stalled, move it on, and report each gap (Role: Supervision)")
-        queued += 1
-    return queued
 
 
 # --- Idle summaries -------------------------------------------------------------
@@ -2035,11 +2029,11 @@ def ci_running():
 
 def check_idle():
     """Once the kit has gone quiet (no run, no queued work except an agent's
-    held by its cap, which is the human's to lift, no CI, and nothing new for IDLE seconds): wake whoever should move on
-    any stalled item, or if none, the coordinator to tell the human what it
-    needs from them. Once per quiet spell."""
-    # Draining looks quiet, but only because nothing may start: neither the
-    # stall check nor the summary could tell anything true.
+    held by its cap, which is the human's to lift, no CI, and nothing new for
+    IDLE seconds): wake the coordinator to tell the human what it needs from
+    them. Once per quiet spell."""
+    # Draining looks quiet, but only because nothing may start: the summary
+    # couldn't tell anything true.
     if not COORDINATOR or IDLE <= 0 or paused() or draining():
         return
     if q("SELECT 1 FROM runs WHERE ended IS NULL"):
@@ -2052,9 +2046,6 @@ def check_idle():
     if ci_running():
         return
     kv_set("idle-summary", now())
-    # Stalled work first: the summary waits for a quiet spell with none.
-    if check_stalls():
-        return
     # Only when what waits on the human has changed since the last summary:
     # otherwise it says again what they already know (coordination#156).
     items = waiting_for_human()
@@ -2074,6 +2065,10 @@ def idler():
             abandon_unstarted()
         except Exception as e:
             log(f"closing unstarted runs failed: {e!r}")
+        try:
+            wake_due()
+        except Exception as e:
+            log(f"moving obligations on failed: {e!r}")
         try:
             check_idle()
         except Exception as e:
@@ -2176,7 +2171,6 @@ def claim(agent):
     return due(agent, grant=True, prio=prio)
 
 
-PRIORITY = "priority"
 TRIGGER_ITEM = re.compile(r"^[a-z-]+:([A-Za-z0-9_.-]+)#(\d+)(?::|$)")
 
 
@@ -2369,9 +2363,8 @@ def end_run(agent, run_id, r):
     elif idle:
         env_retry(agent, run_id, outcome)
     elif outcome in ("completed", "interrupted") or not retry(agent, run_id, outcome):
-        # Done; or stopped by the human; or given up on.
-        # A retried run may still push, so its reviews wait for that.
-        release_reviews(agent)
+        # Done; or stopped by the human; or given up on. What it left owing
+        # (its obligations) moves on within a minute (wake_due).
         later(evaluate_after_run, agent)
     if not r.get("in_extension") and r.get("session_id"):
         sid = r.get("session_id")
@@ -2409,6 +2402,9 @@ def status():
     return {"paused": paused(), "draining": drain, "under_way": left, "drained": drain and not left,
             "reconciled": iso(float(reconciled)) if reconciled else None,
             "agents": agents, "runs": runs, "sessions": sessions, "notices": notices,
+            "obligations": [dict(o, since=iso(o["since"]), next_at=iso(o["next_at"])) for o in
+                            q("SELECT unit, agent, what, description, wakes, escalated, since, next_at "
+                              "FROM obligations ORDER BY agent, since")],
             "summary": kit_summary()}
 
 
@@ -2488,8 +2484,7 @@ def kit_summary():
         head = "quiet, nothing happens until you act"
     else:
         head = "quiet"
-        notes.append(f"once it has been quiet for {IDLE // 60} minutes, whoever should move on any open item that "
-                     f"is waiting for nothing is woken, or if there is none, the coordinator summarises")
+        notes.append(f"once it has been quiet for {IDLE // 60} minutes, the coordinator summarises what waits on you")
     lines = [f"stuck: {s}" for s in stuck] + work + notes
     return "\n".join([f"Kit: {head}; {wait}"] + [f"  - {line}" for line in lines])
 

@@ -2,7 +2,7 @@
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) is the kit's specification: a change to what the kit does updates it in the same change. The dispatcher's rule numbers (`# 1.` to `# 30.`) match its Triggers section, so keep them in step.
+- [DESIGN.md](DESIGN.md) is the kit's specification: a change to what the kit does updates it in the same change. Its Triggers section describes the states in `docker/dispatcher/states.py`, in the order the code tests them, and numbers the asks and notices as the dispatcher's code does (`# 2.` to `# 30.`, with gaps where states took over), so keep them in step.
 - [RUNBOOK.md](RUNBOOK.md) covers setting the kit up and running it; update it when a script's usage or a manual step changes.
 - [README.md](README.md) is for someone new to the project, finding the repository on GitHub. Keep it brief, and keep the detail in the other two.
 

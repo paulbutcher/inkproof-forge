@@ -36,6 +36,7 @@ LABELS='[
   ["blocked", "b60205", "Waiting on another issue (Blocked-by: line)"],
   ["ready-for-release", "5319e7", "Merged and in CHANGELOG.md; waiting for a release"],
   ["verified", "0e8a16", "The requester checked the release"],
+  ["not-verified", "d93f0b", "The requester checked the latest release, and it falls short"],
   ["priority", "e11d21", "Before anything new: set by the human or the coordinator"]
 ]'
 COORD_LABELS='[

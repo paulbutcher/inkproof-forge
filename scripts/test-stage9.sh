@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Stage 9 acceptance: supervision.
-#   - a stall no rule catches (an accepted request labelled `blocked` by the
-#     human, with no Blocked-by: line) wakes the supervisor, not the owner,
-#     once the kit has been quiet;
-#   - the supervisor's trigger names the item, why it is stalled and whose it is;
-#   - the supervisor acts on the item (a comment, or taking the label off),
-#     and the dispatcher doesn't comment a stall notice on it.
-# It runs the dispatcher with IDLE_SECONDS=60 for its duration, and starts real
-# Claude runs: the coordinator's check of the new request, the supervisor's
-# run, and whatever the supervisor's nudge wakes. Up to an hour. It closes its
-# issue at the end (KEEP=1 keeps it open).
+# Stage 9 acceptance: obligations and supervision.
+#   - an accepted request labelled `blocked` by the human, with no Blocked-by:
+#     line, is held "blocked without a reason", which its owner owes: core is
+#     woken for it at once, and the wake says so;
+#   - core is woken again while it stands, and either moves it on (takes the
+#     label off, or adds a Blocked-by: line), or, once its tries are spent, it
+#     becomes the human's `Stalled:` decision and the supervisor is woken for
+#     it, and acts on it. Either way passes; the test says which happened.
+# It runs the dispatcher with OBLIGATION_BACKOFF=0,60,60 for its duration, and
+# starts real Claude runs: the coordinator's check of the new request, core's,
+# and perhaps the supervisor's. Up to an hour. It closes its issue at the end
+# (KEEP=1 keeps it open).
 # Before it: scripts/bootstrap.sh and scripts/up.sh, with `process` of kind
 # supervisor in agents.conf.
 set -euo pipefail
@@ -28,7 +29,6 @@ status() {
     'import urllib.request,sys; sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:8080/status").read().decode())'
 }
 REPO=inkproof-core
-since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "== Preconditions"
 [ -n "$(docker compose ps -q process)" ] && pass "process is running" || { fail "process isn't running (scripts/up.sh)"; exit 1; }
@@ -39,57 +39,67 @@ grep -Eq '^process[[:space:]]+supervisor[[:space:]]' agents.conf && pass "proces
 docker compose exec -T process test -d /var/lib/inkproof/archive-all/coordinator \
   && pass "process reads the whole run archive" || fail "process can't read /var/lib/inkproof/archive-all"
 
-# A quiet spell after a minute, not twenty; put the dispatcher back however the test ends.
+# Waits of a minute, not 15; put the dispatcher back however the test ends.
 trap 'docker compose up -d --no-deps dispatcher >/dev/null 2>&1' EXIT
-IDLE_SECONDS=60 docker compose up -d --no-deps dispatcher >/dev/null 2>&1
+OBLIGATION_BACKOFF=0,60,60 docker compose up -d --no-deps dispatcher >/dev/null 2>&1
 sleep 5
 
-echo "== A stall no rule catches"
-n="$(kit api POST "/repos/$FORGE_ORG/$REPO/issues" "$(jqt -nc '{title: "Stage 9 test: a stalled request",
-  body: "(no reply needed)\n\nThe kit'"'"'s stage 9 test: an accepted request, labelled blocked by the human with no Blocked-by: line, so nothing the kit can see is moving it on."}')" \
+echo "== An item held without a reason"
+n="$(kit api POST "/repos/$FORGE_ORG/$REPO/issues" "$(jqt -nc '{title: "Stage 9 test: blocked without a reason",
+  body: "(no reply needed)\n\nThe kit'"'"'s stage 9 test: an accepted request, labelled blocked by the human with no Blocked-by: line, so its owner owes a line or the label off."}')" \
   | jqt -r .number)"
 kit api POST "/repos/$FORGE_ORG/$REPO/issues/$n/labels" '{"labels":["request","accepted","blocked"]}' >/dev/null
 item="$REPO#$n"
 info "filed $item"
 
-echo "== The supervisor is woken for it"
-deadline=$(( $(date +%s) + 2400 ))
+echo "== Its owner is woken for it"
+deadline=$(( $(date +%s) + 1200 ))
 run=""
 until [ -n "$run" ] || [ "$(date +%s)" -gt "$deadline" ]; do
-  sleep 30
-  run="$(status | jqt -r --arg i "$item" '[.runs[] | select(.agent == "process" and any(.triggers[]; startswith("the kit is quiet") and contains($i)))] | first | .id // empty')"
+  sleep 20
+  run="$(status | jqt -r --arg w "issue $item is blocked without a reason" \
+    '[.runs[] | select(.agent == "core" and any(.triggers[]; contains($w)))] | first | .id // empty')"
 done
-if [ -z "$run" ]; then
-  fail "no supervisor run for $item within 40 minutes"
-else
-  trigger="$(status | jqt -r --argjson r "$run" '.runs[] | select(.id == $r) | .triggers[] | select(startswith("the kit is quiet"))')"
-  pass "supervisor run $run started for $item"
-  grep -q "$item (it is labelled blocked, but no Blocked-by: line names an open, unreleased issue: core)" <<<"$trigger" \
-    && pass "its trigger says why $item is stalled and whose it is" || fail "its trigger doesn't say why, or whose: $trigger"
-  status | jqt -e --arg i "$item" '[.runs[] | select(.agent == "core" and any(.triggers[]; contains("nothing is moving") and contains($i)))] | length == 0' >/dev/null \
-    && pass "core wasn't woken for it by the stall check" || fail "the stall check woke core as well"
-  deadline=$(( $(date +%s) + 1800 ))
-  until status | jqt -e --argjson r "$run" '.runs[] | select(.id == $r) | .ended != null' >/dev/null || [ "$(date +%s)" -gt "$deadline" ]; do sleep 30; done
-  info "run $run: $(status | jqt -r --argjson r "$run" '.runs[] | select(.id == $r) | "\(.outcome); $\(.cost); \(.turns) turns; \(.forge_changes) Forgejo changes"')"
-fi
+[ -n "$run" ] && pass "core's run $run was woken for $item" || fail "core wasn't woken for $item within 20 minutes"
 
-echo "== It acted on the item"
-comments="$(kit api GET "/repos/$FORGE_ORG/$REPO/issues/$n/comments")"
-timeline="$(kit api GET "/repos/$FORGE_ORG/$REPO/issues/$n/timeline?limit=100")"
-said="$(jqt -r '[.[] | select(.user.login == "process") | .body] | last // empty' <<<"$comments")"
-unlabelled="$(jqt -r '[.[] | select(.type == "label" and .user.login == "process" and .label.name == "blocked" and .body != "1")] | length' <<<"$timeline")"
-if [ -n "$said" ] || [ "$unlabelled" != 0 ]; then
-  pass "the supervisor acted on $item"
-  [ -n "$said" ] && info "it said: $(head -c 400 <<<"$said" | tr '\n' ' ')"
-  [ "$unlabelled" != 0 ] && info "it took the blocked label off"
-else
-  fail "the supervisor neither commented on $item nor took its label off"
-fi
-jqt -e '[.[] | select(.user.login == "dispatcher" and (.body | contains("stall check")))] | length == 0' <<<"$comments" >/dev/null \
-  && pass "the dispatcher commented no stall notice on it" || fail "the dispatcher commented a stall notice on it"
-recs="$(kit api GET "/repos/$FORGE_ORG/inkproof-coordination/issues?state=all&type=issues&labels=review:process&since=$since&limit=50" \
-  | jqt -r '[.[] | select(.user.login == "process")] | map("#\(.number) \(.title)") | join("; ")')"
-info "recommendations the supervisor filed: ${recs:-none}"
+echo "== Moved on, or the human's and the supervisor's"
+deadline=$(( $(date +%s) + 2700 ))
+outcome=""
+until [ -n "$outcome" ] || [ "$(date +%s)" -gt "$deadline" ]; do
+  sleep 30
+  s="$(status)"
+  owed="$(jqt -r --arg i "$item" '[.obligations[] | select(.unit == $i and .agent == "core")] | first // empty | "\(.wakes) \(.escalated)"' <<<"$s")"
+  if [ -z "$owed" ]; then
+    outcome="moved"
+  elif [ "${owed#* }" = 1 ]; then
+    outcome="escalated"
+  fi
+done
+case "$outcome" in
+  moved)
+    pass "core moved $item on: it owes nothing for it any more"
+    timeline="$(kit api GET "/repos/$FORGE_ORG/$REPO/issues/$n/timeline?limit=100")"
+    info "core's actions: $(jqt -r '[.[] | select(.user.login == "core") | .type] | join(", ")' <<<"$timeline")" ;;
+  escalated)
+    pass "core was woken $(cut -d' ' -f1 <<<"$owed") times without moving it on: it is the human's"
+    kit api GET "/repos/$FORGE_ORG/inkproof-coordination/issues?state=open&type=issues&limit=50" \
+      | jqt -e --arg t "Stalled: $item" '[.[] | select(.title == $t)] | length == 1' >/dev/null \
+      && pass "a Stalled: decision is open for it" || fail "no Stalled: decision for it"
+    deadline=$(( $(date +%s) + 1200 ))
+    sup=""
+    until [ -n "$sup" ] || [ "$(date +%s)" -gt "$deadline" ]; do
+      sleep 30
+      sup="$(status | jqt -r --arg i "$item has stalled" '[.runs[] | select(.agent == "process" and any(.triggers[]; startswith($i)) and .ended != null)] | first | .id // empty')"
+    done
+    if [ -n "$sup" ]; then
+      pass "the supervisor's run $sup looked into it"
+      said="$(kit api GET "/repos/$FORGE_ORG/$REPO/issues/$n/comments" | jqt -r '[.[] | select(.user.login == "process") | .body] | last // empty')"
+      [ -n "$said" ] && info "it said: $(head -c 400 <<<"$said" | tr '\n' ' ')" || info "it said nothing on the item"
+    else
+      fail "the supervisor wasn't woken for it, or didn't finish, within 20 minutes"
+    fi ;;
+  *) fail "within 45 minutes, core neither moved $item on nor was it put to the human" ;;
+esac
 
 echo "== Cleanup"
 if [ "${KEEP:-}" != 1 ]; then

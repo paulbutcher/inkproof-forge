@@ -163,10 +163,9 @@ The dispatcher assigns you to anything labelled `needs-human`, and to blocking u
 The kit files its own decisions the same way:
 - a reached cap, saying what's waiting and how to raise the cap;
 - a run the extension doesn't list;
-- a request released two days ago that nobody has verified;
-- an item that stays stalled (`Stalled: <repo>#<n>`).
+- a step an agent was woken for three times without taking it (`Stalled: <repo>#<n>`, or `Stalled: release:<repo>`, `milestone:<title>` or `kit`), such as a released request nobody verifies.
 
-When the kit goes quiet with work stalled, the supervisor (`process`) looks first: it finds out why each item stalled, nudges the agent that should act, and files a recommendation for each gap in the kit's rules. So a `Stalled:` decision means the supervisor's nudge didn't move the item on either, or it couldn't tell why; see what it said on the item, and `scripts/activity.sh <repo>#<n>`.
+Each agent is woken for what it owes at once, again as soon as that run ends if it still owes it, then after 15 minutes, twice (`OBLIGATION_BACKOFF`). An agent that can't take a step yet must say why where the kit can see it: a `Blocked-by:` line, `Waiting-on:`, `needs-human` with a decision, or `not-verified`. So a `Stalled:` decision means it did neither, about half an hour after it was first woken. The supervisor (`process`) is woken with it: it finds out why, nudges the agent that should act, and files a recommendation for the gap. See what it said on the item, and `scripts/activity.sh <repo>#<n>`.
 
 Below level 3, the coordinator puts each library's ready release to you as a decision, `Release <repo>`, with the exact command to run.
 
@@ -177,13 +176,13 @@ Forgejo shows the dispatcher's mentions in its notifications. For macOS notifica
 - a `blocking` upstream issue;
 - a reached cap;
 - a run the extension doesn't list;
-- an item the stall check caught.
+- a step that became yours (`Stalled:`).
 
 `scripts/notify-install.sh --remove` takes the job out.
 
 ### Summaries
 
-When the kit goes quiet with nothing stalled, the coordinator writes you a summary:
+When the kit goes quiet, the coordinator writes you a summary:
 - whether things are waiting on you, stalled or finished;
 - what has finished since its last summary;
 - what it needs from you, most important first, with links;
@@ -196,6 +195,7 @@ Open it with `scripts/open.sh coordinator`. It's the session named like "coordin
 - **`scripts/status.sh`** shows, for each agent:
   - its state: idle, running, human active, paused or capped;
   - its waiting work and its spend today;
+  - what it owes: each step it holds or question it hasn't answered, since when, and how many times it has been woken for it;
   - its recent runs, with outcome, cost, session and log.
 
   It then shows your sessions, the notices, and the open requests, pull requests, recommendations and `needs-human` items across the project. It also shows whether the gatekeeper is running and its latest approvals.
@@ -204,8 +204,8 @@ Open it with `scripts/open.sh coordinator`. It's the session named like "coordin
   - "Kit: working": each run, with what it is for and how long it has run; each agent's queued work, with how long the oldest has waited; and CI;
   - "Kit: stuck": first, what can't move on by itself, marked "stuck:": queued work whose runner has stopped calling in (restart that agent's container: `docker compose restart <agent>`), or a run claimed but never started (closed by itself after 15 minutes, `CLAIM_START_SECONDS`, with its work queued again); then whatever else is working;
   - "Kit: quiet, nothing happens until you act": what waits on you;
-  - "Kit: quiet" with nothing waiting on you, in which case a stalled item or the coordinator's summary comes next.
-- **`scripts/watch.sh`** keeps that last part on screen, redrawn every 15 seconds (`-n 60` for every minute) until Ctrl-C. Piped or redirected, it prints the state with the time whenever it changes, so `scripts/watch.sh > kit.log` keeps a record.
+  - "Kit: quiet" with nothing waiting on you, in which case the coordinator's summary comes next.
+- **`scripts/watch.sh`** keeps that last part on screen, followed by what each agent owes (one line each, with how many times it has been woken, and "now yours" once it is a `Stalled:` decision), redrawn every 15 seconds (`-n 60` for every minute) until Ctrl-C. Piped or redirected, it prints the state with the time whenever it changes, so `scripts/watch.sh > kit.log` keeps a record.
 - **`scripts/activity.sh`** follows what's happening, one line per entry, in your time zone. It covers pushes, pull requests, reviews, labels, CI results and releases, with who did them; work queued and why; runs starting and ending, with outcome and cost; your sessions; and notices.
 
   It shows the last 40 entries and then follows until Ctrl-C. `-n 200` shows more first, `--once` doesn't follow, and a word filters the lines: `scripts/activity.sh scale`. Issue references such as `inkproof-core#24` link to Forgejo in terminals that support hyperlinks; `--urls` prints the addresses instead.
@@ -314,7 +314,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 
 | Test | Checks |
 | --- | --- |
-| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out, including the search for items nothing would move on (`NobodyOrphaned`: `ORPHAN_WORLDS`, default 500, widens it, and `ORPHAN_VERBOSE=1` lists every failure). Quick, isolated, and safe anywhere. |
+| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out, and the completeness checks of its states, over every combination of each unit's facts (`test_states.py`). Quick, isolated, and safe anywhere. |
 | `scripts/test-hook.sh` | Unit tests for the guard on your sessions in agents' containers, and for `forge version`, held to the gatekeeper's versioning rule. Quick, isolated, and safe anywhere. |
 | `scripts/test-stage1.sh` | Bootstrap, networks and proxies, CI in its own engine, that agents can't tag or release, and Actions webhooks. |
 | `scripts/test-stage2.sh` | Migration from GitHub, attribution, mirrors, and dependencies fetched from Forgejo. With `MIRROR_TEST_REPO`, a round trip through a scratch GitHub repository. |
@@ -324,7 +324,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 | `scripts/test-stage6.sh` | Level 2: the gatekeeper approves only on a real Actions run. |
 | `scripts/test-stage7.sh` | Level 3: the coordinator gates `API.lock`, and releases go through the gatekeeper. |
 | `scripts/test-stage8.sh` | Backups, pruning and restore-test. |
-| `scripts/test-stage9.sh` | Supervision: a stall no rule catches wakes the supervisor, not the owner, and the supervisor acts on it. Starts real Claude runs. |
+| `scripts/test-stage9.sh` | Obligations and supervision: an item held without a reason wakes its owner at once, and again while it stands; once its tries are spent it is a `Stalled:` decision, and the supervisor is woken. Starts real Claude runs. |
 
 ### Changing an allowlist
 

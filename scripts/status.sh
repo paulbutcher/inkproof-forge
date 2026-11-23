@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # What each agent is doing, from the dispatcher (never GitHub): its state,
-# pending triggers, and recent runs; then notices for you, and the
-# gatekeeper's latest approvals.
+# pending triggers, what it owes, and recent runs; then notices for you, and
+# the gatekeeper's latest approvals.
 # Then open requests, pull requests, recommendations and needs-human items
 # across the project's repositories, from Forgejo.
 # Last, one line saying whether the kit will make progress by itself or is
@@ -19,6 +19,10 @@ docker compose run --rm -T --no-deps --entrypoint jq tools -r '
   (.agents | to_entries[]
     | "  \(.key): \(.value.state), \(.value.runs_today)/\(.value.cap) runs today, $\(.value.spend_today) spent"
       + (if (.value.pending | length) > 0 then "\n" + ([.value.pending[] | "    waiting since \(.since): \(.trigger)" + (if .after then " (not before \(.after))" else "" end)] | join("\n")) else "" end)),
+  "",
+  "Owed (each woken at once, then again while it stands; then yours):",
+  ((.obligations // [])[] | "  \(.agent): \(.description | .[0:160])"
+      + "\n      since \(.since), woken \(.wakes) time(s)" + (if .escalated == 1 then ", now yours (Stalled:)" else "" end)),
   "",
   "Recent runs:",
   (.runs[:15][] | "  #\(.id) \(.agent) \(.started | t) -> \(.ended | t): \(.outcome // "running")"

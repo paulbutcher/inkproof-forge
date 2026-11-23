@@ -1,8 +1,9 @@
 """Unit tests for the dispatcher's decisions, against a fake Forgejo that
 serves issues and pull requests as they really look. Run by
-scripts/test-dispatcher.sh, in the dispatcher's image.
+scripts/test-dispatcher.sh, in the dispatcher's image. test_states.py
+checks the states themselves, over every combination of their facts.
 
-The rules' numbers are those in the dispatcher's Rules section."""
+The numbers are those of DESIGN.md's Triggers."""
 import base64
 import json
 import os
@@ -64,14 +65,17 @@ class Forge:
     def __init__(self):
         self.items, self.statuses, self.mains, self.milestones, self.writes = {}, {}, {}, {}, []
         self.codeowners, self.releases, self.changelogs = {}, {}, {}
+        self.files = {}  # (repo, path, ref): text, for any other file
+        self.tags = {}  # repo: [tag], besides each published release's
 
     def release(self, repo, tag, ago, draft=False):
         """Publish a release: the newest first, as Forgejo lists them."""
         self.releases.setdefault(repo, []).insert(0, {"tag_name": tag, "published_at": at(ago), "draft": draft})
 
     def issue(self, repo, n, author, labels=(), state="open", body="", created=7200, events=(), closed=None,
-              title="An issue"):
+              title="An issue", assignees=()):
         self.items[(repo, n)] = {"number": n, "state": state, "user": {"login": author}, "body": body, "title": title,
+                                 "assignees": [{"login": a} for a in assignees],
                                  "html_url": f"http://forge/org/{repo}/issues/{n}",
                                  "labels": [{"name": l} for l in labels], "created_at": at(created),
                                  "updated_at": at(0), "closed_at": at(closed) if closed is not None else None,
@@ -135,9 +139,10 @@ class Forge:
         if rest == "issues":
             want = set(args.get("labels", "").split(",")) - {""}
             kind = args.get("type", "all")
-            return [self.issue_json(i) for i in mine if i["state"] == args.get("state", "open")
+            return [self.issue_json(i) for i in mine if args.get("state", "open") in ("all", i["state"])
                     and (kind == "all" or (kind == "issues") == (i["pr"] is None))
-                    and want <= {l["name"] for l in i["labels"]}]
+                    and want <= {l["name"] for l in i["labels"]}
+                    and (not args.get("assigned_by") or args["assigned_by"] in {a["login"] for a in i["assignees"]})]
         if m := re.fullmatch(r"commits/(\w+)/status", rest):
             return {"statuses": [{"context": "checks / build (pull_request)", "status": s if isinstance(s, str) else s[0],
                                    "updated_at": at(0 if isinstance(s, str) else s[1])} for s in self.statuses.get(m[1], [])]}
@@ -151,6 +156,14 @@ class Forge:
             if repo not in self.changelogs:
                 raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
             return {"content": base64.b64encode(self.changelogs[repo].encode()).decode()}
+        if rest.startswith("contents/"):
+            text = self.files.get((repo, rest[len("contents/"):], args.get("ref")))
+            if text is None:
+                raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            return {"content": base64.b64encode(text.encode()).decode()}
+        if rest == "tags":  # each published release's
+            return [{"name": r["tag_name"], "commit": {"sha": "t" * 40}} for r in self.releases.get(repo, [])
+                    if not r["draft"]] + [{"name": n, "commit": {"sha": "t" * 40}} for n in self.tags.get(repo, [])]
         if rest == "releases":
             return self.releases.get(repo, [])
         if rest == "milestones":
@@ -162,31 +175,40 @@ class Forge:
 
 class Case(unittest.TestCase):
     def setUp(self):
-        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels"):
+        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels", "units", "obligations"):
             d.q(f"DELETE FROM {t}")
         d.kv_set("rules-seeded", d.now())
+        d.kv_set("obligations-started", d.now())
         d._cache.clear()
         self.f = Forge()
         d.forge = self.f
-        # A claim checks a trigger is still owed on the item its key names,
-        # so every rule's key must name the item it was evaluated on.
-        owed_on = d.owed_on
-        self.addCleanup(setattr, d, "owed_on", owed_on)
+        # Timers aren't run here: a test says when time passes.
+        self.addCleanup(setattr, d, "recheck", d.recheck)
+        d.recheck = lambda unit, at: None
 
-        def checked(it):
-            found = owed_on(it)
-            for o in found[0]:
-                m = d.RULE_KEY.match(o.key)
-                self.assertTrue(m and (m[2], int(m[3])) == (it.repo, it.n), f"{o.key} evaluated on {it.at}")
-            return found
-        d.owed_on = checked
+    def what(self, key):
+        """What a trigger is for: an obligation's state or ask, or a notice's kind."""
+        if key.startswith("owe:"):
+            o = d.obligation(int(key[len("owe:"):].rsplit(":", 2)[1]))
+            return o["what"].split(":")[0] if o else "gone"
+        return key.split(":")[0]
 
     def queued(self, agent=None):
-        """(agent, kind) of each waiting trigger, or just the kinds for one agent."""
+        """(agent, what) of each waiting trigger, or just what, for one agent."""
         rows = d.q("SELECT agent, key FROM triggers WHERE run_id IS NULL ORDER BY id")
         if agent:
-            return [r["key"].split(":")[0] for r in rows if r["agent"] == agent]
-        return [(r["agent"], r["key"].split(":")[0]) for r in rows]
+            return [self.what(r["key"]) for r in rows if r["agent"] == agent]
+        return [(r["agent"], self.what(r["key"])) for r in rows]
+
+    def owing(self, unit=None):
+        """(agent, what) of each obligation standing, on one unit or all, an
+        ask without its comment's id."""
+        rows = d.q("SELECT agent, unit, what FROM obligations ORDER BY id")
+        return sorted((r["agent"], r["what"].split(":")[0]) for r in rows if unit in (None, r["unit"]))
+
+    def state(self, unit):
+        row = d.q("SELECT state, holders FROM units WHERE unit=?", unit)
+        return (row[0]["state"], json.loads(row[0]["holders"])) if row else None
 
     def descriptions(self, agent):
         return [r["description"] for r in d.q("SELECT description FROM triggers WHERE agent=? AND run_id IS NULL "
@@ -200,143 +222,342 @@ class Case(unittest.TestCase):
                    agent, d.now())[0]["id"]
 
 
-class OwnerRules(Case):
-    def test_1_a_site_owns_its_repository_as_a_library_does(self):
+class Issues(Case):
+    """An issue's state, and who owes its next step."""
+
+    def test_untriaged_request_from_someone_else(self):
+        self.f.issue(CORE, 1, "scale", ["request", "new"])
+        self.f.issue(CORE, 2, "core", ["request", "new"])  # its own: a task, filing it accepted it
+        self.f.issue(CORE, 3, "stranger", ["request", "new"])  # an outsider's, which no one else answers
+        for n in (1, 2, 3):
+            d.evaluate(CORE, n)
+        self.assertEqual(self.owing(), [("core", "to do"), ("core", "untriaged"), ("core", "untriaged")])
+        self.assertEqual(self.descriptions("core")[0],
+                         f"issue {CORE}#1 (untriaged): accept it, counter-propose, or close it saying why")
+        self.assertEqual(self.state(f"{CORE}#2"), ("to do", ["core"]))
+
+    def test_a_site_owns_its_repository_as_a_library_does(self):
         self.assertEqual(d.OWNER_OF["inkproof-demos"], "demos")
         self.f.issue("inkproof-demos", 1, "core", ["request", "new"])
         d.evaluate("inkproof-demos", 1)
-        self.assertEqual(self.descriptions("demos"), ["untriaged request inkproof-demos#1"])
+        self.assertEqual(self.queued("demos"), ["untriaged"])
 
-    def test_1_an_untriaged_request_from_someone_else(self):
-        self.f.issue(CORE, 1, "scale", ["request", "new"])
-        self.f.issue(CORE, 2, "core", ["request", "new"])
-        self.f.issue(CORE, 3, "stranger", ["request", "new"])
-        for n in (1, 2, 3):
-            d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("core"), [f"untriaged request {CORE}#1"])
-
-    def test_1_an_issue_filed_without_labels_viewport_9(self):
+    def test_an_issue_filed_without_labels_viewport_9(self):
         self.f.issue(CORE, 9, "scale")  # its labels dropped, as Forgejo does for anyone without write access
-        self.f.issue(CORE, 10, "scale", events=[comment("core", 100, "On it.")])  # the owner has looked
-        self.f.issue(CORE, 11, "scale", ["question"])  # labelled, so not this rule
-        self.f.issue(CORE, 12, "stranger")
-        for n in (9, 10, 11, 12):
+        self.f.issue(CORE, 10, "scale", events=[comment("core", 100, "(no reply needed) On it.")])  # looked at
+        for n in (9, 10):
             d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("core"),
-                         [f"untriaged issue {CORE}#9, filed without labels: if it's a request, add `request` and "
-                          "`new` and handle it as one; otherwise answer it or close it"])
+        self.assertEqual(self.state(f"{CORE}#9")[0], "untriaged")
+        self.assertIn("if it's a request, add `request` and `new`", self.descriptions("core")[0])
+        self.assertEqual(self.state(f"{CORE}#10")[0], "to do")
         rows = d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")
         self.f.items[(CORE, 9)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
         self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once triaged")
+        self.assertEqual(self.state(f"{CORE}#9")[0], "to do")
 
-    def test_26_the_humans_mention_wakes_that_agent_gpu_9(self):
-        asks = comment("human", 300, "@coordinator inkproof-core is at level 3; decide. cc @scale @core @stranger "
-                                     "(not mail@lasm.org)", cid=26)
-        self.f.pull(CORE, 9, "core", events=[asks, comment("scale", 200, "(no reply needed)\nSeen.")])
-        self.f.pull(CORE, 10, "core", sha="b" * 40, events=[comment("scale", 100, "@coordinator please look")])
-        d.evaluate(CORE, 9)
-        d.evaluate(CORE, 10)
-        self.assertEqual(sorted(k for k in self.queued() if k[1] == "mention"), [("coordinator", "mention")],
-                         "scale has acted since; core is the owner, whom any comment wakes; an agent's mention "
-                         "wakes no one")
-        self.assertIn(f"the human mentioned you on pull request {CORE}#9: http://forge/org/{CORE}/issues/9#issuecomment-26",
-                      self.descriptions("coordinator"))
-        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'mention:%'")
-        self.f.items[(CORE, 9)]["events"].append(comment("coordinator", 50, "(no reply needed)\nApproved."))
-        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
+    def test_counter_proposed(self):
+        self.f.issue(CORE, 1, "scale", ["request", "counter-proposal"], events=[label("counter-proposal", True, 100)])
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.owing(), [("scale", "counter-proposed")])
 
-    def test_26_the_owners_mention_wakes_its_requester_gpu_59(self):
-        # core asks scale, its request's requester, for what only scale
-        # knows. Its mentions of anyone else, a mention that wants no reply,
-        # or one on an issue that isn't a request, wake no one.
-        self.f.issue(CORE, 9, "scale", ["request", "accepted"], events=[
-            comment("core", 300, "I can't reproduce it. @scale, can you attach the frame? @gpu might know too.", cid=59),
-            comment("core", 250, "(no reply needed)\n\n@scale, merged.")])
-        self.f.issue(CORE, 10, "scale", events=[comment("core", 300, "@scale, what's this?")])
-        self.f.issue(CORE, 11, "scale", ["request", "accepted"],
-                     events=[comment("core", 300, "@scale, the frame?"), comment("scale", 200, "Attached.")])
-        for n in (9, 10, 11):
+    def test_merged_work_still_to_finish(self):
+        self.f.issue(CORE, 5, "scale", ["request", "accepted"])
+        self.f.pull(CORE, 7, "core", body="Refs org/inkproof-core#5", state="closed", merged=100)
+        d.evaluate(CORE, 5)
+        self.assertEqual(self.descriptions("core"),
+                         [f"issue {CORE}#5 (merged): label it ready-for-release, with its CHANGELOG.md entry"])
+
+    def test_an_owners_own_issue_is_finished_as_a_request_is_demos_22(self):
+        self.f.issue(CORE, 5, "core")
+        self.f.issue(CORE, 6, "core", ["ready-for-release"])
+        self.f.issue(CORE, 8, "scale")  # someone else's, untriaged
+        self.f.pull(CORE, 7, "core", body="Refs #5\nRefs #6\nRefs #8", state="closed", merged=100)
+        for n in (5, 6, 8):
             d.evaluate(CORE, n)
-        self.assertEqual(sorted(k for k in self.queued() if k[1] == "mention"), [("scale", "mention")])
-        self.assertIn(f"core, its owner, mentioned you on issue {CORE}#9: "
-                      f"http://forge/org/{CORE}/issues/9#issuecomment-59", self.descriptions("scale"))
+        self.assertEqual([self.state(f"{CORE}#{n}")[0] for n in (5, 6, 8)], ["merged", "ready", "untriaged"])
+        # The coordinator's own issues are its decisions and records, never released.
+        self.f.issue(COORD, 3, "coordinator")
+        self.f.pull(COORD, 4, "coordinator", body="Refs #3", state="closed", merged=100)
+        d.evaluate(COORD, 3)
+        self.assertEqual(self.state(f"{COORD}#3")[0], "to do")
 
-    def test_30_waiting_on_wakes_the_agent_it_names_gpu_59(self):
-        def waits(n, *events, author="scale", labels=("request", "accepted")):
-            self.f.issue(CORE, n, author, labels, events=events)
-            d.evaluate(CORE, n)
-        waits(1, comment("core", 300, "I can't reproduce it; I need your frame.\n\nWaiting-on: scale", cid=31))
-        # Answered: scale has acted since.
-        waits(2, comment("core", 300, "Waiting-on: scale"), comment("scale", 200, "(no reply needed)\n\nAttached."))
-        # A later line decides: none, the human (needs-human reaches them), or the writer itself.
-        waits(3, comment("core", 300, "Waiting-on: scale"), comment("core", 200, "Waiting-on: none"))
-        waits(4, comment("core", 300, "Waiting-on: human"))
-        waits(5, comment("scale", 300, "(no reply needed)\n\nWaiting-on: scale"))
-        # An untrusted account's line says nothing.
-        waits(6, comment("stranger", 300, "Waiting-on: scale"))
-        # Its owner, whom the comment wakes anyway (2), isn't woken twice; a
-        # line in a comment that wants no reply still wakes it.
-        waits(7, comment("scale", 300, "Waiting-on: core"))
-        waits(8, comment("scale", 300, "(no reply needed)\n\nWaiting-on: @core"))
-        # On a closed request too, where the talk after its verification goes on.
-        self.f.issue(CORE, 9, "scale", ["request", "verified"], state="closed",
-                     events=[comment("coordinator", 300, "Fix your changelog first.\n\nWaiting-on: scale")])
+    def test_part_of_and_refs_in_a_line_count_demo_18_28(self):
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"])
+        self.f.pull(CORE, 28, "core", title="Tile build from real files (part of #2)", state="closed", merged=100)
+        self.f.issue(CORE, 3, "coordinator", ["request", "accepted"])
+        self.f.pull(CORE, 18, "core", body="Not done yet for #3: performance gates. Refs org/inkproof-core#3.",
+                    state="closed", merged=100)
+        d.evaluate(CORE, 2)
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.owing(), [("core", "merged"), ("core", "merged")])
+        found = [r for m in d.REFS_INLINE.findall("Done. Refs #2, #3 and org/x#4. Not #5; prefs #6") for r in
+                 d.REF.findall(m)]
+        self.assertEqual([k for _, _, k in found], ["2", "3", "4"])
+
+    def test_labelled_or_released_it_isnt_the_owners(self):
+        self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
+        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 50, "(no reply needed)\n\nReleased in v0.2.0: ...")])
+        self.f.pull(CORE, 7, "core", body="Refs #5\nRefs #6", state="closed", merged=100)
+        d.evaluate(CORE, 5)
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#5"), ("ready", ["unit:release"]))
+        self.assertEqual(self.owing(), [("scale", "released")])
+
+    def test_released_wakes_the_requester_to_verify(self):
+        self.f.issue(CORE, 9, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.3: ...")])
         d.evaluate(CORE, 9)
-        self.assertEqual(sorted((a, k) for a, k in self.queued() if k == "waiting"),
-                         [("core", "waiting"), ("scale", "waiting"), ("scale", "waiting")])
-        self.assertIn(f"core is waiting on you on issue {CORE}#1: http://forge/org/{CORE}/issues/1#issuecomment-31",
-                      self.descriptions("scale"))
-        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'waiting:%' AND agent='scale'")
-        self.f.items[(CORE, 1)]["events"].append(comment("scale", 50, "Here it is."))
-        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once answered")
+        self.assertEqual(self.queued("scale"), ["released"])
+        self.assertIn("(released in v1.2.3)", self.descriptions("scale")[0])
+        self.f.items[(CORE, 9)]["labels"].append({"name": "verified"})
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.owing(), [("scale", "verified")], "and then to close it")
+
+    def test_not_verified_sends_it_back_to_its_owner_web_20(self):
+        # Its requester found it short at the release; the owner's fix merged afterwards.
+        events = [comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
+                  comment("scale", 4000, "The README names the wrong function."),
+                  label("not-verified", True, 4000, who="scale")]
+        self.f.issue(CORE, 6, "scale", ["request", "accepted", "not-verified"], events=events)
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6")[0], "to do")
+        self.f.pull(CORE, 7, "core", body="Refs #6", state="closed", merged=6000)  # the released work
+        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)
+        d._cache.clear()
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6")[0], "merged")
+        # Released again: the label is from before, so it is the requester's again.
+        self.f.items[(CORE, 6)]["events"].append(comment("gatekeeper", 50, "(no reply needed)\n\nReleased in v0.2.1."))
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6"), ("released", ["scale"]))
+
+    def test_a_fix_merged_after_the_release_waits_for_not_verified_gpu_59(self):
+        # The requester held back for the owner's pull request, which merged:
+        # the release it has is still the one to check, until it says it falls short.
+        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
+                             comment("scale", 300, "I'll switch once it's released.\n\nBlocked-by: org/inkproof-core#8")])
+        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)["closed_at"] = at(100)
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6"), ("released", ["scale"]))
+        self.f.items[(CORE, 6)]["labels"].append({"name": "not-verified"})
+        self.f.items[(CORE, 6)]["events"].append(label("not-verified", True, 50, who="scale"))
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6"), ("merged", ["core"]))
+
+    def test_a_released_request_labelled_again_waits_for_its_release_gpu_59(self):
+        self.f.issue(CORE, 6, "scale", ["request", "accepted", "ready-for-release"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ...")])
+        d.evaluate(CORE, 6)
+        self.assertEqual(self.state(f"{CORE}#6"), ("ready", ["unit:release"]))
+
+    def test_work_merged_before_it_was_unblocked_isnt_its_work_scale_38(self):
+        self.f.issue(CORE, 4, "coordinator", ["request"], state="closed", closed=1000)
+        self.f.issue(CORE, 38, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-core#4")
+        self.f.pull(CORE, 42, "core", body="Refs #38", state="closed", merged=2000)  # the part it could do
+        d.evaluate(CORE, 38)
+        self.assertEqual(self.owing(), [("core", "to do")])
+
+    def test_an_owners_own_issue_demos_74(self):
+        self.f.issue(CORE, 74, "core", created=600)
+        self.f.issue(CORE, 75, "core", ["blocked"], body="Blocked-by: org/inkproof-scale#93")
+        self.f.issue(SCALE, 93, "core", ["request", "new"])
+        self.f.issue(CORE, 76, "core")
+        self.f.pull(CORE, 77, "core", body="Refs #76", ci="success")  # under way
+        for n in (74, 75, 76):
+            d.evaluate(CORE, n)
+        self.assertEqual([self.state(f"{CORE}#{n}")[0] for n in (74, 75, 76)], ["to do", "blocked", "in progress"])
+        self.assertEqual(self.descriptions("core"),
+                         [f"issue {CORE}#74 (to do): work on it: a pull request with a Refs line, or say what it "
+                          "waits for (a Blocked-by: line, Waiting-on:, or needs-human with a decision)"])
+
+    def test_to_do_waits_while_its_owner_is_busy(self):
+        self.f.issue(CORE, 5, "coordinator", ["request", "accepted"])
+        run = self.running("core")
+        d.evaluate(CORE, 5)
+        self.assertEqual(self.owing(), [("core", "to do")])
+        self.assertEqual(self.queued("core"), [], "quiet: not while it runs")
+        d.q("UPDATE runs SET ended=? WHERE id=?", d.now(), run)
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["to do"])
+
+    def test_waits_for_every_blocker_consumer_metrics_12(self):
+        self.f.issue(CORE, 51, "coordinator", ["request"], state="closed", closed=3000)
+        self.f.issue(SCALE, 38, "coordinator", ["request"])
+        self.f.issue(CORE, 12, "coordinator", ["request", "accepted"],
+                     events=[comment("core", 7000, "(no reply needed)\nBlocked-by: org/inkproof-core#51\n"
+                                                   "Blocked-by: org/inkproof-scale#38")])
+        d.evaluate(CORE, 12)
+        self.assertEqual(self.state(f"{CORE}#12"), ("blocked", ["unit:blockers"]))
+        self.assertIn(("POST", f"/repos/org/{CORE}/issues/12/labels", {"labels": [1]}), self.f.writes)
+        # scale#38's release unblocks it.
+        self.f.items[(SCALE, 38)]["events"].append(
+            comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v0.5.3: ..."))
+        self.f.items[(CORE, 12)]["labels"].append({"name": "blocked"})
+        d.evaluate(CORE, 12)
+        self.assertEqual(self.state(f"{CORE}#12")[0], "to do")
+
+    def test_a_line_may_name_a_pull_request_coordination_198(self):
+        self.f.pull(CORE, 13, "core", ci="success")
+        self.f.issue(CORE, 19, "scale", ["request", "accepted"],
+                     events=[comment("core", 7000, "(no reply needed)\nBlocked-by: org/inkproof-core#13")])
+        d.evaluate(CORE, 19)
+        self.assertEqual(self.state(f"{CORE}#19")[0], "blocked")
+        self.f.items[(CORE, 13)]["state"] = "closed"
+        self.f.items[(CORE, 13)]["pr"].update(state="closed", merged=True, merged_at=at(100))
+        d.evaluate(CORE, 19)
+        self.assertEqual(self.state(f"{CORE}#19")[0], "to do")
+
+    def test_closed_but_never_released_still_blocks_coordination_208(self):
+        self.f.issue(SCALE, 62, "core", ["request", "accepted", "ready-for-release"], state="closed", closed=3000)
+        self.f.issue(CORE, 57, "coordinator", ["request", "accepted", "blocked"],
+                     events=[comment("core", 7000, "(no reply needed)\nBlocked-by: org/inkproof-scale#62")])
+        d.evaluate(CORE, 57)
+        self.assertEqual(self.state(f"{CORE}#57")[0], "blocked")
+        self.f.items[(SCALE, 62)]["events"].append(
+            comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v0.22.0: ..."))
+        d.evaluate(CORE, 57)
+        self.assertEqual(self.state(f"{CORE}#57")[0], "to do")
+
+    def test_a_requesters_own_line_on_its_released_request_scene_51(self):
+        self.f.pull(SCALE, 59, "scale", state="closed", merged=100)
+        self.f.items[(SCALE, 59)]["state"] = "closed"
+        self.f.issue(CORE, 51, "scale", ["request", "accepted"],
+                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.18.0: ..."),
+                             comment("scale", 4000, "(no reply needed) Not yet.\n\nBlocked-by: org/inkproof-scale#59")])
+        d.evaluate(CORE, 51)
+        self.assertEqual(self.owing(), [("scale", "released")])
+
+    def test_the_dispatchers_label_comes_off_with_its_last_line_demos_74(self):
+        self.f.issue(CORE, 74, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="dispatcher")])
+        # The human's own label, with no lines, stays: and asks for a line.
+        self.f.issue(CORE, 75, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="human")])
+        d.evaluate(CORE, 74)
+        d.evaluate(CORE, 75)
+        self.assertIn(("DELETE", f"/repos/org/{CORE}/issues/74/labels/1", None), self.f.writes)
+        self.assertNotIn(("DELETE", f"/repos/org/{CORE}/issues/75/labels/1", None), self.f.writes)
+        self.assertEqual(self.state(f"{CORE}#74")[0], "to do")
+        self.assertEqual(self.state(f"{CORE}#75"), ("blocked without a reason", ["core"]))
+
+    def test_a_loop_of_blocked_by_lines_is_its_writers(self):
+        # Each waits on the other: the old rules saw two blocked items and woke no one.
+        self.f.issue(CORE, 1, "core", events=[comment("core", 600, "(no reply needed)\nBlocked-by: org/inkproof-core#2")])
+        self.f.issue(CORE, 2, "core", events=[comment("core", 500, "(no reply needed)\nBlocked-by: org/inkproof-core#1")])
+        for n in (1, 2, 1):
+            d.evaluate(CORE, n, dependents=False)
+        self.assertEqual(self.state(f"{CORE}#1"), ("invalid", ["core"]))
+
+    def test_a_line_naming_the_item_itself_is_invalid_while_it_is_the_newest(self):
+        self.f.issue(CORE, 4, "core")
+        events = self.f.issue(CORE, 3, "scale", ["request", "accepted"], events=[
+            comment("gatekeeper", 900, "(no reply needed)\nReleased in v0.2.0."),
+            comment("scale", 600, "(no reply needed)\nWaiting for the next release.\n\n"
+                                  "Blocked-by: org/inkproof-core#3")])["events"]
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.state(f"{CORE}#3"), ("invalid", ["scale"]))
+        events.append(comment("scale", 300, "(no reply needed)\nBlocked-by: org/inkproof-core#4"))
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.state(f"{CORE}#3")[0], "blocked")
+
+    def test_with_the_human_until_they_answer(self):
+        events = self.f.issue(CORE, 4, "core", ["needs-human"], events=[label("needs-human", True, 500)])["events"]
+        d.evaluate(CORE, 4)
+        self.assertEqual(self.state(f"{CORE}#4"), ("with the human", ["human"]))
+        events.append(comment("human", 100, "Do the first."))
+        d.evaluate(CORE, 4)
+        self.assertEqual(self.owing(), [("core", "reply"), ("core", "to do")])
+
+    def test_closed_while_ready_for_release_coordination_208(self):
+        self.f.issue(SCALE, 62, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
+                     events=[event("close", "demos", 100)])
+        self.f.issue(SCALE, 63, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
+                     events=[comment("gatekeeper", 200, "(no reply needed)\n\nReleased in v0.22.0: ..."),
+                             event("close", "demos", 100)])
+        d.evaluate(SCALE, 62)
+        d.evaluate(SCALE, 63)
+        self.assertEqual(self.owing(), [("coordinator", "closed unreleased")])
+
+    def test_a_release_overtakes_its_decision_gpu_27(self):
+        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000,
+                     events=[label("needs-human", True, 5000, "coordinator"), comment("human", 100, "Go ahead")])
+        self.f.release(CORE, "v0.6.0", 9000)  # before the decision
+        d.evaluate(CORE, 27)
+        self.assertEqual(self.state(f"{CORE}#27")[0], "with the human")
+        self.f.release(CORE, "v0.6.1", 3000)
+        self.f.release(CORE, "v0.6.2", 2000, draft=True)
+        d._cache.clear()
+        d.evaluate(CORE, 27)
+        self.assertEqual(self.state(f"{CORE}#27"), ("overtaken", ["coordinator"]))
+        # Once it has acted since, the human holds it again.
+        self.f.items[(CORE, 27)]["events"].append(comment("coordinator", 50, "(no reply needed)\nUpdated."))
+        d.evaluate(CORE, 27)
+        self.assertEqual(self.state(f"{CORE}#27")[0], "with the human")
+
+    def test_a_release_published_evaluates_the_decision(self):
+        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000)
+        self.f.release(CORE, "v0.6.1", 10)
+        d.handle("release", {"action": "published", "repository": {"name": CORE, "owner": {"login": "org"}},
+                             "sender": {"login": "gatekeeper"}, "release": {"tag_name": "v0.6.1"}})
+        self.assertEqual(self.queued("coordinator"), ["overtaken"])
+
+    def test_the_humans_issues_and_recommendations_are_theirs(self):
+        self.f.issue(COORD, 107, "process", ["needs-human", "recommendation", "review:process"],
+                     events=[label("needs-human", True, 100, "process"), comment("human", 50, "Why?")])
+        self.f.issue(COORD, 108, "dispatcher", ["needs-human"], title="Stalled: x")
+        d.evaluate(COORD, 107)
+        d.evaluate(COORD, 108)
+        self.assertEqual(self.state(f"{COORD}#107")[0], "with the human")
+        self.assertEqual(self.state(f"{COORD}#108")[0], "with the human")
+        self.assertEqual(self.owing(), [("coordinator", "reply")], "the coordinator answers the human's question")
+
+
+class Asks(Case):
+    """What is asked of an agent on an item: owed until it acts there."""
 
     def test_2_a_comment_wanting_a_reply_newer_than_the_owner(self):
-        self.f.issue(CORE, 1, "core", events=[comment("scale", 300, cid=1)])
-        self.f.issue(CORE, 2, "core", events=[comment("scale", 300), comment("core", 200, "Answered.")])
-        self.f.issue(CORE, 3, "core", events=[comment("scale", 300, "(no reply needed)\n\nThanks.")])
-        self.f.issue(CORE, 4, "core", events=[comment("stranger", 300)])
+        held = lambda *events: dict(labels=["needs-human"], events=[label("needs-human", True, 400)] + list(events))
+        self.f.issue(CORE, 1, "core", **held(comment("scale", 300, cid=1)))
+        self.f.issue(CORE, 2, "core", **held(comment("scale", 300), comment("core", 200, "Answered.")))
+        self.f.issue(CORE, 3, "core", **held(comment("scale", 300, "(no reply needed)\n\nThanks.")))
+        self.f.issue(CORE, 4, "core", **held(comment("stranger", 300)))
         for n in (1, 2, 3, 4):
             d.evaluate(CORE, n)
         self.assertEqual(self.descriptions("core"),
                          [f"comment on issue {CORE}#1 from scale: http://forge/org/{CORE}/issues/1#issuecomment-1"])
 
     def test_2_in_the_same_second_the_timelines_order_decides(self):
-        self.f.issue(CORE, 1, "core", events=[comment("core", 100, "Mine."), comment("scale", 100, cid=1)])
-        self.f.issue(CORE, 2, "core", events=[comment("scale", 100), comment("core", 100, "Answered.")])
+        self.f.issue(CORE, 1, "core", ["needs-human"], events=[comment("core", 100, "Mine."), comment("scale", 100, cid=1)])
+        self.f.issue(CORE, 2, "core", ["needs-human"], events=[comment("scale", 100), comment("core", 100, "Answered.")])
         d.evaluate(CORE, 1)
         d.evaluate(CORE, 2)
-        self.assertEqual(self.descriptions("core"),
-                         [f"comment on issue {CORE}#1 from scale: http://forge/org/{CORE}/issues/1#issuecomment-1"])
+        self.assertEqual(self.owing(), [("core", "reply")])
+        self.assertEqual(d.q("SELECT unit FROM obligations")[0]["unit"], f"{CORE}#1")
 
-    def test_2_the_newest_ask_is_the_version_so_a_burst_is_one_trigger(self):
-        # Held, so that its owner's rule 7 for its own issue stays out of it.
-        self.f.issue(CORE, 1, "core", ["blocked"], events=[comment("scale", 300), comment("scale", 200), comment("scale", 100)])
+    def test_2_the_newest_ask_is_the_one_owed_so_a_burst_is_one(self):
+        events = self.f.issue(CORE, 1, "core", ["needs-human"],
+                              events=[comment("scale", 300), comment("scale", 200), comment("scale", 100)])["events"]
         d.evaluate(CORE, 1)
+        self.assertEqual(self.queued("core"), ["reply"])
         self.handled()
+        events.append(comment("scale", 10))
         d.evaluate(CORE, 1)
-        self.assertEqual(self.queued("core"), [])
-        self.f.items[(CORE, 1)]["events"].append(comment("scale", 10))
-        d.evaluate(CORE, 1)
-        self.assertEqual(self.queued("core"), ["comment"])
+        self.assertEqual(self.queued("core"), ["reply"], "the newer one replaces it")
+        self.assertEqual(len(d.q("SELECT 1 FROM obligations")), 1)
 
     def test_2_not_answered_by_a_run_that_started_before_it_coordination_140(self):
-        # The human commented while the owner was mid-run on a review; the
-        # run's later comment and push answered the review, not the human.
-        self.f.issue(CORE, 1, "core", events=[comment("human", 300, "Follow the latest release."),
-                                              comment("core", 200, "Shortened the bullets.")])
+        self.f.issue(CORE, 1, "core", ["needs-human"],
+                     events=[comment("human", 300, "Follow the latest release."),
+                             comment("core", 200, "Shortened the bullets.")])
         run = d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?) RETURNING id",
                   d.now() - 360)[0]["id"]
         d.evaluate(CORE, 1)
-        self.assertEqual(self.queued("core"), ["comment"])
-        # Still owed once that run has ended, so the next run is woken for it.
+        self.assertEqual(self.owing(), [("core", "reply")])
         d.q("UPDATE runs SET ended=? WHERE id=?", d.now() - 150, run)
-        self.assertEqual(d.no_longer_owed(d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")), [])
-        # A run that started after the comment answers it.
-        self.handled()
         d.q("INSERT INTO runs (agent, triggers, claimed, ended) VALUES ('core', '[]', ?, ?)", d.now() - 100, d.now() - 40)
         self.f.items[(CORE, 1)]["events"].append(comment("core", 50, "Reworded to follow the latest release."))
         d.evaluate(CORE, 1)
-        self.assertEqual(d.no_longer_owed(d.q("SELECT id, key FROM triggers WHERE run_id=1")), [d.q("SELECT id FROM triggers WHERE run_id=1")[0]["id"]])
+        self.assertEqual(self.owing(), [])
 
     def test_2_reviews_that_ask_and_one_that_doesnt(self):
         self.f.pull(CORE, 7, "core", reviews=[
@@ -354,489 +575,81 @@ class OwnerRules(Case):
         self.assertIn(f"review on pull request {CORE}#8 by human (`forge reviews {CORE} 8`)", self.descriptions("core"))
         self.assertFalse([x for x in self.descriptions("core") if f"{CORE}#9" in x and "review" in x])
 
-    def test_3_ci_failed_on_its_head(self):
-        self.f.pull(CORE, 7, "core", events=[event("pull_scheduled_merge", "core", 3000)])
-        self.f.statuses["a" * 40] = ["failure"]
-        d.evaluate(CORE, 7)
-        self.assertEqual(self.queued("core"), ["ci-failed"])
-
-    def test_4_a_conflict_wakes_the_owner_but_merely_behind_doesnt(self):
-        self.f.pull(CORE, 7, "core", mergeable=False, events=[event("pull_scheduled_merge", "core", 3000)])
-        self.f.pull(CORE, 8, "core", mergeable=True, events=[event("pull_scheduled_merge", "core", 3000)])
-        d.evaluate(CORE, 7)
-        d.evaluate(CORE, 8)
-        self.assertEqual(self.descriptions("core"), [f"pull request {CORE}#7 conflicts with main"])
-
-    def test_5_no_merge_scheduled_scale_43(self):
-        self.f.pull(CORE, 7, "core", reviews=[
-            {"id": 1, "user": {"login": "conformance"}, "state": "APPROVED", "commit_id": "a" * 40,
-             "body": "Fine.", "submitted_at": at(100)}])
-        self.f.pull(CORE, 8, "core", events=[event("pull_scheduled_merge", "core", 3000)])
-        self.f.pull(CORE, 9, "core", events=[event("pull_scheduled_merge", "core", 3000),
-                                             event("pull_cancel_scheduled_merge", "core", 2000)])
-        self.f.pull(CORE, 10, "core", title="WIP: later")
-        for n in (7, 8, 9, 10):
-            d.evaluate(CORE, n)
-        self.assertEqual([x for x in self.descriptions("core") if "no merge scheduled" in x],
-                         [f"your pull request {CORE}#{n} has no merge scheduled, so it won't merge: schedule it "
-                          "(`forge pr automerge`), or close it if it's no longer wanted" for n in (7, 9)])
-
-    def test_5_not_while_its_owner_runs_viewport_5(self):
-        later = d.later
-        self.addCleanup(setattr, d, "later", later)
-        d.later = lambda fn, *args, delay=30: fn(*args)
-        self.f.pull(CORE, 7, "core")
-        self.f.pull(CORE, 8, "core")
-        run = self.running("core")
-        d.evaluate(CORE, 7)
-        self.assertEqual(self.queued("core"), [], "it may yet schedule it")
-        self.f.items[(CORE, 7)]["events"].append(event("pull_scheduled_merge", "core", 5))
-        d.end_run("core", run, {"outcome": "completed"})
-        self.assertEqual(self.descriptions("core"),
-                         [f"your pull request {CORE}#8 has no merge scheduled, so it won't merge: schedule it "
-                          "(`forge pr automerge`), or close it if it's no longer wanted"])
-
-    def test_25_no_ci_run_for_its_head_export_4(self):
-        self.f.pull(CORE, 4, "core", ci=None, events=[event("pull_push", "core", 3000),
-                                                      event("pull_scheduled_merge", "core", 3000)])
-        self.f.pull(CORE, 5, "core", sha="b" * 40, ci=None, events=[event("pull_push", "core", 60),
-                                                                    event("pull_scheduled_merge", "core", 60)])
-        d.evaluate(CORE, 4)
-        d.evaluate(CORE, 5)
-        due = d.q("SELECT key, not_before FROM triggers WHERE key LIKE 'no-ci:%' ORDER BY key")
-        self.assertEqual([r["key"] for r in due], [f"no-ci:{CORE}#4:{'a' * 12}", f"no-ci:{CORE}#5:{'b' * 12}"])
-        self.assertLess(due[0]["not_before"], d.now(), "pushed long ago")
-        self.assertGreater(due[1]["not_before"], d.now() + 400, "pushed a minute ago: CI may yet start")
-        self.assertEqual(self.descriptions("core")[0],
-                         f"CI has never run on your pull request {CORE}#4 at {'a' * 12}, so nothing reviews it: its "
-                         "branch probably lacks `.forgejo/workflows/`. Merge `origin/main` into it and push")
-        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'no-ci:%' ORDER BY key")
-        self.f.statuses["b" * 40] = ["pending"]
-        d._cache.clear()
-        self.assertEqual(d.no_longer_owed(rows), [rows[1]["id"]], "a claim drops it once CI has started")
-
-    def test_5_a_scheduled_merge_that_never_fired_scale_43(self):
-        """Approved by everyone requested and CI passed before the merge was
-        scheduled, so Forgejo never acted on the schedule."""
-        head, old = "a" * 40, "b" * 40
-
-        def requested(*who):
-            return [{**event("review_request", "core", 4000), "assignee": {"login": w}} for w in who]
-
-        def review(rid, who, ago, state="APPROVED", sha=head, dismissed=False):
-            return {"id": rid, "user": {"login": who}, "state": state, "commit_id": sha, "body": "",
-                    "submitted_at": at(ago), "dismissed": dismissed}
-
-        approvals = [review(1, "gatekeeper", 1700), review(2, "conformance", 1600), review(3, "coordinator", 1600)]
-        everyone = requested("gatekeeper", "conformance", "coordinator")
-        scheduled = [event("pull_scheduled_merge", "core", 1500)]
-        self.f.statuses[head] = ["success"]
-        # 7: ready 25 minutes ago. 8: scheduled only 5 minutes ago.
-        self.f.pull(CORE, 7, "core", events=everyone + scheduled, reviews=approvals)
-        self.f.pull(CORE, 8, "core", events=everyone + [event("pull_scheduled_merge", "core", 300)],
-                    reviews=approvals)
-        # 9: the coordinator's approval is of an older head.
-        self.f.pull(CORE, 9, "core", events=everyone + scheduled, reviews=approvals[:2] + [
-            review(3, "coordinator", 1600, sha=old)])
-        # 10: a request for changes still stands; 11: it was dismissed, then approved.
-        self.f.pull(CORE, 10, "core", events=everyone + scheduled, reviews=approvals + [
-            review(4, "human", 1600, "REQUEST_CHANGES")])
-        self.f.pull(CORE, 11, "core", events=everyone + scheduled, reviews=[
-            review(4, "conformance", 2000, "REQUEST_CHANGES", sha=old, dismissed=True)] + approvals)
-        # 12: CI still running on it.
-        self.f.pull(CORE, 12, "core", sha="c" * 40, events=everyone + scheduled, reviews=[
-            {**r, "commit_id": "c" * 40} for r in approvals])
-        self.f.statuses["c" * 40] = ["pending"]
-        for n in (7, 8, 9, 10, 11, 12):
-            d.evaluate(CORE, n)
-        stuck = [x for x in self.descriptions("core") if "hasn't gone through" in x]
-        self.assertEqual(stuck, [f"your pull request {CORE}#{n} has every approval it needs and CI passed, but its "
-                                 f"scheduled merge hasn't gone through: merge it now (`forge pr merge {n}`)"
-                                 for n in (7, 11)])
-        # Once per state: looked at again, it isn't queued again.
-        self.handled()
-        d.evaluate(CORE, 7)
-        self.assertNotIn("stuck-merge", self.queued("core"))
-
-    def test_6_merged_work_still_to_finish(self):
-        self.f.issue(CORE, 5, "scale", ["request", "accepted"])
-        self.f.pull(CORE, 7, "core", body="Refs org/inkproof-core#5", state="closed", merged=100)
-        d.evaluate(CORE, 5)
-        self.assertEqual(self.descriptions("core"),
-                         [f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release"])
-
-    def test_6_an_owners_own_issue_demos_22(self):
-        # Not a request, but finished as one: nothing else wakes it to label it.
-        self.f.issue(CORE, 5, "core")
-        self.f.issue(CORE, 6, "core", ["ready-for-release"])
-        self.f.issue(CORE, 8, "scale")  # someone else's, untriaged: rule 1's
-        self.f.pull(CORE, 7, "core", body="Refs #5\nRefs #6\nRefs #8", state="closed", merged=100)
-        for n in (5, 6, 8):
-            d.evaluate(CORE, n)
-        self.assertIn(f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release",
-                      self.descriptions("core"))
-        self.assertEqual([k for k in self.queued("core") if k == "merged"], ["merged"])
-        # The coordinator's own issues are its decisions and records, never released.
-        self.f.issue(COORD, 3, "coordinator")
-        self.f.pull(COORD, 4, "coordinator", body="Refs #3", state="closed", merged=100)
-        d.evaluate(COORD, 3)
-        self.assertNotIn("merged", self.queued("coordinator"))
-
-    def test_6_not_once_labelled_or_released(self):
-        self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
-        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
-                     events=[comment("gatekeeper", 50, "(no reply needed)\n\nReleased in v0.2.0: ...")])
-        self.f.pull(CORE, 7, "core", body="Refs #5\nRefs #6", state="closed", merged=100)
-        d.evaluate(CORE, 5)
-        d.evaluate(CORE, 6)
-        self.assertEqual(self.queued("core"), [])
-
-    def test_6_work_merged_after_its_release_web_20(self):
-        # Its requester found it short of its criteria at the release, and the
-        # owner's fix merged afterwards: nothing else would release it again.
-        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
-                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
-                             comment("scale", 4000, "Not verified yet: the README names the wrong function.")])
-        self.f.pull(CORE, 7, "core", body="Refs #6", state="closed", merged=6000)  # the released work
-        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)
-        d.evaluate(CORE, 6)
-        self.assertIn(f"your pull request {CORE}#8 merged after {CORE}#6 was released in v0.2.0: if it changes what "
-                      f"{CORE}#6 asked for, it needs ready-for-release again; if it only refers to it (an upgrade, "
-                      "a refactor), leave it to its requester", self.descriptions("core"))
-        self.assertNotIn("idle-request", self.queued("core"))  # 7 still ends at the release
-
-    def test_6_the_pull_request_it_waited_on_counts_gpu_59(self):
-        # Its requester held back on the released request for the owner's
-        # pull request, whose merge unblocked it in the same second: that
-        # merge is still work after the unblocking, to be released.
-        self.f.issue(CORE, 6, "scale", ["request", "accepted"],
-                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.2.0: ..."),
-                             comment("scale", 300, "I'll switch once it's released.\n\nBlocked-by: org/inkproof-core#8")])
-        self.f.pull(CORE, 8, "core", body="Refs #6", state="closed", merged=100)["closed_at"] = at(100)
-        d.evaluate(CORE, 6)
-        self.assertIn("merged", self.queued("core"))
-
-    def test_6_not_while_blocked_consumer_metrics_12(self):
-        self.f.issue(SCALE, 38, "coordinator", ["request"])
-        self.f.issue(CORE, 12, "coordinator", ["request", "accepted", "blocked"], body="Blocked-by: org/inkproof-scale#38")
-        self.f.pull(CORE, 15, "core", body="Refs #12", state="closed", merged=100)
-        d.evaluate(CORE, 12)
-        self.assertNotIn("merged", self.queued("core"))
-
-    def test_6_not_for_work_merged_before_it_was_unblocked_scale_38(self):
-        self.f.issue(CORE, 4, "coordinator", ["request"], state="closed", closed=1000)
-        self.f.issue(CORE, 38, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-core#4")
-        self.f.pull(CORE, 42, "core", body="Refs #38", state="closed", merged=2000)  # the part it could do
-        d.evaluate(CORE, 38)
-        self.assertEqual(self.queued("core"), ["unblocked"])
-
-    def test_7_an_owners_own_issue_demos_74(self):
-        # Filed for itself in the human's session: nothing else wakes it.
-        self.f.issue(CORE, 74, "core", created=600)
-        self.f.issue(CORE, 75, "core", ["blocked"], body="Blocked-by: org/inkproof-scale#93")
-        self.f.issue(SCALE, 93, "core", ["request", "new"])
-        self.f.issue(CORE, 76, "core")
-        self.f.pull(CORE, 77, "core", body="Refs #76")  # under way
-        for n in (74, 75, 76):
-            d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("core"),
-                         [f"your issue {CORE}#74 isn't blocked and has no pull request under way: work on it, or "
-                          "say on it what it waits for (a `Blocked-by:` line)"])
-        # The coordinator's own issues are its decisions and records.
-        self.f.issue(COORD, 3, "coordinator")
-        d.evaluate(COORD, 3)
-        self.assertNotIn("idle-request", self.queued("coordinator"))
-
-    def test_7_and_8_float_5_unblocked_then_left_alone(self):
-        self.f.issue(CORE, 2, "coordinator", ["request"], state="closed", closed=3000)
-        self.f.issue(CORE, 5, "coordinator", ["request", "accepted", "blocked"], created=9000,
-                     body="Blocked-by: org/inkproof-core#2",
-                     events=[label("accepted", True, 8000), label("blocked", True, 8000)])
-        d.evaluate(CORE, 5)
-        self.assertEqual(self.queued("core"), ["unblocked"])
-        self.assertIn(("DELETE", f"/repos/org/{CORE}/issues/5/labels/1", None), self.f.writes)
-        # Its run did other work and left it: once idle, one more nudge, and no more.
-        self.handled()
-        d.evaluate(CORE, 5)
-        self.assertEqual(self.queued("core"), ["idle-request"])
-        self.handled()
-        d.evaluate(CORE, 5)
-        self.assertEqual(self.queued("core"), [])
-
-    def test_7_after_a_merge_that_left_part_of_it_to_do_demo_3(self):
-        self.f.issue(CORE, 3, "coordinator", ["request", "accepted"], created=9000,
-                     events=[label("accepted", True, 8000)])
-        self.f.pull(CORE, 11, "core", body="Refs #3", state="closed", merged=2000)
-        d.evaluate(CORE, 3)
-        self.assertEqual(self.queued("core"), ["merged"])
-        self.handled()
-        # Its run left it open, with the rest still to do.
-        d.evaluate(CORE, 3)
-        self.assertEqual(self.queued("core"), ["idle-request"])
-        self.handled()
-        d.evaluate(CORE, 3)
-        self.assertEqual(self.queued("core"), [])
-
-    def test_6_part_of_counts_as_refs_demo_28(self):
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                     events=[label("accepted", True, 8000)])
-        self.f.pull(CORE, 28, "core", title="Tile build from real files (part of #2)",
-                    body="Part of #2, second step.", state="closed", merged=100)
-        self.f.pull(CORE, 29, "core", title="Decode in place (part of tentenths/inkproof-scale#2)",
-                    body="Prior art: none found.", state="closed", merged=50)
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.descriptions("core")[:1],
-                         [f"your pull request {CORE}#28 merged; it answers {CORE}#2, not yet labelled ready-for-release"])
-
-    def test_6_refs_in_the_middle_of_a_line_demo_18(self):
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                     events=[label("accepted", True, 8000)])
-        self.f.pull(CORE, 18, "core", title="Browser app",
-                    body="Not done yet for #2: performance gates. Refs org/inkproof-core#2.",
-                    state="closed", merged=100)
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.descriptions("core")[:1],
-                         [f"your pull request {CORE}#18 merged; it answers {CORE}#2, not yet labelled ready-for-release"])
-        # Only the references after it, not everything else on the line.
-        found = [r for m in d.REFS_INLINE.findall("Done. Refs #2, #3 and org/x#4. Not #5; prefs #6") for r in
-                 d.REF.findall(m)]
-        self.assertEqual([k for _, _, k in found], ["2", "3", "4"])
-
-    def test_7_as_soon_as_the_run_that_left_it_ends_demo_2(self):
-        # Its pull request merged as its run was ending: nothing else looks
-        # at the request again until the sweep.
-        later = d.later
-        self.addCleanup(setattr, d, "later", later)
-        d.later = lambda fn, *args, delay=30: fn(*args)
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                     events=[label("accepted", True, 8000)])
-        self.f.pull(CORE, 21, "core", body="Refs #2", state="closed", merged=100)
-        run = self.running("core")
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.queued("core"), ["merged"])
-        self.handled()
-        d.end_run("core", run, {"outcome": "completed"})
-        self.assertEqual(self.queued("core"), ["idle-request"])
-
-    def test_7_a_run_that_worked_on_it_and_stopped_short_demo_2(self):
-        accepted = [label("accepted", True, 8000)]
-        progress = lambda ago: comment("core", ago, "(no reply needed) Progress: half done.")
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000, events=accepted)
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.queued("core"), ["idle-request"])
-        self.handled()
-        # Its run worked on it, reported progress and ended with nothing merged.
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                     events=accepted + [progress(5000)])
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.descriptions("core"), [
-            f"your accepted request {CORE}#2 isn't finished: you last acted on it at {at(5000)}, and it has no "
-            "pull request under way. Carry on with it, or say on it what it waits for (a `Blocked-by:` line, "
-            "or `needs-human`)"])
-        self.handled()
-        # A run that looks and does nothing isn't woken again.
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.queued("core"), [])
-        # At most FOLLOW_UPS runs that act without merging anything for it.
-        for ago in (4000, 3000, 2000):
-            self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                         events=accepted + [progress(5000), progress(ago)])
-            d.evaluate(CORE, 2)
-            self.handled()
-        self.assertEqual(len(d.q("SELECT 1 FROM triggers WHERE key LIKE 'idle-request:%'")), 1 + d.FOLLOW_UPS)
-        # A merge for it starts the count again.
-        self.f.pull(CORE, 21, "core", body="Refs #2", state="closed", merged=1000)
-        d._cache.clear()
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], created=9000,
-                     events=accepted + [progress(500)])
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.queued("core"), ["merged"])
-        self.handled()
-        d.evaluate(CORE, 2)
-        self.assertEqual(self.queued("core"), ["idle-request"])
-
-    def test_7_not_while_the_owner_is_busy_or_a_pull_request_is_under_way(self):
-        self.f.issue(CORE, 5, "coordinator", ["request", "accepted"])
-        self.running("core")
-        d.evaluate(CORE, 5)
-        self.assertEqual(self.queued("core"), [])
-        d.q("UPDATE runs SET ended=?", d.now())
-        self.f.pull(CORE, 7, "core", body="Refs #5", events=[event("pull_scheduled_merge", "core", 3000)])
-        d.evaluate(CORE, 7)  # as its webhook would: the requests it refers to are evaluated again
-        self.assertEqual(self.queued("core"), [])
-
-    def test_8_consumer_metrics_12_waits_for_every_blocker(self):
-        self.f.issue(CORE, 51, "coordinator", ["request"], state="closed", closed=3000)
-        self.f.issue(SCALE, 38, "coordinator", ["request"])
-        self.f.issue(CORE, 12, "coordinator", ["request", "accepted"],
-                     events=[comment("core", 7000, "Blocked-by: org/inkproof-core#51\nBlocked-by: org/inkproof-scale#38")])
-        d.evaluate(CORE, 12)
-        self.assertEqual(self.queued("core"), [])
-        self.assertIn(("POST", f"/repos/org/{CORE}/issues/12/labels", {"labels": [1]}), self.f.writes)
-        # A release of Scale that isn't scale#38's wakes no one; scale#38's own release does.
-        self.f.items[(SCALE, 38)]["events"].append(
-            comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v0.5.3: ..."))
-        self.f.items[(CORE, 12)]["labels"].append({"name": "blocked"})
-        d.evaluate(CORE, 12)
-        self.assertEqual(self.descriptions("core"),
-                         [f"{SCALE}#38 was released in v0.5.3; {CORE}#12 is blocked on it"])
-
-    def test_8_a_line_may_name_a_pull_request_coordination_198(self):
-        # demos#19 waited for its owner's own pull request, which doesn't name it.
-        self.f.pull(CORE, 13, "core")
-        self.f.issue(CORE, 19, "scale", ["request", "accepted"],
-                     events=[comment("core", 7000, "Blocked-by: org/inkproof-core#13")])
-        d.evaluate(CORE, 19)
-        self.assertEqual(self.queued("core"), [])
-        self.assertIn(("POST", f"/repos/org/{CORE}/issues/19/labels", {"labels": [1]}), self.f.writes)
-        self.f.items[(CORE, 13)]["state"] = "closed"
-        self.f.items[(CORE, 13)]["pr"].update(state="closed", merged=True, merged_at=at(100))
-        self.f.items[(CORE, 19)]["labels"].append({"name": "blocked"})
-        d.evaluate(CORE, 19)
-        self.assertEqual(self.descriptions("core"), [f"pull request {CORE}#13 merged; {CORE}#19 is blocked on it"])
-
-    def test_8_closed_but_never_released_still_blocks_coordination_208(self):
-        # Its requester closed scene#62 before Scene released it.
-        self.f.issue(SCALE, 62, "core", ["request", "accepted", "ready-for-release"], state="closed", closed=3000)
-        self.f.issue(CORE, 57, "coordinator", ["request", "accepted", "blocked"],
-                     events=[comment("core", 7000, "Blocked-by: org/inkproof-scale#62")])
-        d.evaluate(CORE, 57)
-        self.assertEqual(self.queued("core"), [])
-        self.assertNotIn(("DELETE", f"/repos/org/{CORE}/issues/57/labels/1", None), self.f.writes)
-        # Released after all: that unblocks it.
-        self.f.items[(SCALE, 62)]["events"].append(
-            comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v0.22.0: ..."))
-        d.evaluate(CORE, 57)
-        self.assertEqual(self.descriptions("core"),
-                         [f"{SCALE}#62 was released in v0.22.0; {CORE}#57 is blocked on it"])
-
-    def test_8_a_requesters_own_line_on_its_released_request_wakes_it_scene_51(self):
-        self.f.pull(SCALE, 59, "scale", state="closed", merged=100)
-        self.f.issue(CORE, 51, "scale", ["request", "accepted"],
-                     events=[comment("gatekeeper", 5000, "(no reply needed)\n\nReleased in v0.18.0: ..."),
-                             comment("scale", 4000, "Not yet verified.\n\nBlocked-by: org/inkproof-scale#59")])
-        self.f.items[(SCALE, 59)]["state"] = "closed"
-        d.evaluate(CORE, 51)
-        self.assertNotIn("unblocked", self.queued("core"))
-        self.assertIn(f"pull request {SCALE}#59 merged; your request {CORE}#51, released and not yet verified, "
-                      "waits on it: verify it", self.descriptions("scale"))
-
-    def test_8_the_dispatchers_label_comes_off_with_its_last_line_demos_74(self):
-        # Its own issue, labelled by the dispatcher, whose lines are gone.
-        self.f.issue(CORE, 74, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="dispatcher")])
-        # The human's own label, with no lines, stays.
-        self.f.issue(CORE, 75, "core", ["blocked"], created=600, events=[label("blocked", True, 500, who="human")])
-        d.evaluate(CORE, 74)
-        d.evaluate(CORE, 75)
-        self.assertIn(("DELETE", f"/repos/org/{CORE}/issues/74/labels/1", None), self.f.writes)
-        self.assertNotIn(("DELETE", f"/repos/org/{CORE}/issues/75/labels/1", None), self.f.writes)
-        # And in the same evaluation, nothing holds #74 back any more (7).
-        self.assertEqual([x for x in self.descriptions("core") if "isn't blocked" in x],
-                         [f"your issue {CORE}#74 isn't blocked and has no pull request under way: work on it, or "
-                          "say on it what it waits for (a `Blocked-by:` line)"])
-
-    def test_8_the_humans_comment_on_an_upstream_issue(self):
-        self.f.issue(COORD, 9, "core", ["upstream"], events=[comment("human", 100, "Fixed in Lean 4.36.")])
-        self.f.issue(CORE, 3, "core", ["blocked"], created=5000, body="Blocked-by: org/inkproof-coordination#9")
-        d.evaluate(CORE, 3)
-        self.assertEqual(self.descriptions("core"),
-                         [f"human commented on upstream issue {COORD}#9; {CORE}#3 is blocked on it"])
-
-    def test_8_an_upstream_issue_an_agent_waits_on_is_blocking_web_2(self):
-        # web filed coordination#116 without `blocking` and marked its task
-        # blocked on it: nothing told the human, and the kit went quiet.
-        self.f.issue(COORD, 116, "core", ["upstream", "upstream:lasm"])
-        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-coordination#116")
-        d.evaluate(CORE, 2)
-        self.assertIn(("POST", f"/repos/org/{COORD}/issues/116/labels", {"labels": [3]}), self.f.writes)
-        # Once nothing open waits on it, it no longer waits on the human.
-        self.f.items[(COORD, 116)]["labels"].append({"name": "blocking"})
-        self.f.items[(CORE, 2)]["state"] = "closed"
-        self.f.writes.clear()
-        d.evaluate(CORE, 2)
-        self.assertEqual([w for w in self.f.writes if "/issues/116/" in w[1]],
-                         [("DELETE", f"/repos/org/{COORD}/issues/116/labels/3", None)])
-
-    def test_8_blocking_follows_the_lines_not_who_set_it(self):
-        # Kept by the sweep too: an upstream issue labelled `blocking` that
-        # nothing names loses it; an issue that isn't upstream never gets it.
-        self.f.issue(COORD, 9, "core", ["upstream", "blocking"])
-        self.f.issue(SCALE, 4, "scale", ["request"])
-        self.f.issue(CORE, 3, "core", ["request", "accepted"], body="Blocked-by: org/inkproof-scale#4")
-        d.sweep()
-        writes = [w for w in self.f.writes if "/labels" in w[1] and not w[1].endswith("/labels/1")
-                  and not (w[0] == "POST" and w[2] == {"labels": [1]})]
-        self.assertEqual(writes, [("DELETE", f"/repos/org/{COORD}/issues/9/labels/3", None)])
-
-    def test_9_ci_failing_on_main(self):
-        self.f.statuses["m" * 40] = ["failure"]
-        d.evaluate_repo(CORE)
-        self.assertEqual(self.queued("core"), ["main-failed"])
-
-
-class RequesterRules(Case):
-    def test_10_released_wakes_the_requester_to_verify(self):
-        self.f.issue(CORE, 9, "scale", ["request", "accepted"],
-                     events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.3: ...")])
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), ["released"])
-
-    def test_10_the_coordinators_own_release_dropped_once_it_verifies_gpu_57(self):
-        self.f.issue(CORE, 9, "coordinator", ["request"],
-                     events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.3: ...")])
-        self.f.issue(CORE, 10, "coordinator", ["request"],
-                     events=[comment("gatekeeper", 100, "(no reply needed)\n\nReleased in v1.2.4: ...")])
+    def test_26_the_humans_mention_wakes_that_agent_gpu_9(self):
+        asks = comment("human", 300, "@coordinator inkproof-core is at level 3; decide. cc @scale @core @stranger "
+                                     "(not mail@lasm.org)", cid=26)
+        self.f.pull(CORE, 9, "core", events=[asks, comment("scale", 200, "(no reply needed)\nSeen.")])
+        self.f.pull(CORE, 10, "core", sha="b" * 40, events=[comment("scale", 100, "@coordinator please look")])
         d.evaluate(CORE, 9)
         d.evaluate(CORE, 10)
-        self.assertEqual([k for k in self.queued("coordinator") if k == "released"], ["released", "released"])
-        # Its release run verified #9, as its role says, but not #10.
-        self.f.items[(CORE, 9)]["labels"].append({"name": "verified"})
-        d.q("UPDATE triggers SET created=?", d.now() - 3600)
-        self.assertEqual([t for t in d.claim("coordinator")["triggers"] if t.startswith("your request")],
-                         [f"your request {CORE}#10 was released in v1.2.4: upgrade to it, check its acceptance "
-                          "criteria, and verify it"])
+        self.assertEqual([o for o in self.owing() if o[1] == "mention"], [("coordinator", "mention")],
+                         "scale has acted since; core is the owner, whom any comment reaches; an agent's mention "
+                         "reaches no one")
+        self.assertIn(f"the human mentioned you on pull request {CORE}#9: "
+                      f"http://forge/org/{CORE}/issues/9#issuecomment-26", self.descriptions("coordinator"))
+        rows = d.q("SELECT id, key FROM triggers WHERE agent='coordinator' AND key LIKE 'owe:%'")
+        self.f.items[(CORE, 9)]["events"].append(comment("coordinator", 50, "(no reply needed)\nApproved."))
+        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "a claim drops it once it has acted")
 
-    def test_10_again_once_its_run_ends_without_a_word_gpu_59(self):
-        # The run woken for the release only upgraded (a pull request that
-        # refers to it), so the requester is woken again, once; a comment
-        # on the request (verifying, or what it waits for) answers it.
-        released = comment("gatekeeper", 3600, "(no reply needed)\n\nReleased in v1.2.3: ...")
-        self.f.issue(CORE, 9, "scale", ["request", "accepted"],
-                     events=[released, {"type": "pull_ref", "user": {"login": "scale"}, "created_at": at(1800)}])
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), ["released"])
-        run = d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('scale', '[]', ?) RETURNING id",
-                  d.now() - 2000)[0]["id"]
-        d.q("UPDATE triggers SET run_id=?", run)
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), [], "not while the run is under way")
-        d.q("UPDATE runs SET ended=? WHERE id=?", d.now() - 1000, run)
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), ["unanswered"])
-        d.q("DELETE FROM triggers WHERE key LIKE 'unanswered:%'")
-        self.f.issue(SCALE, 4, "scale")
-        self.f.items[(CORE, 9)]["events"].append(comment("scale", 500, "Blocked-by: org/inkproof-scale#4"))
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), [])
-
-    def test_10_still_unverified_a_day_later(self):
-        self.f.issue(CORE, 9, "scale", ["request"],
-                     events=[comment("gatekeeper", 90000, "(no reply needed)\n\nReleased in v1.2.3: ...")])
-        d.evaluate(CORE, 9)
-        self.assertEqual(self.queued("scale"), ["released", "unverified"])
-
-    def test_11_counter_proposed_or_rejected(self):
-        self.f.issue(CORE, 1, "scale", ["request", "counter-proposal"], events=[label("counter-proposal", True, 100)])
-        self.f.issue(CORE, 2, "scale", ["request"], state="closed", events=[event("close", "core", 100)])
-        self.f.issue(CORE, 3, "scale", ["request"], state="closed", events=[event("close", "scale", 100)])
-        self.f.issue(CORE, 4, "scale", ["request", "verified"], state="closed", events=[event("close", "core", 100)])
-        for n in (1, 2, 3, 4):
+    def test_26_the_owners_mention_wakes_its_requester_gpu_59(self):
+        self.f.issue(CORE, 9, "scale", ["request", "accepted"], events=[
+            comment("core", 300, "I can't reproduce it. @scale, can you attach the frame? @gpu might know too.", cid=59),
+            comment("core", 250, "(no reply needed)\n\n@scale, merged.")])
+        self.f.issue(CORE, 10, "scale", events=[comment("core", 300, "@scale, what's this?")])
+        self.f.issue(CORE, 11, "scale", ["request", "accepted"],
+                     events=[comment("core", 300, "@scale, the frame?"), comment("scale", 200, "Attached.")])
+        for n in (9, 10, 11):
             d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("scale"), [f"your request {CORE}#1 has a counter-proposal",
-                                                      f"your request {CORE}#2 was closed without being verified"])
+        self.assertEqual([o for o in self.owing() if o[1] == "mention"], [("scale", "mention")])
+        self.assertIn(f"core, its owner, mentioned you on issue {CORE}#9: "
+                      f"http://forge/org/{CORE}/issues/9#issuecomment-59", self.descriptions("scale"))
+
+    def test_30_waiting_on_holds_it_for_the_agent_it_names_gpu_59(self):
+        def waits(n, *events, author="scale", labels=("request", "accepted")):
+            self.f.issue(CORE, n, author, labels, events=events)
+            d.evaluate(CORE, n)
+            return self.state(f"{CORE}#{n}")
+        self.assertEqual(waits(1, comment("core", 300, "(no reply needed)\nI need your frame.\n\nWaiting-on: scale",
+                                          cid=31)), ("waiting", ["scale"]))
+        self.assertIn(f"issue {CORE}#1 (waiting): answer, or do what it waits for", self.descriptions("scale"))
+        # Answered: scale has acted since.
+        self.assertEqual(waits(2, comment("core", 300, "(no reply needed)\nWaiting-on: scale"),
+                               comment("scale", 200, "(no reply needed)\n\nAttached."))[0], "to do")
+        # A later line decides: none, the human (needs-human reaches them), or the writer itself.
+        self.assertEqual(waits(3, comment("core", 300, "(no reply needed)\nWaiting-on: scale"),
+                               comment("core", 200, "(no reply needed)\nWaiting-on: none"))[0], "to do")
+        self.assertEqual(waits(4, comment("core", 300, "(no reply needed)\nWaiting-on: human"))[0], "to do")
+        self.assertEqual(waits(5, comment("scale", 300, "(no reply needed)\n\nWaiting-on: scale"))[0], "to do")
+        self.assertEqual(waits(6, comment("stranger", 300, "Waiting-on: scale"))[0], "to do")
+        # On a closed request too, where the talk after its verification goes on: there, an ask.
+        self.f.issue(CORE, 9, "scale", ["request", "verified"], state="closed",
+                     events=[comment("coordinator", 300, "Fix your changelog first.\n\nWaiting-on: scale")])
+        d.evaluate(CORE, 9)
+        self.assertEqual(self.owing(f"{CORE}#9"), [("scale", "waiting")])
+
+    def test_26_the_supervisors_mention_reaches_the_owner_at_most_three_a_day(self):
+        self.addCleanup(d.AGENTS.pop, "process", None)
+        d.AGENTS["process"] = {"kind": "supervisor", "own": None}
+        self.addCleanup(setattr, d, "SUPERVISOR", d.SUPERVISOR)
+        d.SUPERVISOR = "process"
+        nudges = [comment("process", 500 - 10 * i, f"(no reply needed)\n\n@core Move this on ({i}).") for i in range(4)]
+        self.f.issue(CORE, 4, "core", ["needs-human"], events=nudges)
+        d.evaluate(CORE, 4)
+        self.assertEqual([r["what"] for r in d.q("SELECT what FROM obligations WHERE agent='core'")],
+                         [f"mention:{nudges[2]['id']}"],
+                         "one, for the newest of the three it may send that day; the fourth reaches no one")
+
+    def test_answered_by_acting_not_by_time(self):
+        self.f.issue(CORE, 1, "core", ["needs-human"], events=[comment("human", 300, "Which?")])
+        d.evaluate(CORE, 1)
+        self.f.items[(CORE, 1)]["events"].append(label("priority", True, 100, who="core"))
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.owing(), [], "any action of the owner's there answers it")
 
 
-class CoordinatorRules(Case):
+class Notices(Case):
+    """Something to look at once: never what work waits on."""
+
     def test_12_a_request_filed(self):
         self.f.issue(CORE, 1, "scale", ["request", "new"])
         self.f.issue(CORE, 2, "coordinator", ["request", "new"])
@@ -844,6 +657,13 @@ class CoordinatorRules(Case):
         d.evaluate(CORE, 2)
         self.assertEqual([x for x in self.descriptions("coordinator") if x.startswith("request filed")],
                          [f"request filed: {CORE}#1"])
+
+    def test_once_per_version(self):
+        self.f.issue(CORE, 1, "scale", ["request", "new"])
+        d.evaluate(CORE, 1)
+        self.handled()
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.queued("coordinator"), [])
 
     def test_13_a_pull_request_opened_is_held_until_ci_finishes(self):
         self.f.pull(CORE, 7, "core", created=60, events=[event("pull_scheduled_merge", "core", 50)])
@@ -862,159 +682,24 @@ class CoordinatorRules(Case):
         for n in (7, 8, 9):
             self.f.statuses["a" * 40] = ["success"]
             d.evaluate(CORE, n)
-        self.assertEqual(self.descriptions("coordinator"), [f"pull request opened: {CORE}#9"])
+        self.assertEqual([x for x in self.descriptions("coordinator") if "opened" in x],
+                         [f"pull request opened: {CORE}#9"])
 
     def test_13_a_changelog_only_pull_request_that_grows(self):
         self.f.pull(CORE, 8, "core", files=("CHANGELOG.md",), ci="success")
         d.evaluate(CORE, 8)
-        self.assertEqual(self.queued("coordinator"), [])
+        self.assertNotIn("pr-opened", self.queued("coordinator"))
         self.f.items[(CORE, 8)]["files"].append("Inkproof/Core.lean")
         d.evaluate(CORE, 8)
-        self.assertEqual(self.queued("coordinator"), ["pr-opened"])
+        self.assertIn("pr-opened", self.queued("coordinator"))
 
-    def test_14_its_review_once_ci_passed_and_until_it_approves(self):
-        self.f.pull(CORE, 7, "core", requested=["coordinator"], events=[event("pull_scheduled_merge", "core", 50)])
-        self.f.statuses["a" * 40] = ["pending"]
-        d.evaluate(CORE, 7)
-        self.assertNotIn("review-requested", self.queued("coordinator"))
-        self.f.statuses["a" * 40] = ["success"]
-        d.evaluate(CORE, 7)
-        self.assertIn("review-requested", self.queued("coordinator"))
-        d.q("DELETE FROM triggers")
-        self.f.items[(CORE, 7)]["reviews"].append({"id": 1, "user": {"login": "coordinator"}, "state": "APPROVED",
-                                                   "commit_id": "a" * 40, "submitted_at": at(10)})
-        d.evaluate(CORE, 7)
-        self.assertNotIn("review-requested", self.queued("coordinator"))
-
-    def test_14_says_whether_its_review_is_the_one_needed_gpu_9(self):
-        self.f.codeowners[SCALE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
-        for repo, owner in ((SCALE, "scale"), (CORE, "core")):  # Core has no CODEOWNERS on main
-            self.f.pull(repo, 9, owner, requested=["coordinator"], ci="success")
-            d.evaluate(repo, 9)
-        level3, below = [r["description"] for r in d.q(
-            "SELECT description FROM triggers WHERE key LIKE 'review-requested:%' ORDER BY key DESC")]
-        self.assertIn(f"{SCALE} is at level 3: CODEOWNERS on main gives `API.lock` to you, so this pull request "
-                      "waits for your review", level3)
-        self.assertIn("a comment alone leaves it waiting", level3)
-        self.assertIn(f"{CORE} is below level 3, so the human approves its `API.lock`", below)
-
-    def test_14_after_a_push_dismissed_its_approval_web_8(self):
-        # Forgejo stops listing it as requested once it reviews; the push
-        # dismissed its approval and requested no one again.
-        self.f.pull(SCALE, 8, "scale", sha="b" * 40, ci="success", events=[
-            event("pull_push", "scale", 3000),
-            {"type": "review_request", "user": {"login": "scale"}, "assignee": {"login": "coordinator"},
-             "created_at": at(3000)},
-            event("pull_push", "scale", 1000)],
-            reviews=[{"id": 1, "user": {"login": "coordinator"}, "state": "APPROVED", "commit_id": "a" * 40,
-                      "submitted_at": at(2000), "dismissed": True}])
-        d.evaluate(SCALE, 8)
-        self.assertIn("review-requested", self.queued("coordinator"))
-
-    def test_15_consumer_metrics_13_fixed_with_the_label_left_on(self):
-        self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
-                     events=[label("ready-for-release", True, 4000), comment("coordinator", 3900, "Refused: ...")])
-        self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(2000)}
-        d.evaluate(CORE, 13)
-        self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
-                         [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has finished "
-                          f"since you last looked at it. {BELOW_RELEASE}"])
-
-    def test_29_closed_while_ready_for_release_coordination_208(self):
-        self.f.issue(SCALE, 62, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
-                     events=[label("ready-for-release", True, 4000, who="scale"), event("close", "demos", 100)])
-        # Released, then closed by its requester: as it should be.
-        self.f.issue(SCALE, 63, "demos", ["request", "accepted", "ready-for-release"], state="closed", closed=100,
-                     events=[comment("gatekeeper", 200, "(no reply needed)\n\nReleased in v0.22.0: ..."),
-                             event("close", "demos", 100)])
-        d.evaluate(SCALE, 62)
-        d.evaluate(SCALE, 63)
-        self.assertEqual([x for x in self.descriptions("coordinator") if "closed" in x],
-                         [f"{SCALE}#62 was closed by demos while labelled ready-for-release, and hasn't been "
-                          "released: reopen it and release it, or, if its work truly isn't wanted, take the label "
-                          "off and say why on it"])
-
-    def test_15_not_once_it_has_looked(self):
-        self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
-                     events=[label("ready-for-release", True, 4000), comment("coordinator", 1000, "Not yet.")])
-        self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(2000)}
-        d.evaluate(CORE, 13)
-        self.assertNotIn("rfr", self.queued("coordinator"))
-
-    def test_15_scale_38_refused_while_mains_ci_ran_then_it_passed(self):
-        """The coordinator looked while CI on main was running (the gatekeeper
-        refused), and main didn't change after: CI finishing is the change."""
-        self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"],
-                     events=[label("ready-for-release", True, 400, "core"),
-                             comment("coordinator", 300, "The gatekeeper declined: CI on main is running.")])
-        self.f.mains[CORE] = {"id": "n" * 40, "timestamp": at(420)}
-        self.f.statuses["n" * 40] = [("running", 410)]
-        d.evaluate(CORE, 13)
-        self.assertNotIn("rfr", self.queued("coordinator"))
-        self.f.statuses["n" * 40] = [("failure", 100)]
-        d._cache.clear()
-        d.evaluate(CORE, 13)
-        self.assertNotIn("rfr", self.queued("coordinator"))
-        self.f.statuses["n" * 40] = [("success", 100)]
-        d._cache.clear()
-        d.evaluate(CORE, 13)
-        self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
-                         [f"{CORE}#13 is still labelled ready-for-release, and main has changed or its CI has "
-                          f"finished since you last looked at it. {BELOW_RELEASE}"])
-
-    def test_15_not_while_mains_ci_runs(self):
-        self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"],
-                     events=[label("ready-for-release", True, 400, "core")])
-        self.f.statuses["m" * 40] = [("running", 410)]
-        d.evaluate(CORE, 13)
-        self.assertNotIn("rfr", self.queued("coordinator"))
-        self.f.statuses["m" * 40] = [("success", 100)]
-        d._cache.clear()
-        d.evaluate(CORE, 13)
-        self.assertEqual([x for x in self.descriptions("coordinator") if "ready-for-release" in x],
-                         [f"ready-for-release added to issue {CORE}#13. {BELOW_RELEASE}"])
-
-    def test_15_says_who_releases_gpu_27(self):
-        self.f.codeowners[SCALE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
-        for repo, owner in ((SCALE, "scale"), (CORE, "core")):  # Core has no CODEOWNERS on main
-            self.f.issue(repo, 13, owner, ["request", "ready-for-release"],
-                         events=[label("ready-for-release", True, 400, owner)])
-            d.evaluate(repo, 13)
-        self.assertEqual(sorted(x for x in self.descriptions("coordinator") if "ready-for-release" in x),
-                         [f"ready-for-release added to issue {CORE}#13. {BELOW_RELEASE}",
-                          f"ready-for-release added to issue {SCALE}#13. {SCALE} is at level 3: CODEOWNERS on main "
-                          "gives `API.lock` to you, so you release it with `forge release`"])
-
-    def test_27_a_release_overtakes_its_decision_gpu_27(self):
-        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000,
-                     events=[label("needs-human", True, 5000, "coordinator"), comment("human", 100, "Go ahead")])
-        self.f.release(CORE, "v0.6.0", 9000)  # before the decision
-        d.evaluate(CORE, 27)
-        self.assertNotIn("overtaken", self.queued("coordinator"))
-        self.f.release(CORE, "v0.6.1", 3000)
-        self.f.release(CORE, "v0.6.2", 2000, draft=True)
-        d._cache.clear()
-        d.evaluate(CORE, 27)
-        self.assertEqual([x for x in self.descriptions("coordinator") if "released" in x],
-                         [f"{CORE} released v0.6.1 after your decision {CORE}#27 asked the human to release it: "
-                          "close the decision if that release covers it, or update it for what's left"])
-
-    def test_27_not_once_it_has_looked_nor_on_other_issues(self):
-        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000,
-                     events=[comment("coordinator", 1000, "Updated for v0.6.2.")])
-        self.f.issue(CORE, 28, "coordinator", ["needs-human"], title="Release notes", created=5000)
-        self.f.issue(CORE, 29, "core", ["needs-human"], title=f"Release {CORE}", created=5000)
-        self.f.release(CORE, "v0.6.1", 3000)
-        for n in (27, 28, 29):
+    def test_11_rejected(self):
+        self.f.issue(CORE, 2, "scale", ["request"], state="closed", events=[event("close", "core", 100)])
+        self.f.issue(CORE, 3, "scale", ["request"], state="closed", events=[event("close", "scale", 100)])
+        self.f.issue(CORE, 4, "scale", ["request", "verified"], state="closed", events=[event("close", "core", 100)])
+        for n in (2, 3, 4):
             d.evaluate(CORE, n)
-        self.assertNotIn("overtaken", self.queued("coordinator"))
-
-    def test_27_a_release_published_evaluates_the_decision(self):
-        self.f.issue(CORE, 27, "coordinator", ["needs-human"], title=f"Release {CORE}", created=5000)
-        self.f.release(CORE, "v0.6.1", 10)
-        d.handle("release", {"action": "published", "repository": {"name": CORE, "owner": {"login": "org"}},
-                             "sender": {"login": "gatekeeper"}, "release": {"tag_name": "v0.6.1"}})
-        self.assertEqual(self.queued("coordinator"), ["overtaken"])
+        self.assertEqual(self.descriptions("scale"), [f"your request {CORE}#2 was closed without being verified"])
 
     def test_16_needs_human_added_but_not_once_refused(self):
         self.f.issue(CORE, 4, "core", ["needs-human"], events=[label("needs-human", True, 100)])
@@ -1033,385 +718,469 @@ class CoordinatorRules(Case):
         self.assertEqual([x for x in self.descriptions("coordinator") if "needs-human" in x],
                          [f"needs-human added to issue {COORD}#120"])
 
-    def test_17_a_milestone_with_nothing_left_open(self):
-        self.f.milestones[CORE] = [{"id": 3, "title": "Float library", "open_issues": 0, "closed_issues": 4},
-                                   {"id": 4, "title": "Next", "open_issues": 0, "closed_issues": 0}]
-        d.evaluate_repo(CORE)
-        self.assertEqual(self.descriptions("coordinator"),
-                         [f"the last open issue in milestone Float library was closed, on every repository it "
-                          f"spans ({CORE})"])
+    def test_8_the_humans_comment_on_an_upstream_issue(self):
+        self.f.issue(COORD, 9, "core", ["upstream"], events=[comment("human", 100, "Fixed in Lean 4.36.")])
+        self.f.issue(CORE, 3, "core", ["blocked"], created=5000, body="Blocked-by: org/inkproof-coordination#9")
+        d.evaluate(CORE, 3)
+        self.assertEqual(self.descriptions("core"),
+                         [f"human commented on upstream issue {COORD}#9; {CORE}#3 is blocked on it"])
 
-    def test_17_once_per_milestone_when_every_namesake_is_done_coordination_107(self):
-        def ms(i, open_, closed, state="open"):
-            return {"id": i, "title": "Milestone 5", "state": state, "open_issues": open_, "closed_issues": closed,
-                    "created_at": at(1000)}
-        self.f.milestones[SCALE] = [ms(7, 0, 1)]
-        self.f.milestones[CORE] = [ms(8, 2, 1)]
-        self.f.milestones[COORD] = [ms(6, 0, 0)]  # an empty namesake counts neither way
-        d.evaluate_repo(SCALE)
-        self.assertEqual(self.queued("coordinator"), [], "Core's namesake still has open issues")
-        self.f.milestones[CORE] = [ms(8, 0, 3)]
-        for repo in (SCALE, CORE, COORD):
-            d.evaluate_repo(repo)
-        self.assertEqual(d.q("SELECT key FROM triggers WHERE key LIKE 'milestone-done:%'")[0]["key"],
-                         "milestone-done:Milestone 5:8")
-        self.assertEqual(self.queued("coordinator").count("milestone-done"), 1, "once, from whichever repository")
+    def test_8_an_upstream_issue_an_agent_waits_on_is_blocking_web_2(self):
+        self.f.issue(COORD, 116, "core", ["upstream", "upstream:lasm"])
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-coordination#116")
+        d.evaluate(CORE, 2)
+        self.assertIn(("POST", f"/repos/org/{COORD}/issues/116/labels", {"labels": [3]}), self.f.writes)
+        self.f.items[(COORD, 116)]["labels"].append({"name": "blocking"})
+        self.f.items[(CORE, 2)]["state"] = "closed"
+        self.f.writes.clear()
+        d.evaluate(CORE, 2)
+        self.assertEqual([w for w in self.f.writes if "/issues/116/" in w[1]],
+                         [("DELETE", f"/repos/org/{COORD}/issues/116/labels/3", None)])
 
-    def test_23_no_milestone_with_open_work_review_follow_ups_5(self):
-        def ms(i, title, state, created, open_=0, closed_issues=2, closed=None):
-            return {"id": i, "title": title, "state": state, "open_issues": open_, "closed_issues": closed_issues,
-                    "created_at": at(created), "updated_at": at(closed if closed is not None else 100),
-                    "closed_at": at(closed) if closed is not None else None}
-        self.f.milestones[CORE] = [ms(1, "Milestone 2", "closed", 99000, closed=90000),
-                                   ms(3, "Follow-ups", "open", 3000, open_=1, closed_issues=1)]
-        self.f.milestones[COORD] = [ms(2, "Milestone 5", "closed", 9000, closed=6000),
-                                    ms(4, "Milestone 5", "open", 2000, closed_issues=0)]  # an empty duplicate
-        d.evaluate_repo(COORD)
-        self.assertEqual(self.queued("coordinator"), [], "Core's follow-ups still have open work")
-        # Its last issue closes; the milestone is left open.
-        self.f.milestones[CORE][1] = ms(3, "Follow-ups", "open", 3000, closed_issues=2)
-        run = self.running("coordinator")
-        d.evaluate_repo(COORD)
-        self.assertEqual(self.queued("coordinator"), [], "not while it runs: it may be drafting the next one")
-        d.end_run("coordinator", run, {"outcome": "completed"})
-        d.evaluate_repo(COORD)
-        self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL")[0]["key"], f"next-milestone:{CORE}:3")
-        self.assertIn("close out any milestone left open", self.descriptions("coordinator")[0])
-        self.handled()
-        # Closing what was left open, the empty duplicate included, doesn't wake it again.
-        self.f.milestones[CORE][1] = ms(3, "Follow-ups", "closed", 3000, closed=50)
-        self.f.milestones[COORD][1] = ms(4, "Milestone 5", "closed", 2000, closed_issues=0, closed=40)
-        d.evaluate_repo(COORD)
-        self.assertEqual(self.queued("coordinator"), [], "once per milestone finished")
-        # The next milestone's work, once done, is due in its own right.
-        self.f.milestones[COORD].append(ms(5, "Milestone 6", "open", 30, closed_issues=3))
-        d.evaluate_repo(COORD)
-        self.handled()  # rule 17 for it comes first; 23 waits until the coordinator has nothing queued
-        d.evaluate_repo(COORD)
-        self.assertIn(f"next-milestone:{COORD}:5", [r["key"] for r in d.q("SELECT key FROM triggers WHERE run_id IS NULL")])
+    def test_8_blocking_follows_the_lines_not_who_set_it(self):
+        self.f.issue(COORD, 9, "core", ["upstream", "blocking"])
+        self.f.issue(SCALE, 4, "scale", ["request"])
+        self.f.issue(CORE, 3, "core", ["request", "accepted"], body="Blocked-by: org/inkproof-scale#4")
+        d.sweep()
+        writes = [w for w in self.f.writes if "/labels" in w[1] and not w[1].endswith("/labels/1")
+                  and not (w[0] == "POST" and w[2] == {"labels": [1]})]
+        self.assertEqual(writes, [("DELETE", f"/repos/org/{COORD}/issues/9/labels/3", None)])
+
+    def test_22_a_blocking_lasm_issue(self):
+        self.f.issue(COORD, 31, "core", ["upstream", "upstream:lasm", "blocking"])
+        d.evaluate(COORD, 31)
+        self.assertEqual(self.queued("lasm"), ["lasm-blocking"])
+        self.assertEqual(self.state(f"{COORD}#31"), ("upstream", ["world"]))
+
+    def test_28_the_owner_is_told_when_someone_else_makes_it_a_priority(self):
+        self.f.issue(CORE, 2, "scale", ["request", "accepted", "priority"],
+                     events=[label("priority", True, 100, who="human")])
+        self.f.issue(CORE, 3, "scale", ["request", "accepted", "priority"],
+                     events=[label("priority", True, 100, who="core")])  # its own doing
+        d.evaluate(CORE, 2)
+        d.evaluate(CORE, 3)
+        self.assertEqual([x for x in self.descriptions("core") if "priority" in x],
+                         [f"{CORE}#2 is now a priority: it comes before anything new (Protocol: Priority)"])
+
+    def test_18_a_release_the_coordinator_didnt_ask_for(self):
+        for by in ("gatekeeper", "human"):
+            d.handle("release", {"action": "published", "repository": {"name": SCALE, "owner": {"login": "org"}},
+                                 "sender": {"login": by}, "release": {"tag_name": f"v1.0.{len(by)}"}})
+        self.assertEqual(self.descriptions("coordinator"), [f"{SCALE} released v1.0.5"])
 
 
-class ReviewerRules(Case):
-    def conf(self):
-        return d.q("SELECT not_before FROM triggers WHERE agent='conformance' AND key LIKE 'conf:%' "
-                   "AND run_id IS NULL")
+class PullRequests(Case):
+    def pr(self, n=7, **kw):
+        kw.setdefault("events", [event("pull_scheduled_merge", "core", 3000)])
+        kw.setdefault("reviews", [{"id": n, "user": {"login": "conformance"}, "state": "APPROVED",
+                                   "commit_id": kw.get("sha", "a" * 40), "submitted_at": at(100)}])
+        kw.setdefault("ci", "success")
+        self.f.pull(CORE, n, "core", **kw)
+        d.evaluate(CORE, n)
+        return self.state(f"{CORE}#{n}")
 
-    def test_19_a_passing_head_from_an_idle_agent_at_once(self):
-        self.f.pull(CORE, 7, "core", events=[event("pull_scheduled_merge", "core", 50)])
-        self.f.statuses["a" * 40] = ["success"]
-        d.evaluate(CORE, 7)
-        self.assertIsNone(self.conf()[0]["not_before"])
+    def test_what_its_author_must_fix(self):
+        self.assertEqual(self.pr(1, ci="failure"), ("CI failing", ["core"]))
+        self.assertEqual(self.pr(2, sha="b" * 40, mergeable=False), ("conflicting", ["core"]))
+        self.assertEqual(self.pr(3, sha="c" * 40, title="WIP: later"), ("in draft", ["core"]))
+        self.assertEqual(self.pr(4, sha="d" * 40, reviews=[
+            {"id": 4, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "d" * 40,
+             "submitted_at": at(100)}]), ("changes requested", ["core"]))
 
-    def test_19_a_running_author_settles_first_and_its_run_ending_releases_it(self):
-        self.f.pull(CORE, 7, "core", events=[event("pull_push", "core", 30), event("pull_scheduled_merge", "core", 50)])
-        self.f.statuses["a" * 40] = ["success"]
+    def test_ci_running_is_a_timer_until_it_is_late(self):
+        self.f.statuses["a" * 40] = [("running", 600)]
+        self.assertEqual(self.pr(7, ci=None)[0], "CI running")
+        self.f.statuses["b" * 40] = [("running", 4000)]
+        self.assertEqual(self.pr(8, sha="b" * 40, ci=None, events=[event("pull_push", "core", 4000),
+                                                                   event("pull_scheduled_merge", "core", 4000)]),
+                         ("CI stuck", ["core"]))
+
+    def test_25_no_ci_run_for_its_head_export_4(self):
+        self.assertEqual(self.pr(4, ci=None, events=[event("pull_push", "core", 3000)])[0], "no CI")
+        self.assertEqual(self.pr(5, sha="b" * 40, ci=None, events=[event("pull_push", "core", 60)])[0], "CI running",
+                         "pushed a minute ago: CI may yet start")
+        self.assertIn("Merge `origin/main` into it and push", self.descriptions("core")[0])
+
+    def test_19_conformance_reviews_a_passing_head_once_it_has_settled(self):
+        self.assertEqual(self.pr(7, reviews=[]), ("in review", ["conformance"]))
         run = self.running("core")
-        d.evaluate(CORE, 7)
-        self.assertGreater(self.conf()[0]["not_before"], d.now() + 500)
+        self.assertEqual(self.pr(8, sha="b" * 40, reviews=[], events=[event("pull_push", "core", 30)]),
+                         ("settling", ["timer"]))
+        # Its author's run ends: the head has settled.
+        later = d.later
+        self.addCleanup(setattr, d, "later", later)
+        d.later = lambda fn, *args, delay=30: fn(*args)
         d.end_run("core", run, {"outcome": "completed"})
-        self.assertIsNone(self.conf()[0]["not_before"])
+        self.assertEqual(self.state(f"{CORE}#8"), ("in review", ["conformance"]))
 
-    def test_19_not_before_ci_passes_nor_once_reviewed(self):
-        self.f.pull(CORE, 7, "core")
-        self.f.statuses["a" * 40] = ["pending"]
-        self.f.pull(CORE, 8, "core", sha="b" * 40, reviews=[
-            {"id": 1, "user": {"login": "conformance"}, "state": "APPROVED", "commit_id": "b" * 40,
-             "submitted_at": at(10)}])
-        self.f.statuses["b" * 40] = ["success"]
-        d.evaluate(CORE, 7)
-        d.evaluate(CORE, 8)
-        self.assertEqual(self.conf(), [])
+    def test_14_the_coordinators_review_once_ci_passed(self):
+        self.f.codeowners[SCALE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
+        for repo, owner in ((SCALE, "scale"), (CORE, "core")):  # Core has no CODEOWNERS on main
+            self.f.pull(repo, 9, owner, requested=["coordinator"], ci="success",
+                        events=[event("pull_scheduled_merge", owner, 50)],
+                        reviews=[{"id": 9, "user": {"login": "conformance"}, "state": "APPROVED",
+                                  "commit_id": "a" * 40, "submitted_at": at(100)}])
+            d.evaluate(repo, 9)
+        self.assertEqual(self.state(f"{SCALE}#9"), ("in review", ["coordinator"]))
+        level3, below = sorted((x for x in self.descriptions("coordinator") if "in review" in x),
+                               key=lambda x: SCALE not in x)
+        self.assertIn(f"{SCALE} is at level 3: CODEOWNERS on main gives `API.lock` to you", level3)
+        self.assertIn("a comment alone leaves it waiting", level3)
+        self.assertIn(f"{CORE} is below level 3, so the human approves its `API.lock`", below)
+
+    def test_14_after_a_push_dismissed_its_approval_web_8(self):
+        self.f.pull(SCALE, 8, "scale", sha="b" * 40, ci="success", events=[
+            event("pull_push", "scale", 3000),
+            {"type": "review_request", "user": {"login": "scale"}, "assignee": {"login": "coordinator"},
+             "created_at": at(3000)},
+            event("pull_push", "scale", 1000)],
+            reviews=[{"id": 1, "user": {"login": "coordinator"}, "state": "APPROVED", "commit_id": "a" * 40,
+                      "submitted_at": at(2000), "dismissed": True}])
+        d.evaluate(SCALE, 8)
+        self.assertIn("coordinator", self.state(f"{SCALE}#8")[1])
 
     def test_20_the_author_replied_to_its_request_for_changes(self):
-        self.f.pull(CORE, 7, "core", events=[comment("core", 50, "I keep it because ...")], reviews=[
-            {"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "a" * 40,
-             "submitted_at": at(100)}])
-        d.evaluate(CORE, 7)
-        self.assertIn("conf-reply", self.queued("conformance"))
+        changes = [{"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "a" * 40,
+                    "submitted_at": at(100)}]
+        self.assertEqual(self.pr(7, reviews=changes, events=[comment("core", 50, "I keep it because ...")]),
+                         ("author replied", ["conformance"]))
 
     def test_20_not_while_the_pull_request_is_blocked_demo_35(self):
-        # The author agreed and will fix it in another pull request first:
-        # the head changes before there is anything to review again.
         self.f.issue(CORE, 37, "core")
-        self.f.pull(CORE, 35, "core", ["blocked"], events=[
+        changes = [{"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "a" * 40,
+                    "submitted_at": at(100)}]
+        self.assertEqual(self.pr(35, labels=["blocked"], reviews=changes, events=[
             comment("core", 50, "#37 replaces the gate; I'll merge main in once it lands.\n\n"
-                                "Blocked-by: org/inkproof-core#37")], reviews=[
-            {"id": 1, "user": {"login": "conformance"}, "state": "REQUEST_CHANGES", "commit_id": "a" * 40,
+                                "Blocked-by: org/inkproof-core#37")]), ("blocked", ["unit:blockers"]))
+
+    def test_5_its_merge_to_schedule_once_nothing_else_stands_in_its_way_scale_43(self):
+        self.assertEqual(self.pr(7, events=[]), ("unscheduled", ["core"]))
+        self.assertEqual(self.descriptions("core"),
+                         [f"pull request {CORE}#7 (unscheduled): schedule its merge (`forge pr automerge`), or "
+                          "close it if it's no longer wanted"])
+        run = self.running("core")
+        self.assertEqual(self.pr(8, sha="b" * 40, events=[]), ("unscheduled", ["core"]))
+        self.assertEqual(len(self.queued("core")), 1, "quiet: not while its owner runs (viewport#5)")
+        d.q("UPDATE runs SET ended=? WHERE id=?", d.now(), run)
+
+    def test_5_a_scheduled_merge_that_never_fired_scale_43(self):
+        head = "a" * 40
+        approvals = [{"id": i, "user": {"login": w}, "state": "APPROVED", "commit_id": head, "body": "",
+                      "submitted_at": at(1600)} for i, w in ((1, "gatekeeper"), (2, "conformance"))]
+        everyone = [{**event("review_request", "core", 4000), "assignee": {"login": w}}
+                    for w in ("gatekeeper", "conformance")]
+        self.assertEqual(self.pr(7, events=everyone + [event("pull_scheduled_merge", "core", 1500)],
+                                 reviews=approvals), ("stuck", ["core"]))
+        self.assertEqual(self.pr(8, sha="a" * 40, events=everyone + [event("pull_scheduled_merge", "core", 300)],
+                                 reviews=approvals), ("merging", ["timer"]))
+
+    def test_the_humans_part_is_the_humans(self):
+        self.f.pull(CORE, 7, "human", ci="success", reviews=[
+            {"id": 1, "user": {"login": "conformance"}, "state": "APPROVED", "commit_id": "a" * 40,
              "submitted_at": at(100)}])
-        d.evaluate(CORE, 35)
-        self.assertNotIn("conf-reply", self.queued("conformance"))
+        d.evaluate(CORE, 7)
+        self.assertEqual(self.state(f"{CORE}#7"), ("unscheduled", ["human"]))
+        self.assertEqual(self.owing(f"{CORE}#7"), [])
 
-    def test_21_and_22_milestone_reviews_and_blocking_lasm_issues(self):
-        self.f.issue(COORD, 30, "coordinator", ["milestone-review"])
-        self.f.issue(COORD, 31, "core", ["upstream", "upstream:lasm", "blocking"])
-        d.evaluate(COORD, 30)
-        d.evaluate(COORD, 31)
-        self.assertEqual(self.queued("architecture"), ["milestone"])
-        self.assertEqual(self.queued("lasm"), ["milestone", "lasm-blocking"])
 
-    def test_24_every_review_reported_on_an_open_milestone_issue_coordination_82(self):
-        events = [label("milestone-review", True, 600, "coordinator"),
-                  comment("lasm", 500, "(no reply needed)\nNo findings.")]
-        events = self.f.issue(COORD, 82, "coordinator", ["milestone-review"], events=events)["events"]
-        d.evaluate(COORD, 82)
-        self.assertNotIn("reviewed", self.queued("coordinator"), "architecture hasn't reported")
+class Releases(Case):
+    def setUp(self):
+        super().setUp()
+        self.f.statuses["m" * 40] = ["success"]
+        self.f.release(CORE, "v0.2.0", 9000)
+        self.f.files[(CORE, "API.lock", "v0.2.0")] = "def a : Nat\n"
+        self.f.files[(CORE, "API.lock", "m" * 40)] = "def a : Nat\ndef b : Nat\n"
+
+    def release(self, repo=CORE):
+        d._cache.clear()
+        d.evaluate_repo(repo)
+        return self.state(f"release:{repo}")
+
+    def test_9_ci_failing_on_main(self):
+        self.f.statuses["m" * 40] = ["failure"]
+        self.assertEqual(self.release(), ("main failing", ["core"]))
+
+    def test_up_to_date(self):
+        self.assertEqual(self.release(), ("up to date", []))
+
+    def test_15_ready_for_release_is_the_coordinators_and_says_who_releases_gpu_27(self):
+        self.f.changelogs[CORE] = "## v0.3.0\n\n- b.\n\n## v0.2.0\n"
+        self.f.issue(CORE, 13, "scale", ["request", "ready-for-release"])
+        self.assertEqual(self.release(), ("releasable", ["coordinator"]))
+        self.assertEqual(self.descriptions("coordinator"), [
+            f"the release of {CORE} (releasable): it is below level 3: put the release to the human as a "
+            f"`Release <repo>` decision, whose command is `scripts/release.sh {CORE} '<one-line note>' 13`, "
+            f"completing {CORE}#13"])
+        self.f.codeowners[CORE] = ".* @gatekeeper @conformance\nAPI\\.lock @coordinator\n"
+        self.release()
+        self.assertEqual(d.q("SELECT description FROM obligations")[0]["description"],
+                         f"the release of {CORE} (releasable): release it with `forge release`, naming every "
+                         f"ready-for-release issue it completes: `forge release {CORE} '<one-line note>' 13`, "
+                         f"completing {CORE}#13")
+        # Below level 3, once the decision is open, the human releases it.
+        del self.f.codeowners[CORE]
+        self.f.issue(CORE, 14, "coordinator", ["needs-human"], title=f"Release {CORE}")
+        self.assertEqual(self.release(), ("with the human", ["human"]))
+
+    def test_an_entry_above_the_last_release_is_enough_demos_105(self):
+        self.f.changelogs[CORE] = "## v0.3.0\n\n- b.\n\n## v0.2.0\n"
+        self.assertEqual(self.release(), ("releasable", ["coordinator"]))
+        self.assertIn("nothing is labelled ready-for-release, but CHANGELOG.md on main heads v0.3.0",
+                      self.descriptions("coordinator")[0])
+
+    def test_a_heading_the_gatekeeper_would_refuse_is_the_owners(self):
+        self.f.changelogs[CORE] = "## v0.2.1\n\n- b.\n\n## v0.2.0\n"
+        self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
+        self.assertEqual(self.release(), ("wrong entry", ["core"]))
+        self.assertIn("(`forge version` gives v0.3.0; CHANGELOG.md heads v0.2.1)", self.descriptions("core")[0])
+
+    def test_the_last_release_is_the_highest_tag_as_the_gatekeeper_finds_it(self):
+        # Tagged before Forgejo had releases for it, as a migrated repository may be.
+        self.f.tags[CORE] = ["v0.3.0", "not-a-version"]
+        self.f.files[(CORE, "API.lock", "v0.3.0")] = "def a : Nat\ndef b : Nat\n"
+        self.f.changelogs[CORE] = "## v0.3.0\n\n- b.\n"
+        self.assertEqual(self.release(), ("up to date", []), "v0.3.0 is released")
+        self.f.changelogs[CORE] = "## v0.3.1\n\n- c.\n\n## v0.3.0\n"
+        self.assertEqual(self.release(), ("releasable", ["coordinator"]), "API.lock unchanged since v0.3.0: a patch")
+
+    def test_ready_for_release_with_no_entry_is_the_owners(self):
+        self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
+        self.assertEqual(self.release(), ("no entry", ["core"]))
+
+    def test_not_while_mains_ci_runs_scale_38(self):
+        self.f.changelogs[CORE] = "## v0.3.0\n\n## v0.2.0\n"
+        self.f.statuses["m" * 40] = [("running", 100)]
+        self.assertEqual(self.release(), ("main CI running", ["timer"]))
+        self.f.statuses["m" * 40] = [("success", 50)]
+        self.assertEqual(self.release()[0], "releasable")
+
+    def test_held_by_what_holds_a_ready_issue_consumer_metrics_13(self):
+        # The coordinator found it wanting: it says so where the kit can see it.
+        self.f.changelogs[CORE] = "## v0.3.0\n\n## v0.2.0\n"
+        self.f.issue(CORE, 13, "coordinator", ["request", "ready-for-release"],
+                     events=[comment("coordinator", 300, "Refused: the README is stale.\n\nWaiting-on: core")])
+        self.assertEqual(self.release(), ("held", ["unit:held"]))
+        d.evaluate(CORE, 13)
+        self.assertEqual(self.owing(), [("core", "reply"), ("core", "waiting")])
+
+    def test_ci_on_main_finishing_evaluates_the_release(self):
+        self.f.changelogs[CORE] = "## v0.3.0\n\n## v0.2.0\n"
+        later = d.later
+        self.addCleanup(setattr, d, "later", later)
+        d.later = lambda fn, *args, delay=30: None
+        d.handle("action_run_success", {"repository": {"name": CORE, "owner": {"login": "org"}},
+                                        "sender": {"login": "ci"}, "run": {"event": "push"}})
+        self.assertEqual(self.state(f"release:{CORE}")[0], "releasable")
+
+
+class Milestones(Case):
+    def ms(self, i, title="M1", state="open", open_=0, closed=3):
+        return {"id": i, "title": title, "state": state, "open_issues": open_, "closed_issues": closed,
+                "created_at": at(86400)}
+
+    def test_17_finished_on_every_repository_it_spans_coordination_107(self):
+        self.f.milestones[SCALE] = [self.ms(7)]
+        self.f.milestones[CORE] = [self.ms(8, open_=2)]
+        self.f.milestones[COORD] = [self.ms(6, closed=0)]  # an empty namesake counts neither way
+        d.evaluate_milestones()
+        self.assertEqual(self.state("milestone:M1"), ("in progress", ["unit:issues"]))
+        self.assertEqual(self.state("kit"), ("in progress", ["unit:milestones"]))
+        self.f.milestones[CORE] = [self.ms(8)]
+        d.evaluate_milestones()
+        self.assertEqual(self.owing("milestone:M1"), [("coordinator", "finished")])
+        self.assertEqual(self.owing("kit"), [("coordinator", "what next")], "and no milestone has open work")
+        self.assertIn("open its milestone issue and add milestone-review", self.descriptions("coordinator")[0])
+
+    def test_its_issue_its_reviews_and_its_acceptance(self):
+        self.f.milestones[COORD] = [self.ms(1, open_=1)]
+        events = self.f.issue(COORD, 9, "coordinator", ["milestone", "milestone-review"], title="Milestone: M1",
+                              events=[label("milestone-review", True, 600, "coordinator"),
+                                      comment("lasm", 500, "(no reply needed)\nNo findings.")])["events"]
+        d.evaluate(COORD, 9)
+        d.evaluate_milestones()
+        self.assertEqual(self.state(f"{COORD}#9"), ("in review", ["architecture"]))
         events.append(comment("architecture", 400, "(no reply needed)\nReport."))
-        d.evaluate(COORD, 82)
-        self.assertEqual(self.descriptions("coordinator")[-1],
-                         f"every milestone review has reported on {COORD}#82: accept the milestone (say what you "
-                         "checked, close the issue and its Forgejo milestones, record it in ROADMAP.md), or say "
-                         "on it what it waits for")
-        rows = d.q("SELECT id, key FROM triggers WHERE key LIKE 'reviewed:%' AND run_id IS NULL")
-        events.append(comment("coordinator", 100, "(no reply needed)\nWaiting on #85."))
-        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "it has looked since")
+        d.evaluate(COORD, 9)
+        self.assertEqual(self.state(f"{COORD}#9"), ("reviewed", ["coordinator"]))
+        # A comment isn't an answer: a Blocked-by: line is (coordination#82).
+        events.append(comment("coordinator", 300, "(no reply needed)\nWaiting on #85."))
+        d.evaluate(COORD, 9)
+        self.assertEqual(self.state(f"{COORD}#9")[0], "reviewed")
+        self.f.issue(COORD, 85, "coordinator")
+        events.append(comment("coordinator", 200, "(no reply needed)\nBlocked-by: org/inkproof-coordination#85"))
+        d.evaluate(COORD, 9)
+        self.assertEqual(self.state(f"{COORD}#9")[0], "blocked")
+        # Accepted: its issue closed, its milestones still open.
+        self.f.items[(COORD, 9)]["state"] = "closed"
+        self.f.milestones[COORD] = [self.ms(1)]
+        d.evaluate(COORD, 9)
+        d.evaluate_milestones()
+        self.assertEqual(self.state("milestone:M1"), ("accepted", ["coordinator"]))
+        self.f.milestones[COORD] = [self.ms(1, state="closed")]
+        d.evaluate_milestones()
+        self.assertEqual(self.state("milestone:M1"), ("closed", []))
 
-    def test_21_the_coordinator_accepted_and_closed_it_at_once_coordination_73(self):
+    def test_21_its_reviews_even_once_accepted_coordination_73(self):
         self.f.issue(COORD, 73, "coordinator", ["milestone-review"], state="closed", closed=60, events=[
             label("milestone-review", True, 70, "coordinator"), comment("coordinator", 60, "(no reply needed)\nAccepted."),
             comment("lasm", 30, "(no reply needed)\nNo findings.")])
         d.evaluate(COORD, 73)
-        self.assertEqual(self.queued(), [("architecture", "milestone")], "lasm has reported")
-        rows = d.q("SELECT id, key FROM triggers WHERE run_id IS NULL")
-        self.assertEqual(d.no_longer_owed(rows), [], "a claim keeps it")
+        self.assertEqual(self.owing(), [("architecture", "in review")])
         self.f.items[(COORD, 73)]["events"].append(comment("architecture", 10, "(no reply needed)\nReport."))
-        self.assertEqual(d.no_longer_owed(rows), [rows[0]["id"]], "until it has reported")
+        d.evaluate(COORD, 73)
+        self.assertEqual(self.owing(), [])
+
+    def test_23_what_next_once_no_milestone_has_open_work(self):
+        self.f.milestones[COORD] = [self.ms(1, state="closed")]
+        run = self.running("coordinator")
+        d.evaluate_milestones()
+        self.assertEqual(self.owing(), [("coordinator", "what next")])
+        self.assertEqual(self.queued("coordinator"), [], "quiet: not while it runs, drafting the next one perhaps")
+        d.q("UPDATE runs SET ended=? WHERE id=?", d.now(), run)
+        d.wake_due()
+        self.assertIn("close out any left open", self.descriptions("coordinator")[0])
+        # A decision for the human, a pull request on its repository, or the project finished answers it.
+        self.f.issue(COORD, 5, "coordinator", ["needs-human"], assignees=("human",))
+        d.evaluate_milestones()
+        self.assertEqual(self.state("kit"), ("with the human", ["human"]))
+        self.f.items[(COORD, 5)]["state"] = "closed"
+        self.f.files[(COORD, "ROADMAP.md", "main")] = "# Roadmap\n\nStatus: finished\n"
+        d.evaluate_milestones()
+        self.assertEqual(self.state("kit"), ("finished", []))
+        self.assertEqual(self.owing(), [])
 
 
-class Stalls(Case):
-    """Once the kit is quiet, every open item must wait for something the kit
-    can see; whoever should move on one that doesn't is woken."""
-
-    def setUp(self):
-        super().setUp()
-        self.clock = d.now()
-        self.real_now = d.now
-        d.now = lambda: self.clock
-
-    def tearDown(self):
-        d.now = self.real_now
-
-    def spell(self):
-        """A quiet spell later: the stall check, its work then handled."""
-        self.clock += 3600
-        d._cache.clear()
-        n = d.check_stalls()
-        found = sorted((r["agent"], r["key"].split(":")[1]) for r in
-                       d.q("SELECT agent, key FROM triggers WHERE run_id IS NULL AND key LIKE 'stalled:%'"))
-        self.handled()
-        return n, found
-
-    def test_what_waits_visibly_and_what_doesnt(self):
-        approved = [{"id": 1, "user": {"login": "conformance"}, "state": "APPROVED", "commit_id": "a" * 40,
-                     "submitted_at": at(100)}]
-
-        def requested(*who):
-            return [{**event("review_request", "core", 4000), "assignee": {"login": w}} for w in who]
-
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])  # nothing moves it
-        self.f.issue(CORE, 2, "scale", ["request", "needs-human"])  # the human's
-        self.f.issue(CORE, 3, "coordinator", ["request", "accepted"], body="Blocked-by: org/inkproof-core#2")
-        self.f.issue(CORE, 5, "scale", ["request", "ready-for-release"])  # the coordinator's
-        self.f.issue(CORE, 6, "scale", ["request", "accepted"])  # its pull request #7 is checked instead
-        self.f.pull(CORE, 7, "core", body="Refs #6", events=requested("conformance"))  # conformance's
-        self.f.issue(CORE, 10, "scale", ["request", "blocked"])  # blocked, but naming nothing
-        self.f.pull(CORE, 11, "core", events=requested("conformance"), reviews=approved)  # approved, not merging
-        self.f.pull(CORE, 12, "core", events=requested("conformance", "human"), reviews=approved)  # the human's
-        self.f.issue(CORE, 13, "scale", ["request", "counter-proposal"])  # the requester's answer
-        # Released: its requester's, rule 10's nudges notwithstanding (gpu#59).
-        self.f.issue(CORE, 14, "scale", ["request"], events=[comment("gatekeeper", 100, "Released in v1.0.0")])
-        self.f.issue(COORD, 9, "core", ["upstream", "upstream:lasm"])  # the world outside
-        # Its reviewers wait for CI, so only its author can move it (export#4).
-        self.f.pull(CORE, 15, "core", sha="f" * 40, ci=None, events=requested("conformance"))
-        self.f.pull(CORE, 16, "core", sha="e" * 40, ci="failure", events=requested("conformance"))
-        n, found = self.spell()
-        self.assertEqual(found, sorted([("core", f"{CORE}#1"), ("coordinator", f"{CORE}#5"),
-                                        ("conformance", f"{CORE}#7"), ("core", f"{CORE}#10"),
-                                        ("core", f"{CORE}#11"), ("scale", f"{CORE}#13"), ("scale", f"{CORE}#14"),
-                                        ("core", f"{CORE}#15"), ("core", f"{CORE}#16")]))
-        self.assertEqual(n, 9)
-
-    def test_unreleased_work_on_main_wakes_its_owner_demos_105(self):
-        # A consumer action merged with its changelog entry, for a request
-        # on another repository: nothing on this one is ready-for-release.
-        self.f.release(CORE, "v0.2.0", 9000)
-        self.f.changelogs[CORE] = "# Changelog\n\n## v0.3.0\n\n- Exact strokes.\n\n## v0.2.0\n\n- Earlier.\n"
-        self.f.changelogs[SCALE] = "# Changelog\n\n## [0.1.0]\n\n- First.\n"  # never released
-        self.f.release("inkproof-demos", "v1.0.0", 9000)
-        self.f.changelogs["inkproof-demos"] = "## v1.0.0\n\n- Released.\n"  # nothing above it
-        n, found = self.spell()
-        self.assertEqual(found, [("core", f"{CORE}#0"), ("scale", f"{SCALE}#0")])
-        self.assertIn("`CHANGELOG.md` on main heads v0.3.0, above its last release",
-                      d.q("SELECT description FROM triggers WHERE agent='core'")[0]["description"])
-        self.assertEqual([w for w in self.f.writes if w[1].endswith("/comments")], [], "main has no issue to comment on")
-        # Once something carries it to a release, or a pull request is open, it waits visibly.
-        self.f.issue(CORE, 1, "core", ["ready-for-release"])
-        self.f.pull(SCALE, 2, "scale", ci="success")
-        d.q("DELETE FROM kv WHERE key LIKE 'stall:%'")
-        _, found = self.spell()
-        self.assertEqual([f for f in found if f[1].endswith("#0")], [])
-
-    def test_twice_without_moving_then_the_humans_and_a_fix_starts_again(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual(self.spell(), (0, []))
-        # The human hears of the gap once, when it is first caught, then of the stall.
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stalled"])
-        caught = [b["body"] for m, p, b in self.f.writes if p == f"/repos/org/{CORE}/issues/1/comments"]
-        self.assertEqual(len(caught), 1)
-        self.assertIn("the stall check woke core for this issue", caught[0])
-        # Once it waits visibly, a later stall starts from nothing, and is a gap of its own.
-        self.f.items[(CORE, 1)]["labels"].append({"name": "needs-human"})
-        self.assertEqual(self.spell(), (0, []))
-        self.f.items[(CORE, 1)]["labels"].pop()
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")],
-                         ["stall", "stalled", "stall"])
-
-    def test_moved_on_between_checks_starts_again_demos_22(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        # Its owner only says what it will do, and the dispatcher's own labels
-        # are no progress: the count goes on.
-        self.f.items[(CORE, 1)]["events"] += [comment("core", 60, "I'll do it once #2 merges."),
-                                              label("blocked", False, 30, who="dispatcher")]
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual(json.loads(d.kv_get(f"stall:{CORE}#1"))[0], 2)
-        # A pull request referring to it opens and merges while the kit is busy,
-        # so no check sees it moving: still, it starts again from nothing.
-        self.f.items[(CORE, 1)]["events"].append(event("pull_ref", "core", 60))
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual(json.loads(d.kv_get(f"stall:{CORE}#1"))[0], 1)
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stall"])
-
-    def test_a_mention_from_elsewhere_isnt_progress_coordination_209(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.f.items[(CORE, 1)]["events"] += [event("comment_ref", "scale", 60), event("issue_ref", "scale", 50)]
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-        self.assertEqual(self.spell(), (0, []))
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stall", "stalled"])
-
-    def test_a_count_from_before_the_mark_carries_on(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"], events=[event("pull_ref", "core", 60)])
-        d.kv_set(f"stall:{CORE}#1", json.dumps([2, 1]))
-        self.assertEqual(self.spell(), (0, []))
-        self.assertEqual([r["kind"] for r in d.q("SELECT kind FROM notices ORDER BY rowid")], ["stalled"])
-
-    def test_a_capped_agent_isnt_woken_or_counted(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        for _ in range(d.CAP):
-            d.q("INSERT INTO runs (agent, triggers, claimed, ended) VALUES ('core', '[]', ?, ?)", self.clock + 3600,
-                self.clock + 3600)
-        self.assertEqual(self.spell(), (0, []))
-        self.assertIsNone(d.kv_get(f"stall:{CORE}#1"))
-
-
-class Supervisor(Case):
-    """With a supervisor, a stalled item wakes it, once for them all, rather
-    than each owner; and its mentions wake whoever they name."""
-
-    spell = Stalls.spell
+class Obligations(Case):
+    """Woken at once, again as each run ends with it still owed, with
+    OBLIGATION_BACKOFF between; then the human's."""
 
     def setUp(self):
         super().setUp()
         self.clock = d.now()
         self.addCleanup(setattr, d, "now", d.now)
         d.now = lambda: self.clock
+        self.f.issue(CORE, 1, "scale", ["request", "new"])
+        d.evaluate(CORE, 1)
+
+    def finish(self, agent="core", outcome="completed", **more):
+        """Its runner claims its work and the run ends."""
+        self.clock += d.DEBOUNCE + 1
+        c = d.claim(agent)
+        self.assertIsNotNone(c, "work was due")
+        self.clock += 600
+        d.end_run(agent, c["run"], {"outcome": outcome, "turns": 20, "cost": 1.0, **more})
+        return c
+
+    def test_woken_again_with_backoff_then_the_humans(self):
+        self.assertEqual(self.queued("core"), ["untriaged"])
+        d.wake_due()
+        self.assertEqual(len(self.queued("core")), 1, "not again while queued")
+        self.finish()
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["untriaged"], "at once, the first time")
+        self.assertIn("woken again, 2 of 3", self.descriptions("core")[0])
+        self.finish()
+        d.wake_due()
+        self.assertEqual(self.queued("core"), [], "then not for 15 minutes")
+        self.clock += 900
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["untriaged"])
+        self.finish()
+        self.clock += 900
+        d.wake_due()
+        self.assertEqual(self.queued("core"), [], "three runs: it is the human's")
+        decisions = [w[2] for w in self.f.writes if w[1] == f"/repos/org/{COORD}/issues"]
+        self.assertEqual([x["title"] for x in decisions], [f"Stalled: {CORE}#1"])
+        self.assertIn("`core` was woken 3 times", decisions[0]["body"])
+        self.clock += 3600
+        d.wake_due()
+        self.assertEqual(self.queued("core"), [], "and stays so")
+
+    def test_discharged_when_what_it_owes_changes(self):
+        self.f.items[(CORE, 1)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
+        self.clock += d.DEBOUNCE + 1
+        self.assertIsNone(d.claim("core"), "its trigger is dropped at the claim")
+        self.assertEqual(self.owing(), [("core", "to do")])
+        # Back to what it was: owed afresh.
+        self.f.items[(CORE, 1)]["labels"] = [{"name": "request"}, {"name": "new"}]
+        d.evaluate(CORE, 1)
+        self.assertEqual(d.q("SELECT wakes FROM obligations WHERE what='untriaged'")[0]["wakes"], 1)
+
+    def test_a_run_that_never_got_going_uses_up_nothing(self):
+        self.finish(outcome="failed: ERR_PROXY_TUNNEL", turns=1, cost=0)
+        self.assertEqual(d.q("SELECT wakes FROM obligations")[0]["wakes"], 1)
+        self.assertEqual(self.queued("core"), ["untriaged"], "its own trigger, queued again to retry")
+
+    def test_dropped_by_hand_it_comes_back_after_the_wait(self):
+        self.clock += d.DEBOUNCE + 1
+        d.q("UPDATE triggers SET run_id=-1 WHERE run_id IS NULL")
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["untriaged"], "the first wait is none")
+
+    def test_the_supervisor_is_woken_with_the_human(self):
         self.addCleanup(d.AGENTS.pop, "process", None)
         d.AGENTS["process"] = {"kind": "supervisor", "own": None}
         self.addCleanup(setattr, d, "SUPERVISOR", d.SUPERVISOR)
         d.SUPERVISOR = "process"
-
-    def test_a_quiet_spell_wakes_the_supervisor_once_for_every_stalled_item(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        self.f.issue(CORE, 5, "scale", ["request", "ready-for-release"])
-        self.assertEqual(self.spell(), (1, []))  # no owner is woken
-        sup = [r["description"] for r in d.q("SELECT description FROM triggers WHERE agent='process'")]
+        for _ in range(3):
+            self.finish()
+            self.clock += 900
+            d.wake_due()
+        sup = self.descriptions("process")
         self.assertEqual(len(sup), 1)
-        self.assertIn(f"{CORE}#1 (nothing is moving it on: core)", sup[0])
-        self.assertIn(f"{CORE}#5 (it is labelled ready-for-release but hasn't been released: coordinator)", sup[0])
-        self.assertTrue(sup[0].endswith("Find out why each stalled, move it on, and report each gap (Role: Supervision)"))
-        # The human isn't sent a comment for each: the supervisor reports the gaps.
-        self.assertFalse([w for w in self.f.writes if w[1].endswith("/comments")])
-        # Still stalled after STALL_ROUNDS spells, each is the human's, as before.
-        self.spell()
-        self.assertEqual(self.spell(), (0, []))
-        self.assertEqual(sorted(r["kind"] for r in d.q("SELECT kind FROM notices")),
-                         ["stall", "stall", "stalled", "stalled"])
+        self.assertTrue(sup[0].startswith(f"{CORE}#1 has stalled: core was woken 3 times"))
 
-    def test_a_capped_supervisor_leaves_it_to_the_owners(self):
-        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
-        for _ in range(d.cap_of("process")):
-            d.q("INSERT INTO runs (agent, triggers, claimed, ended, turns, cost) VALUES ('process', '[]', ?, ?, 9, 1)",
-                self.clock + 3600, self.clock + 3600)
-        self.assertEqual(self.spell(), (1, [("core", f"{CORE}#1")]))
-
-    def test_26_its_mention_wakes_the_owner_too_at_most_three_a_day(self):
-        nudges = [comment("process", 500 - 10 * i, f"(no reply needed)\n\n@core Move this on ({i}).") for i in range(4)]
-        self.f.issue(CORE, 4, "core", ["blocked"], events=nudges)
-        d.evaluate(CORE, 4)
-        self.assertEqual([x for x in self.descriptions("core") if "supervisor" in x],
-                         [f"the supervisor mentioned you on issue {CORE}#4: http://forge/org/{CORE}/issues/4"
-                          f"#issuecomment-{c['id']}" for c in nudges[:3]])
-        # An agent's mention still wakes no one.
-        self.f.issue(CORE, 5, "core", ["blocked"], events=[comment("scale", 100, "(no reply needed)\n\n@core Hi.")])
-        d.evaluate(CORE, 5)
-        self.assertFalse([x for x in self.descriptions("core") if f"{CORE}#5" in x])
+    def test_a_quiet_one_waits_while_its_agent_has_other_work(self):
+        self.f.issue(CORE, 2, "coordinator", ["request", "accepted"])
+        d.evaluate(CORE, 2)
+        self.assertEqual(self.queued("core"), ["untriaged"])
+        self.finish()
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["untriaged"], "woken again for #1, so #2 still waits")
+        self.f.items[(CORE, 1)]["state"] = "closed"
+        self.clock += d.DEBOUNCE + 1
+        self.assertIsNone(d.claim("core"), "#1 is no longer owed")
+        d.wake_due()
+        self.assertEqual(self.queued("core"), ["to do"])
 
 
 class Mechanics(Case):
-    def test_once_per_version(self):
-        self.f.issue(CORE, 1, "scale", ["request", "new"])
-        d.evaluate(CORE, 1)
-        self.handled()
-        d.evaluate(CORE, 1)
-        self.assertEqual(self.queued("core"), [])
-
-    def test_a_claim_drops_what_is_no_longer_owed(self):
-        self.f.pull(CORE, 7, "core")
-        d.evaluate(CORE, 7)
-        d.q("UPDATE triggers SET created=?", d.now() - 3600)
-        self.f.items[(CORE, 7)]["events"].append(event("pull_scheduled_merge", "core", 10))
-        claimed = d.claim("core")
-        self.assertIsNone(claimed)
-        self.assertEqual(self.queued("core"), [])
-        # Renamed, so the same state can queue it again.
-        self.f.items[(CORE, 7)]["events"].append(event("pull_cancel_scheduled_merge", "core", 5))
-        d.evaluate(CORE, 7)
-        self.assertEqual(self.queued("core"), ["unscheduled"])
-
     def test_a_claim_keeps_what_is_still_owed(self):
         self.f.issue(CORE, 1, "scale", ["request", "new"])
         d.evaluate(CORE, 1)
         d.q("UPDATE triggers SET created=?", d.now() - 3600)
-        self.assertEqual(d.claim("core")["triggers"], [f"untriaged request {CORE}#1"])
-
-    def test_a_claim_keeps_merged_work_to_finish_consumer_metrics_12(self):
-        self.f.issue(CORE, 5, "scale", ["request", "accepted"])
-        self.f.pull(CORE, 7, "core", body="Refs #5", state="closed", merged=100)
-        d.evaluate(CORE, 5)
-        d.q("UPDATE triggers SET created=?", d.now() - 3600)
         self.assertEqual(d.claim("core")["triggers"],
-                         [f"your pull request {CORE}#7 merged; it answers {CORE}#5, not yet labelled ready-for-release"])
+                         [f"issue {CORE}#1 (untriaged): accept it, counter-propose, or close it saying why"])
 
-    def test_the_first_sweep_records_what_the_old_triggers_covered(self):
+    def test_the_first_sweep_records_the_notices_the_old_triggers_covered(self):
         d.q("DELETE FROM kv")
         self.f.issue(CORE, 1, "scale", ["request", "new"], events=[comment("scale", 100)])
         d.reconcile()  # inkproof-tools, not in Forgejo yet, is skipped
-        self.assertEqual(self.queued("core"), ["request"])  # the comment's kind is recorded as handled
+        self.assertEqual(sorted(self.queued("core")), ["reply", "untriaged"])
+        self.assertEqual(self.queued("coordinator"), [], "its notice of the filing is recorded as handled")
         self.assertTrue(d.kv_get("rules-seeded"))
+
+    def test_the_old_rules_triggers_are_dropped_once(self):
+        d.q("DELETE FROM kv WHERE key='obligations-started'")
+        d.add_trigger("core", f"request:{CORE}#1:x", "untriaged request")
+        d.add_trigger("core", f"filed:{CORE}#1:", "request filed")
+        d.add_trigger("core", "idle:1", "the kit is idle")
+        d.retire_rule_triggers()
+        self.assertEqual(self.queued("core"), ["filed", "idle"])
+        d.add_trigger("core", f"request:{CORE}#2:x", "untriaged request")
+        d.retire_rule_triggers()
+        self.assertEqual(len(self.queued("core")), 3, "once")
 
     def test_a_blocker_closing_evaluates_what_waits_on_it(self):
         self.f.issue(SCALE, 38, "coordinator", ["request"])
         self.f.issue(CORE, 12, "coordinator", ["request", "accepted", "blocked"], body="Blocked-by: org/inkproof-scale#38")
         d.evaluate(CORE, 12)
-        self.assertEqual(self.queued("core"), [])
+        self.assertEqual(self.state(f"{CORE}#12")[0], "blocked")
         self.f.items[(SCALE, 38)].update(state="closed", closed_at=at(5))
         d.handle("issues", {"action": "closed", "repository": {"name": SCALE, "owner": {"login": "org"}},
                             "sender": {"login": "coordinator"},
                             "issue": {"number": 38, "state": "closed", "labels": [{"name": "request"}]}})
-        self.assertIn("unblocked", self.queued("core"))
+        self.assertEqual(self.state(f"{CORE}#12")[0], "to do")
 
     def test_a_merge_evaluates_the_requests_it_answers(self):
         self.f.issue(CORE, 5, "scale", ["request", "accepted"])
@@ -1419,13 +1188,21 @@ class Mechanics(Case):
         d.handle("pull_request", {"action": "closed", "repository": {"name": CORE, "owner": {"login": "org"}},
                                   "sender": {"login": "core"},
                                   "pull_request": {"number": 7, "merged": True, "user": {"login": "core"}}})
-        self.assertIn("merged", self.queued("core"))
+        self.assertEqual(self.state(f"{CORE}#5")[0], "merged")
 
-    def test_a_release_the_coordinator_didnt_ask_for(self):
-        for by in ("gatekeeper", "human"):
-            d.handle("release", {"action": "published", "repository": {"name": SCALE, "owner": {"login": "org"}},
-                                 "sender": {"login": by}, "release": {"tag_name": f"v1.0.{len(by)}"}})
-        self.assertEqual(self.descriptions("coordinator"), [f"{SCALE} released v1.0.5"])
+    def test_a_deleted_item_owes_nothing(self):
+        self.f.issue(CORE, 1, "scale", ["request", "new"])
+        d.evaluate(CORE, 1)
+        del self.f.items[(CORE, 1)]
+        real = self.f.__call__
+
+        def gone(method, path, body=None):
+            if path.startswith(f"/repos/org/{CORE}/issues/1"):
+                raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+            return real(method, path, body)
+        d.forge = gone
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.owing(), [])
 
 
 class Paging(Case):
@@ -1479,13 +1256,13 @@ class UnstartedRuns(Case):
 
 
 class IdleSummary(Case):
-    """The coordinator's idle summary, once a quiet spell finds nothing stalled."""
+    """The coordinator's idle summary, once per quiet spell."""
 
     def setUp(self):
         super().setUp()
         self.clock, self.waiting = d.now(), ["inkproof-core#1"]
         for name, value in (("now", lambda: self.clock), ("ci_running", lambda: False),
-                            ("check_stalls", lambda: 0), ("waiting_for_human", lambda: list(self.waiting))):
+                            ("waiting_for_human", lambda: list(self.waiting))):
             self.addCleanup(setattr, d, name, getattr(d, name))
             setattr(d, name, value)
 
@@ -1501,21 +1278,16 @@ class IdleSummary(Case):
         return found
 
     def test_a_restart_starts_a_quiet_spell_demos_105(self):
-        # A spell's check ran under the old rules; a rollout brings new ones,
-        # which run once the kit has been quiet IDLE seconds since the start.
-        checks = []
-        d.check_stalls = lambda: checks.append(self.clock) or 0
         self.addCleanup(setattr, d, "STARTED", d.STARTED)
-        self.spell()
-        self.clock += d.IDLE + 60
-        d.check_idle()
-        self.assertEqual(len(checks), 1, "once per quiet spell")
+        self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; 1 item waits on you"])
+        self.waiting = ["inkproof-core#1", "inkproof-scale#4"]
+        self.clock += 600
         d.STARTED = self.clock
         d.check_idle()
-        self.assertEqual(len(checks), 1, "not until it has been quiet IDLE seconds since the start")
+        self.assertEqual(self.queued(), [], "not until it has been quiet IDLE seconds since the start")
         self.clock += d.IDLE + 60
         d.check_idle()
-        self.assertEqual(len(checks), 2)
+        self.assertEqual(self.queued(), [("coordinator", "idle")])
 
     def test_only_when_what_waits_on_the_human_changed_coordination_156(self):
         self.assertEqual(self.spell(), [f"{d.IDLE_TRIGGER}; 1 item waits on you"])
@@ -1659,7 +1431,7 @@ class FailedRunsAreRetried(Case):
 
 class Draining(Case):
     """A clean stop: runs under way finish, nothing new starts, and the quiet
-    that follows isn't taken for a stall."""
+    that follows brings no summary."""
 
     def setUp(self):
         super().setUp()
@@ -1690,32 +1462,19 @@ class Draining(Case):
         os.remove(DRAINING)
         self.assertIsNotNone(d.claim("scale"))
 
-    def test_the_quiet_isnt_a_stall(self):
+    def test_the_quiet_brings_no_summary(self):
         d.end_run("core", self.run, {"outcome": "completed", "turns": 20, "cost": 1.0})
         d.q("UPDATE triggers SET run_id=-1 WHERE run_id IS NULL")
-        called = []
-        self.addCleanup(setattr, d, "check_stalls", d.check_stalls)
-        d.check_stalls = lambda: called.append(1) or 0
         real_now = d.now
         self.addCleanup(setattr, d, "now", real_now)
         d.now = lambda: real_now() + d.IDLE + 3600
         d.check_idle()
-        self.assertEqual(called, [])
         self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL"), [])
 
 
 class Priority(Case):
     """Work labelled priority comes before anything new."""
 
-    def test_28_the_owner_is_woken_when_someone_else_makes_it_a_priority(self):
-        self.f.issue(CORE, 2, "scale", ["request", "accepted", "priority"],
-                     events=[label("priority", True, 100, who="human")])
-        self.f.issue(CORE, 3, "scale", ["request", "accepted", "priority"],
-                     events=[label("priority", True, 100, who="core")])  # its own doing
-        d.evaluate(CORE, 2)
-        d.evaluate(CORE, 3)
-        self.assertEqual(self.descriptions("core"),
-                         [f"{CORE}#2 is now a priority: it comes before anything new (Protocol: Priority)"])
 
     def test_a_runs_priority_work_comes_first(self):
         self.f.issue(CORE, 1, "scale", ["request", "accepted"])
@@ -1733,176 +1492,6 @@ class Priority(Case):
             f"priority items open on your repository: {CORE}#3: they come before anything new (Protocol: Priority)",
             f"a comment on {CORE}#1",
             "the kit is idle"])
-
-
-
-class NobodyOrphaned(Case):
-    """Not a proof, but the next best thing: random worlds of issues and pull
-    requests, as Forgejo could hold them, and in each, once the kit is
-    quiet, every open item waits on something the kit can see, or the stall
-    check wakes an agent that can move it on. What counts as visible is
-    written here apart from stall_owners, so that each checks the other.
-    ORPHAN_WORLDS sets how many worlds, ORPHAN_SEED where they start."""
-
-    WORLDS = int(os.environ.get("ORPHAN_WORLDS", "500"))
-    SEED = int(os.environ.get("ORPHAN_SEED", "0"))
-    AUTHORS = ("core", "scale", "coordinator", "demos", "human", "stranger")
-    LABELS = ("request", "accepted", "new", "needs-human", "upstream", "blocked", "ready-for-release",
-              "counter-proposal", "verified")
-
-    def setUp(self):
-        super().setUp()
-        self.real_now = d.now
-        self.addCleanup(setattr, d, "now", self.real_now)
-
-    def reset(self):
-        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels"):
-            d.q(f"DELETE FROM {t}")
-        d._cache.clear()
-        self.f = Forge()
-        d.forge = self.f
-        self.clock = self.real_now()
-        d.now = lambda: self.clock
-
-    def world(self, rng):
-        specs = []
-        for _ in range(rng.randint(1, 6)):
-            repo = rng.choice((CORE, SCALE))
-            specs.append({"repo": repo, "n": 1 + sum(s["repo"] == repo for s in specs), "pr": rng.random() < 0.4})
-        issues = [s for s in specs if not s["pr"]]
-        for s in specs:
-            s.update(author=rng.choice(self.AUTHORS), open=rng.random() < 0.8,
-                     labels=[l for l in self.LABELS if rng.random() < (0.05 if s["pr"] else 0.25)],
-                     human_assigned=rng.random() < 0.1, released=not s["pr"] and rng.random() < 0.3,
-                     blocked_by=rng.choice(issues) if issues and rng.random() < 0.3 else None)
-            if s["blocked_by"] is s:
-                s["blocked_by"] = None
-            if rng.random() < 0.3:
-                s["wait"] = (rng.choice(("core", "scale", "demos", "coordinator", "human", "stranger")),
-                             rng.choice(("core", "scale", "demos", "coordinator", "conformance", "human", "none")),
-                             rng.random() < 0.3)  # who wrote it, whom it names, and whether they answered
-            if s["pr"]:
-                mine = [i for i in issues if i["repo"] == s["repo"]]
-                s.update(refs=rng.choice(mine) if mine and rng.random() < 0.5 else None,
-                         requested=[r for r in ("conformance", "human") if rng.random() < 0.4],
-                         review=rng.choice((None, "APPROVED", "REQUEST_CHANGES", "stale")),
-                         ci=rng.choice((None, "success", "failure")), wip=rng.random() < 0.1,
-                         sha=format(rng.getrandbits(160), "040x"))
-        for s in specs:
-            body = "\n".join(([f"Blocked-by: org/{s['blocked_by']['repo']}#{s['blocked_by']['n']}"]
-                              if s["blocked_by"] else []) + ([f"Refs #{s['refs']['n']}"] if s.get("refs") else []))
-            events = [comment("gatekeeper", 1000, "(no reply needed)\n\nReleased in v1.0.0: ...")] if s["released"] else []
-            if s.get("wait"):
-                writer, named, answered = s["wait"]
-                events.append(comment(writer, 800, f"(no reply needed)\n\nWaiting-on: {named}"))
-                if answered:
-                    events.append(comment(named, 600, "(no reply needed)\n\nDone."))
-            state = "open" if s["open"] else "closed"
-            if s["pr"]:
-                events += [{**event("review_request", s["author"], 4000), "assignee": {"login": r}}
-                           for r in s["requested"]]
-                reviews = [{"id": 1, "user": {"login": "conformance"}, "submitted_at": at(500),
-                            "state": "REQUEST_CHANGES" if s["review"] == "stale" else s["review"],
-                            "commit_id": "0" * 40 if s["review"] == "stale" else s["sha"]}] if s["review"] else []
-                i = self.f.pull(s["repo"], s["n"], s["author"], s["labels"], sha=s["sha"], events=events,
-                                reviews=reviews, body=body, state=state, ci=s["ci"],
-                                title="WIP: work" if s["wip"] else "Work")
-            else:
-                i = self.f.issue(s["repo"], s["n"], s["author"], s["labels"], state, body, events=events)
-            i["assignees"] = [{"login": "human"}] if s["human_assigned"] else []
-        # Each repository's last release and CHANGELOG.md's newest entry.
-        self.mains = {}
-        for repo in (CORE, SCALE):
-            released, entry = rng.choice((None, "v0.2.0")), rng.choice((None, "v0.2.0", "v0.3.0"))
-            if released:
-                self.f.release(repo, released, 9000)
-            if entry:
-                self.f.changelogs[repo] = f"# Changelog\n\n## {entry}\n\n- Work.\n"
-            self.mains[repo] = (released, entry)
-        return specs
-
-    @staticmethod
-    def waiting(s):
-        """The agent an item's Waiting-on: line holds it for, if any."""
-        if not s.get("wait"):
-            return None
-        writer, named, answered = s["wait"]
-        answered = answered or (named == "conformance" and s.get("review"))
-        if writer in d.TRUSTED and named in d.AGENTS and named != writer and not answered:
-            return named
-        return None
-
-    @staticmethod
-    def visible(s, specs):
-        """What an open item may wait on without anyone being woken: the
-        human, the world outside, another open item, or its pull request."""
-        if not s["open"] or "needs-human" in s["labels"] or s["human_assigned"] or "upstream" in s["labels"]:
-            return "closed, the human's or upstream"
-        b = s["blocked_by"]
-        if b and s["author"] in d.TRUSTED and not b["released"] and (
-                b["open"] or "ready-for-release" in b["labels"]):
-            return "blocked by an open or unreleased issue"
-        if NobodyOrphaned.waiting(s):
-            return None
-        if s["pr"]:
-            if s["author"] == "human" or "human" in s["requested"]:
-                return "the human's pull request, or their review"
-            return None
-        if any(p["pr"] and p["open"] and p.get("refs") is s for p in specs):
-            return "its open pull request, checked in its own right"
-        if (s["author"] == "human" and "request" in s["labels"] and s["released"]
-                and "verified" not in s["labels"]):
-            return "released, for the human to verify"
-        if s["author"] == "human" and "counter-proposal" in s["labels"]:
-            return "a counter-proposal, for the human to answer"
-        return None
-
-    def test_every_open_item_waits_visibly_or_someone_is_woken(self):
-        failures = []
-        for seed in range(self.SEED, self.SEED + self.WORLDS):
-            rng = __import__("random").Random(seed)
-            self.reset()
-            specs = self.world(rng)
-            self.clock += 3600
-            d._cache.clear()
-            d.check_stalls()
-            woken = {}
-            for r in d.q("SELECT agent, key FROM triggers WHERE key LIKE 'stalled:%'"):
-                woken.setdefault(r["key"].split(":")[1], set()).add(r["agent"])
-            for s in specs:
-                at_ = f"{s['repo']}#{s['n']}"
-                who = woken.get(at_, set())
-                can = {d.OWNER_OF[s["repo"]], s["author"], d.COORDINATOR} | set(s.get("requested", []))
-                wait = self.waiting(s)
-                can |= {wait} if wait else set()
-                if wait and not self.visible(s, specs) and wait not in who:
-                    failures.append(f"seed {seed}: {at_} waits on {wait}, who wasn't woken ({sorted(who)}): {s}")
-                # Work waiting to be released is the coordinator's, even on a
-                # request released before, whose requester waits for it (gpu#59).
-                if (not wait and not s["pr"] and "ready-for-release" in s["labels"]
-                        and not self.visible(s, specs) and d.COORDINATOR not in who):
-                    failures.append(f"seed {seed}: {at_} is ready for release, but the coordinator wasn't woken "
-                                    f"({sorted(who)}): {s}")
-                if who - can:
-                    failures.append(f"seed {seed}: {at_} woke {sorted(who - can)}, who can't move it on: {s}")
-                if not who and not self.visible(s, specs):
-                    failures.append(f"seed {seed}: {at_} is orphaned: "
-                                    f"{ {k: (v and f'{v['repo']}#{v['n']}') if k in ('blocked_by', 'refs') else v for k, v in s.items()} }")
-            # A repository's main with work described above its last release
-            # waits for a release: something must carry it there.
-            for repo, (released, entry) in self.mains.items():
-                who = woken.get(f"{repo}#0", set())
-                if who - {d.OWNER_OF[repo]}:
-                    failures.append(f"seed {seed}: {repo}'s main woke {sorted(who)}")
-                carried = any(s["open"] and s["repo"] == repo and (s["pr"] or "ready-for-release" in s["labels"])
-                              for s in specs)
-                if entry and (released is None or entry > released) and not carried and not who:
-                    failures.append(f"seed {seed}: {repo}'s main has {entry} unreleased (last {released}), "
-                                    "and nothing carries it to a release")
-        if os.environ.get("ORPHAN_VERBOSE"):
-            print("\n".join(failures))
-        self.maxDiff = None
-        self.assertEqual(failures[:5], [], f"{len(failures)} failures in {self.WORLDS} worlds")
 
 
 if __name__ == "__main__":
