@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The human's Remote Control session in this container, which
+# scripts/remote.sh starts inside tmux (session `human`) so that it outlives
+# the terminal: an interactive Claude session, named after the agent, that the
+# human drives from the Claude desktop app, claude.ai/code or the mobile app.
+#
+# Remote Control refuses the setup token runs use (CLAUDE_CODE_OAUTH_TOKEN),
+# so this session goes without it and uses a claude.ai login of its own, kept
+# in this agent's Claude volume; with none, it asks for one first. It is one
+# of the human's sessions like any other (entrypoint `cli`): it consults, and
+# the guard applies (inkproof-hook). If Claude exits, it starts again after a
+# few seconds, so the agent stays reachable from the app.
+set -uo pipefail
+unset CLAUDE_CODE_OAUTH_TOKEN
+cd "${AGENT_WORKSPACE:-/workspace/${AGENT_REPO}}" || exit 1
+
+logged_in() { claude auth status >/dev/null 2>&1; }
+
+if ! logged_in; then
+  echo "Log $AGENT_NAME in with the agents' Claude account (the one secrets/claude/oauth-token belongs to)."
+  echo "Your Remote Control sessions here use this login; runs keep using the setup token."
+  claude auth login --claudeai || { echo "Logging in failed."; sleep 30; exit 1; }
+fi
+
+while true; do
+  claude --remote-control "$AGENT_NAME"
+  code=$?
+  echo
+  echo "Claude exited (status $code). It starts again in 10 seconds: Ctrl-C to stop it, Ctrl-b d to detach."
+  sleep 10 || exit 0
+done

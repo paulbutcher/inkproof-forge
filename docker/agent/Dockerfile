@@ -19,7 +19,7 @@ ARG TARGETARCH
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq less procps python3 python3-pip xz-utils util-linux \
+      ca-certificates curl git jq less procps python3 python3-pip tmux xz-utils util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 # lean-lsp-mcp, the Lean tools the repositories' CLAUDE.md asks agents to use.

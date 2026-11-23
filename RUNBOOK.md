@@ -137,10 +137,20 @@ A run starts once the events have settled for a minute (`DEBOUNCE_SECONDS`), and
 
 ### Talking to an agent
 
-You can talk to any agent in its container (`scripts/open.sh <agent>`, then Claude in the extension or a terminal), to ask about its work or have it look into something. Its runs carry on meanwhile, in the same checkouts, so your session only consults. It reads anything, and builds or tries changes only in a clone of its own outside `/workspace`. In Forgejo it files issues and comments, nothing else. A guard refuses the rest, saying what to do instead.
+You can talk to any agent in its container (in VS Code: `scripts/open.sh <agent>`, then Claude in the extension or a terminal; or from the Claude app, below), to ask about its work or have it look into something. Its runs carry on meanwhile, in the same checkouts, so your session only consults. It reads anything, and builds or tries changes only in a clone of its own outside `/workspace`. In Forgejo it files issues and comments, nothing else. A guard refuses the rest, saying what to do instead.
 
 - To have something changed, ask the agent to file it as an issue on its own repository. One of its runs then takes it up like any task of its own, without this conversation, so the issue must say everything.
 - Its comments wake no one, itself included. A decision or go-ahead from you is a comment you post in Forgejo in your own name: ask the agent to draft it.
+
+#### From the Claude app
+
+`scripts/remote.sh` starts a Remote Control session in every running agent's container, or in the agents you name. Each shows under the agent's name in the Claude desktop app, claude.ai/code and the mobile app, when you're signed in to the agents' Claude account. It is a session of yours like one in VS Code, and the same guard applies.
+
+- **Once per agent, log in.** Remote Control doesn't accept the setup token runs use, so each agent needs a claude.ai login of the agents' account for your sessions. Run `scripts/remote.sh --attach <agent>`, follow the login link in your browser, and paste the code back. Claude may also ask you to enable Remote Control. Then detach with Ctrl-b d. The login is kept in the agent's Claude volume, so it survives restarts and rebuilds. Runs keep using the setup token.
+- **Starting them.** A session ends when its container is recreated, for instance by `scripts/up.sh` after a change, so run `scripts/remote.sh` again afterwards. If Claude exits, the session starts again after ten seconds.
+- `scripts/remote.sh --attach <agent>` uses the same session in this terminal. `scripts/remote.sh --stop [<agent>...]` ends sessions.
+- Anyone signed in to the agents' Claude account can use these sessions.
+- To ask about a run, point the session at its log in `.inkproof/runs/`. Remote Control doesn't list past runs as the extension does.
 
 ### Putting work first
 
