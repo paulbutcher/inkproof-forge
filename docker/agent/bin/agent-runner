@@ -272,7 +272,11 @@ def run(claim):
     elif result and not result.get("is_error"):
         outcome = "completed"
     elif result:
-        outcome = f"failed: {result.get('subtype', 'error')}"
+        # An API error (a usage limit, an outage) has subtype "success" and
+        # says what went wrong in its text; the others name it in subtype.
+        why = " ".join(str(result.get("result") or "").split())[:200]
+        subtype = result.get("subtype") or "error"
+        outcome = f"failed: {why if why and subtype == 'success' else subtype}"
     else:
         outcome = f"exited (status {proc.returncode}) before finishing a reply"
     denied = [{"tool": d.get("tool_name"), "input": d.get("tool_input")}

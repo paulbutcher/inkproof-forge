@@ -53,7 +53,8 @@ import sys
 import threading
 import time
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -99,6 +100,9 @@ RETRY_DELAY = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))
 # API. It isn't counted against RETRIES; its work waits these delays in turn,
 # then the last one each time, until the agent's runs get going again.
 ENV_DELAYS = [int(s) for s in os.environ.get("ENV_RETRY_DELAYS", "300,900,3600").split(",")]
+# A run cut short by the account's usage limit is retried this long after
+# the limit resets, by the time its error gives.
+LIMIT_MARGIN = int(os.environ.get("LIMIT_RESET_MARGIN_SECONDS", "120"))
 REVIEWER = "conformance"
 MILESTONE_REVIEWERS = ("architecture", "process", "lasm")
 KEEP_PAYLOADS = 500
@@ -235,7 +239,8 @@ CREATE INDEX IF NOT EXISTS shadow_unit ON shadow (unit, resolved);
 """)
 for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
                "events ADD COLUMN detail TEXT",      # ledgers from before the activity stream
-               "triggers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"):  # before failed runs were retried
+               "triggers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",  # before failed runs were retried
+               "triggers ADD COLUMN env_held INTEGER NOT NULL DEFAULT 0"):  # before work held for its environment was released
     try:
         DB.execute(f"ALTER TABLE {column}")
     except sqlite3.OperationalError:
@@ -261,15 +266,17 @@ def add_trigger(agent, key, description, once=False, not_before=None):
     """Queue work for an agent, unless the same key is already waiting; with
     once, unless it was ever queued. With not_before, it waits until then to
     be claimed. Queued again without one while it waits, it waits no longer
-    (a pull request whose CI has finished), unless it waits to be retried.
+    (a pull request whose CI has finished), unless it waits to be retried, or
+    for its environment (env_retry).
     Returns the new trigger's id, or None."""
     if agent not in AGENTS:
         return
     with LOCK:
-        dup = DB.execute("SELECT id, run_id, not_before, attempts FROM triggers WHERE agent=? AND key=? "
+        dup = DB.execute("SELECT id, run_id, not_before, attempts, env_held FROM triggers WHERE agent=? AND key=? "
                          + ("" if once else "AND run_id IS NULL ") + "ORDER BY id DESC", (agent, key)).fetchone()
         if dup:
-            if (dup["run_id"] is None and dup["not_before"] and not_before is None and not dup["attempts"]):
+            if (dup["run_id"] is None and dup["not_before"] and not_before is None
+                    and not dup["attempts"] and not dup["env_held"]):
                 DB.execute("UPDATE triggers SET not_before=NULL WHERE id=?", (dup["id"],))
             return
         cur = DB.execute("INSERT INTO triggers (agent, key, description, created, not_before) VALUES (?,?,?,?,?)",
@@ -2238,7 +2245,7 @@ def due(agent, grant=False, prio=(set(), [])):
         cur = DB.execute("INSERT INTO runs (agent, triggers, claimed) VALUES (?,?,?)",
                          (agent, json.dumps(descs), t))
         run_id = cur.lastrowid
-        DB.execute(f"UPDATE triggers SET run_id=? WHERE id IN ({','.join('?' * len(rows))})",
+        DB.execute(f"UPDATE triggers SET run_id=?, env_held=0 WHERE id IN ({','.join('?' * len(rows))})",
                    (run_id, *[r["id"] for r in rows]))
     log(f"{agent} claimed run {run_id}: {', '.join(descs)}")
     return {"run": run_id, "triggers": descs}
@@ -2287,7 +2294,7 @@ def retry(agent, run_id, outcome):
         return False
     attempt = max(r["attempts"] for r in rows) + 1
     if attempt <= RETRIES:
-        q("UPDATE triggers SET run_id=NULL, attempts=?, not_before=? WHERE run_id=?",
+        q("UPDATE triggers SET run_id=NULL, attempts=?, not_before=?, env_held=0 WHERE run_id=?",
           attempt, now() + RETRY_DELAY * attempt, run_id)
         log(f"{agent} run {run_id} {outcome}: its work is queued again (retry {attempt} of {RETRIES})")
         return True
@@ -2316,27 +2323,73 @@ def never_got_going(r, changes):
         and r["turns"] <= 1 and not r.get("cost") and not changes
 
 
+# "You've hit your session limit · resets 4:40pm (UTC)"; a weekly limit may
+# name its day ("resets Nov 30, 9am (Europe/London)").
+RESETS = re.compile(r"\bresets\s+(?:(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2}),?\s+(?:at\s+)?)?"
+                    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>am|pm)\s*\((?P<tz>[^)]+)\)", re.I)
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+
+
+def limit_resets(outcome, at=None):
+    """When the usage limit a run's outcome names resets, as a timestamp; None
+    if it names none, or not in a form understood here."""
+    m = RESETS.search(outcome or "")
+    if not m:
+        return None
+    try:
+        tz = timezone.utc if m["tz"].strip().upper() == "UTC" else ZoneInfo(m["tz"].strip())
+        at = now() if at is None else at
+        local = datetime.fromtimestamp(at, tz)
+        t = local.replace(hour=int(m["h"]) % 12 + (12 if m["ap"].lower() == "pm" else 0),
+                          minute=int(m["m"] or 0), second=0, microsecond=0)
+        if m["mon"]:
+            t = t.replace(month=MONTHS.index(m["mon"].lower()) + 1, day=int(m["day"]))
+            if t < local - timedelta(days=1):
+                t = t.replace(year=t.year + 1)
+        elif t < local - timedelta(hours=1):  # a clock a little ahead of the API's is still today
+            t += timedelta(days=1)
+    except (ValueError, KeyError, ZoneInfoNotFoundError):
+        return None
+    return t.timestamp() if t.timestamp() - at < 8 * 86400 else None
+
+
 def env_retry(agent, run_id, outcome):
-    """Queue a run's work again after the next of ENV_DELAYS, without counting
-    it as a try; the human hears once while runs keep failing this way."""
+    """Queue a run's work again without counting it as a try: after the usage
+    limit its outcome names resets, or else after the next of ENV_DELAYS. The
+    human hears once while runs keep failing this way."""
     k = int(kv_get(f"env-failures:{agent}", "0"))
-    delay = ENV_DELAYS[min(k, len(ENV_DELAYS) - 1)]
     kv_set(f"env-failures:{agent}", str(k + 1))
-    q("UPDATE triggers SET run_id=NULL, not_before=? WHERE run_id=?", now() + delay, run_id)
+    reset = limit_resets(outcome)
+    until = max(reset + LIMIT_MARGIN, now() + 60) if reset else now() + ENV_DELAYS[min(k, len(ENV_DELAYS) - 1)]
+    q("UPDATE triggers SET run_id=NULL, not_before=?, env_held=1 WHERE run_id=?", until, run_id)
+    if reset:
+        # The limit is the account's, so every agent's held work waits for it,
+        # and none waits longer.
+        q("UPDATE triggers SET not_before=? WHERE env_held=1 AND run_id IS NULL", until)
     since = kv_get("env-failing")
     if not since:
         since = iso(now())
         kv_set("env-failing", since)
     add_notice(f"env-failing:{since}", "env-failing", None, None,
                f"runs are failing before they get going ({agent} run {run_id}: {outcome}). Their work is retried "
-               f"after {', then '.join(f'{s // 60} minutes' for s in ENV_DELAYS)}, and then at that interval, "
-               "until runs get going again. Look for an outage, the proxy or the Claude credential.")
-    log(f"{agent} run {run_id} {outcome} before getting going: its work is queued again in {delay // 60} minutes")
+               + (f"after the usage limit resets, at {iso(until)}. " if reset else
+                  f"after {', then '.join(f'{s // 60} minutes' for s in ENV_DELAYS)}, and then at that interval, "
+                  "until runs get going again. Look for an outage, the proxy or the Claude credential."))
+    log(f"{agent} run {run_id} {outcome}: its work is queued again at {iso(until)}"
+        + (", when the usage limit has reset" if reset else ""))
 
 
 def got_going(agent):
-    """The agent's run got going: its environment works again."""
+    """The agent's run got going: its environment works again. The agents
+    share most of it (the Claude credential and its usage limit, the
+    proxies), so work held back for theirs is due now too, rather than
+    up to an hour later."""
     q("DELETE FROM kv WHERE key=?", f"env-failures:{agent}")
+    held = q("SELECT DISTINCT agent FROM triggers WHERE env_held=1 AND run_id IS NULL AND not_before>?", now())
+    if held:
+        q("UPDATE triggers SET not_before=?, env_held=0 WHERE env_held=1 AND run_id IS NULL", now())
+        log(f"{agent}'s run got going: work held back for the environment is due now "
+            f"({', '.join(r['agent'] for r in held)})")
     if not q("SELECT 1 FROM kv WHERE key LIKE 'env-failures:%'"):
         q("DELETE FROM kv WHERE key='env-failing'")
 
@@ -2355,7 +2408,9 @@ def end_run(agent, run_id, r):
       r.get("session_id"), r.get("log"), r.get("transcript"), int(bool(r.get("in_extension"))),
       changes, r.get("archived_log"), r.get("archived_transcript"), run_id)
     outcome = r.get("outcome") or ""
-    idle = never_got_going(r, changes)
+    # A usage limit cuts a run short however far it got: its environment's
+    # fault, not its work's, so it is retried as one that never got going.
+    idle = never_got_going(r, changes) or bool(limit_resets(outcome))
     if not idle:
         got_going(agent)
     if paused() and outcome != "interrupted":
@@ -2467,17 +2522,20 @@ def kit_summary():
             stuck.append(f"{len(mine)} queued for {agent}, whose runner hasn't called in for {span(silent)}: "
                          f"restart its container")
             continue
-        held = sum(t["id"] in later_ids for t in mine)
-        held = f" ({held} not yet due)" if held else ""
+        due = [t["not_before"] for t in mine if t["id"] in later_ids]
+        held = f" ({len(due)} not yet due, the first at {iso(min(due))})" if due else ""
         work.append(f"{len(mine)} queued for {agent}, the oldest for {span(now() - min(t['created'] for t in mine))}"
                     f"{held}")
     if ci:
         work.append("CI running")
+    failing = env_failing_text()
     notes = []
     if capped_agents:
         notes.append(f"capped with work waiting: {', '.join(capped_agents)} (raise its cap, or it waits for midnight UTC)")
     if stuck:
         head = "stuck"
+    elif failing:
+        head = "failing"
     elif work:
         head = "working"
     elif waiting or capped_agents:
@@ -2485,8 +2543,22 @@ def kit_summary():
     else:
         head = "quiet"
         notes.append(f"once it has been quiet for {IDLE // 60} minutes, the coordinator summarises what waits on you")
-    lines = [f"stuck: {s}" for s in stuck] + work + notes
+    lines = [f"stuck: {s}" for s in stuck] + ([f"failing: {failing}"] if failing else []) + work + notes
     return "\n".join([f"Kit: {head}; {wait}"] + [f"  - {line}" for line in lines])
+
+
+def env_failing_text():
+    """While runs fail before they get going: since when, for whom, and the
+    latest such run's outcome, which names the cause (a usage limit, say)."""
+    since = kv_get("env-failing")
+    agents = sorted(r["key"].split(":", 1)[1] for r in q("SELECT key FROM kv WHERE key LIKE 'env-failures:%'"))
+    if not since or not agents:
+        return None
+    last = q(f"SELECT agent, outcome FROM runs WHERE ended IS NOT NULL AND agent IN ({','.join('?' * len(agents))}) "
+             "ORDER BY ended DESC LIMIT 1", *agents)
+    latest = f"; the latest, {last[0]['agent']}'s, ended {clip_line(last[0]['outcome'] or '?', 160)}" if last else ""
+    return (f"runs have failed before getting going since {since} ({', '.join(agents)}){latest}. "
+            "Their work is tried again when due")
 
 
 def notices_text(after):

@@ -201,8 +201,9 @@ Open it with `scripts/open.sh coordinator`. It's the session named like "coordin
   It then shows your sessions, the notices, and the open requests, pull requests, recommendations and `needs-human` items across the project. It also shows whether the gatekeeper is running and its latest approvals.
 
   It ends with the kit's state, on one line with how many items wait on you, then one indented line for each thing behind it:
-  - "Kit: working": each run, with what it is for and how long it has run; each agent's queued work, with how long the oldest has waited; and CI;
+  - "Kit: working": each run, with what it is for and how long it has run; each agent's queued work, with how long the oldest has waited and, for work held back, when the first of it is due; and CI;
   - "Kit: stuck": first, what can't move on by itself, marked "stuck:": queued work whose runner has stopped calling in (restart that agent's container: `docker compose restart <agent>`), or a run claimed but never started (closed by itself after 15 minutes, `CLAIM_START_SECONDS`, with its work queued again); then whatever else is working;
+  - "Kit: failing": runs keep failing before they get going (an outage, the proxy, the Claude credential or the usage limit), marked "failing:", with which agents and how the latest run ended, which names the cause; then whatever else is working. Their work is tried again by itself, so there is nothing to do unless the cause is yours to fix;
   - "Kit: quiet, nothing happens until you act": what waits on you;
   - "Kit: quiet" with nothing waiting on you, in which case the coordinator's summary comes next.
 - **`scripts/watch.sh`** keeps that last part on screen, followed by what each agent owes (one line each, with how many times it has been woken, and "now yours" once it is a `Stalled:` decision), redrawn every 15 seconds (`-n 60` for every minute) until Ctrl-C. Piped or redirected, it prints the state with the time whenever it changes, so `scripts/watch.sh > kit.log` keeps a record.

@@ -4,6 +4,7 @@ scripts/test-dispatcher.sh, in the dispatcher's image. test_states.py
 checks the states themselves, over every combination of their facts.
 
 The numbers are those of DESIGN.md's Triggers."""
+import datetime
 import base64
 import json
 import os
@@ -1344,6 +1345,12 @@ class Summary(Case):
         d.q("UPDATE triggers SET created=?", d.now() - 300)
         self.assertIn("  - 1 queued for core, the oldest for 5 minutes", self.lines())
 
+    def test_queued_work_not_yet_due_says_when_it_is(self):
+        d.add_trigger("core", "work:1", "some work", once=True, not_before=d.now() + 600)
+        d.runner_seen("core")
+        self.assertIn(f"  - 1 queued for core, the oldest for under a minute (1 not yet due, the first at "
+                      f"{d.iso(d.now() + 600)})", self.lines())
+
     def test_a_claim_that_never_started_is_stuck(self):
         d.q("INSERT INTO runs (agent, triggers, claimed) VALUES ('core', '[]', ?)", d.now() - 600)
         lines = self.lines()
@@ -1404,6 +1411,63 @@ class FailedRunsAreRetried(Case):
         d.end_run("core", run, {"outcome": "completed", "turns": 30, "cost": 1.5})
         self.assertIsNone(d.kv_get("env-failures:core"))
         self.assertIsNone(d.kv_get("env-failing"))
+
+    def test_work_held_for_its_environment_keeps_its_delay_when_its_rule_queues_it_again(self):
+        d.end_run("core", self.claim(), {"outcome": "failed: API Error", "turns": 1, "cost": 0})
+        d.add_trigger("core", "work:1", "some work", once=True)
+        self.assertGreater(d.q("SELECT not_before FROM triggers WHERE key='work:1'")[0]["not_before"], d.now())
+
+    def test_a_run_getting_going_releases_every_agents_work_held_for_the_environment(self):
+        limit = {"outcome": "failed: Claude AI usage limit reached", "turns": 1, "cost": 0}
+        d.end_run("core", self.claim(), limit)
+        d.add_trigger("scale", "work:2", "other work", once=True)
+        d.q("UPDATE triggers SET created=?, not_before=NULL WHERE key='work:2'", d.now() - 3600)
+        d.end_run("scale", d.claim("scale")["run"], limit)
+        for name, value in (("waiting_on_human", lambda: 0), ("ci_running", lambda: False)):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+            setattr(d, name, value)
+        self.assertIn("failing: runs have failed before getting going since", d.kit_summary())
+        self.assertIn("(core, scale); the latest, scale's, ended failed: Claude AI usage limit reached",
+                      d.kit_summary())
+        d.add_trigger("demos", "work:3", "demos work", once=True)
+        d.q("UPDATE triggers SET created=? WHERE key='work:3'", d.now() - 3600)
+        d.end_run("demos", d.claim("demos")["run"], {"outcome": "completed", "turns": 9, "cost": 0.4})
+        held = d.q("SELECT not_before, env_held FROM triggers WHERE key IN ('work:1', 'work:2')")
+        self.assertTrue(all(t["not_before"] <= d.now() and not t["env_held"] for t in held), [dict(t) for t in held])
+        # The others still count as failing until a run of theirs gets going.
+        self.assertIsNotNone(d.kv_get("env-failing"))
+
+    def test_a_usage_limit_is_retried_when_it_resets_for_every_agent_however_far_the_run_got(self):
+        reset = d.limit_resets("resets 4:40pm (UTC)")
+        d.add_trigger("scale", "work:2", "other work", once=True)
+        d.q("UPDATE triggers SET created=?, not_before=NULL WHERE key='work:2'", d.now() - 3600)
+        d.end_run("scale", d.claim("scale")["run"], {"outcome": "failed: API Error", "turns": 1, "cost": 0})
+        # Cut short after 33 turns: not counted, and held until the reset.
+        d.end_run("core", self.claim(), {"outcome": "failed: You've hit your session limit · resets 4:40pm (UTC)",
+                                         "turns": 33, "cost": 0.71})
+        rows = d.q("SELECT key, attempts, not_before FROM triggers WHERE key IN ('work:1', 'work:2') ORDER BY key")
+        expected = max(reset + d.LIMIT_MARGIN, d.now() + 60)
+        for t in rows:
+            self.assertEqual(t["attempts"], 0)
+            self.assertAlmostEqual(t["not_before"], expected, delta=5)
+        self.assertFalse([w for w in self.f.writes if w[1].endswith("/issues")])
+
+    def test_when_a_usage_limit_resets(self):
+        at = datetime.datetime(2026, 11, 23, 16, 20, tzinfo=datetime.timezone.utc).timestamp()
+        utc = lambda *a: datetime.datetime(*a, tzinfo=datetime.timezone.utc).timestamp()
+        for text, expected in (
+                ("failed: You've hit your session limit · resets 4:40pm (UTC)", utc(2026, 11, 23, 16, 40)),
+                ("resets 5pm (UTC)", utc(2026, 11, 23, 17, 0)),
+                ("resets 3am (UTC)", utc(2026, 11, 24, 3, 0)),  # tomorrow
+                ("resets 4pm (UTC)", utc(2026, 11, 23, 16, 0)),  # just passed: still today
+                ("resets 12:15am (Europe/London)", utc(2026, 11, 24, 0, 15)),
+                ("resets 9am (America/New_York)", utc(2026, 11, 24, 14, 0)),
+                ("weekly limit · resets Nov 27, 9am (UTC)", utc(2026, 11, 27, 9, 0)),
+                ("failed: error_max_turns", None),
+                ("resets 4:40pm", None),  # no zone: can't tell when
+                ("resets 4:40pm (Nowhere/Atlantis)", None),
+                ("resets Dec 31, 9am (UTC)", None)):  # too far off to be a usage limit
+            self.assertEqual(d.limit_resets(text, at), expected, text)
 
     def test_a_run_that_did_something_is_an_ordinary_failure(self):
         d.end_run("core", self.claim(), {"outcome": "failed: error_during_execution", "turns": 1, "cost": 0.2})
