@@ -69,6 +69,8 @@ KEYS_DIR = Path(os.environ.get("RUNNER_KEYS_DIR", "/run/secrets/runner-keys"))
 AGENTS_CONF = Path(os.environ.get("AGENTS_CONF", "/etc/kit/agents.conf"))
 CONTROL = Path(os.environ.get("CONTROL_DIR", "/control"))
 FORGE = os.environ.get("FORGE_URL", "http://forgejo:3000").rstrip("/")
+# Forgejo as the human's browser reaches it, for links in what the kit writes.
+FORGE_WEB = os.environ.get("FORGE_WEB_URL", FORGE).rstrip("/")
 ORG = os.environ.get("FORGE_ORG", "")
 HUMAN = os.environ.get("HUMAN_USER", "")
 PREFIX = os.environ.get("REPO_PREFIX", "inkproof-")
@@ -189,11 +191,8 @@ def draining():
 def under_way():
     """What a clean stop waits for: runs not yet ended, and CI."""
     work = [f"{r['agent']}'s run {r['id']}" for r in q("SELECT id, agent FROM runs WHERE ended IS NULL ORDER BY id")]
-    try:
-        if ci_running():
-            work.append("CI")
-    except Exception as e:
-        work.append(f"CI, which Forgejo can't tell ({e!r})")
+    if ci_running():
+        work.append("CI")
     return work
 
 
@@ -236,6 +235,7 @@ CREATE TABLE IF NOT EXISTS shadow (
   id INTEGER PRIMARY KEY, unit TEXT, agent TEXT, side TEXT, state TEXT, rules TEXT,
   first REAL, last REAL, resolved REAL);
 CREATE INDEX IF NOT EXISTS shadow_unit ON shadow (unit, resolved);
+CREATE TABLE IF NOT EXISTS human_waits (repo TEXT, number INTEGER, PRIMARY KEY (repo, number));
 """)
 for column in ("triggers ADD COLUMN not_before REAL",  # ledgers from before stage 5
                "events ADD COLUMN detail TEXT",      # ledgers from before the activity stream
@@ -484,6 +484,28 @@ def unreleased_entry(repo):
     return cached(("unreleased", repo), 60, read)
 
 
+def released_top(repo):
+    """If CHANGELOG.md's newest heading on main is the last release's: (its
+    tag, whether lines were added under it after the tag), else None. An
+    entry written before the tag and merged after it lands there (demos,
+    2026-11-23: #119's lines under an already released v0.22.0)."""
+    def section(text):
+        m = CHANGELOG_VERSION.search(text or "")
+        if not m:
+            return None
+        nxt = re.compile(r"(?m)^##[ \t]").search(text, m.end())
+        return text[m.start():nxt.start() if nxt else len(text)].strip()
+
+    def read():
+        last = last_tag(repo)
+        text = file_text(repo, "CHANGELOG.md", "main")
+        m = CHANGELOG_VERSION.search(text or "")
+        if not last or not m or tuple(int(x) for x in m.groups()) != last[1]:
+            return None
+        return last[0], section(text) != section(file_text(repo, "CHANGELOG.md", last[0]))
+    return cached(("released-top", repo), 60, read)
+
+
 def ci_state(repo, sha):
     """success, failure, running or none: the commit statuses branch
     protection requires (contexts starting "checks"), as it sees them."""
@@ -656,17 +678,31 @@ def decision_issue(repo, key, kind, title, sections):
         log(f"couldn't open the decision {title!r} on {repo}: {e}")
 
 
+def waits_on_you(issue, pr):
+    """Whether an item, as Forgejo serves it, waits on the human: open, and
+    assigned to them or requesting their review."""
+    return issue.get("state") == "open" and HUMAN in (
+        {a.get("login") for a in issue.get("assignees") or []}
+        | {u.get("login") for u in (pr or {}).get("requested_reviewers") or []})
+
+
+def note_waiting(repo, n, waits):
+    """Keep the index of what waits on the human in step with an item as
+    last read: every evaluation reads the item anyway (Item), on a webhook
+    or in the sweep, which also drops what closed unseen (evaluate_repo)."""
+    if waits:
+        q("INSERT OR IGNORE INTO human_waits (repo, number) VALUES (?,?)", repo, n)
+    else:
+        q("DELETE FROM human_waits WHERE repo=? AND number=?", repo, n)
+
+
 def waiting_for_human():
     """The open issues and pull requests that wait on the human, as sorted
-    `repo#n`: assigned to them, or requesting their review."""
-    found = set()
-    for repo in OWNER_OF:
-        for i in forge_list(f"/repos/{ORG}/{repo}/issues?state=open&type=all&assigned_by={HUMAN}"):
-            found.add((repo, i["number"]))
-        for p in forge_list(f"/repos/{ORG}/{repo}/pulls?state=open"):
-            if HUMAN in {u["login"] for u in p.get("requested_reviewers") or []}:
-                found.add((repo, p["number"]))
-    return [f"{r}#{n}" for r, n in sorted(found)]
+    `repo#n`: assigned to them, or requesting their review. From the index
+    the evaluations keep, never from Forgejo: the status page asks this every
+    few seconds."""
+    return [f"{r['repo']}#{r['number']}" for r in q("SELECT repo, number FROM human_waits ORDER BY repo, number")
+            if r["repo"] in OWNER_OF]
 
 
 def waiting_on_human():
@@ -696,6 +732,10 @@ def handle(event, payload):
         return
     if not project_repo(repo):
         return
+    # What can start an Actions run (checks.yml: pushes, pull requests), and
+    # a run's end: whether CI runs there is checked again (refresh_ci).
+    if event in ("push", "create", "pull_request") or event.startswith("action_run"):
+        ci_may_run(repo)
     trusted = sender in TRUSTED
     action = payload.get("action")
     item = payload.get("issue") or payload.get("pull_request") or {}
@@ -1395,8 +1435,18 @@ def release_facts(repo, items):
     who = {ST.OWNER: [OWNER_OF.get(repo)], ST.COORDINATOR: [COORDINATOR or HUMAN]}
     names = " ".join(str(it.n) for it in ready)
     level3 = f.level3
+    owner_note = ""
+    if f.heading == "wrong":
+        owner_note = f" (`forge version` gives {expected}; CHANGELOG.md heads {entry})"
+    elif ST.state(f).name == "no entry":
+        top = released_top(repo)
+        if top and top[1]:
+            owner_note = (f" (CHANGELOG.md's newest heading, {top[0]}, is already released, and lines were added "
+                          f"under it after {top[0]} was tagged: move them under a new heading)")
+        elif top:
+            owner_note = f" (CHANGELOG.md's newest heading, {top[0]}, is the last release)"
     who["notes"] = {
-        ST.OWNER: f" (`forge version` gives {expected}; CHANGELOG.md heads {entry})" if f.heading == "wrong" else "",
+        ST.OWNER: owner_note,
         ST.COORDINATOR: (
             f": `forge release {repo} '<one-line note>' {names}`".rstrip() if level3 else
             f", whose command is `scripts/release.sh {repo} '<one-line note>' {names}`".rstrip())
@@ -1498,9 +1548,9 @@ def sync(unit, owes):
         want = {}
         for o in owes:
             want.setdefault((o.agent, o.what), o)
-        for k, r in rows.items():
-            if k not in want:
-                DB.execute("DELETE FROM obligations WHERE id=?", (r["id"],))
+        gone = [r for k, r in rows.items() if k not in want]
+        for r in gone:
+            DB.execute("DELETE FROM obligations WHERE id=?", (r["id"],))
         # What isn't quiet first, so that a quiet one waits for it.
         for k, o in sorted(want.items(), key=lambda kv: kv[1].quiet):
             if k in rows:
@@ -1511,6 +1561,9 @@ def sync(unit, owes):
                                  "VALUES (?,?,?,?,?,?,?)", (o.agent, unit, o.what, o.description, int(o.quiet),
                                                             now(), now()))
                 new.append(cur.lastrowid)
+    for r in gone:
+        if r["escalated"]:
+            unstall(r)
     for i in new:
         advance(i, fresh=True)
 
@@ -1570,7 +1623,7 @@ def escalate(r):
     away: the human's, and the supervisor's to find out why."""
     q("UPDATE obligations SET escalated=1 WHERE id=?", r["id"])
     link = unit_link(r["unit"])
-    decision_issue(COORDINATION, f"stalled:{r['unit']}:{r['what']}:{r['agent']}:{int(r['since'])}", "stalled",
+    decision_issue(COORDINATION, stalled_key(r), "stalled",
                    f"Stalled: {r['unit']}", {
         "Question": f"`{r['agent']}` was woken {r['wakes']} times for [{r['unit']}]({link}), and it still owes the "
                     f"same: {r['description']}. What should happen?",
@@ -1582,7 +1635,9 @@ def escalate(r):
                           "the kit can see, and one that doesn't is a gap in the protocol or its role."
                           + (" The supervisor has been woken to look into it too." if SUPERVISOR else ""),
         "If you say go ahead": "Nothing changes by itself: say on the item what should happen, then close this "
-                               "issue. The kit doesn't wake anyone for it again until what it owes changes.",
+                               "issue. The kit doesn't wake anyone for it again until what it owes changes. If "
+                               f"`{r['agent']}` no longer owes it before you act, the kit says so here and closes "
+                               "this issue.",
         "Blocked on this": f"{r['unit']}."})
     log(f"{r['agent']} was woken {r['wakes']} times for {r['unit']} ({r['what']}): it is the human's")
     if SUPERVISOR and SUPERVISOR != r["agent"] and not capped(SUPERVISOR):
@@ -1592,13 +1647,37 @@ def escalate(r):
                     "move it on if you can, and report the gap (Role: Supervision)")
 
 
+def stalled_key(r):
+    return f"stalled:{r['unit']}:{r['what']}:{r['agent']}:{int(r['since'])}"
+
+
+def unstall(r):
+    """An escalated obligation that went away: its `Stalled:` decision is
+    closed, saying so, unless the human closed it already."""
+    rows = q("SELECT number FROM notices WHERE key=? AND posted=1", stalled_key(r))
+    if not rows or not rows[0]["number"]:
+        return
+    n = rows[0]["number"]
+    try:
+        if forge("GET", f"/repos/{ORG}/{COORDINATION}/issues/{n}").get("state") != "open":
+            return
+        forge("POST", f"/repos/{ORG}/{COORDINATION}/issues/{n}/comments", {"body": (
+            f"{NO_REPLY}\n\n@{HUMAN} Moved on: `{r['agent']}` no longer owes this ({r['what']}), so it needs "
+            "nothing from you. Closed by the kit; whatever kept it stalled may still be worth a look.")})
+        forge("PATCH", f"/repos/{ORG}/{COORDINATION}/issues/{n}", {"state": "closed"})
+        log(f"{r['unit']} moved on: closed its decision {COORDINATION}#{n}")
+    except Exception as e:
+        log(f"couldn't close the decision {COORDINATION}#{n} for {r['unit']}: {e!r}")
+
+
 def unit_link(unit):
+    """A unit's page in Forgejo, as the human's browser reaches it."""
     m = re.fullmatch(r"([\w.-]+)#(\d+)", unit)
     if m:
-        return f"{FORGE}/{ORG}/{m[1]}/issues/{m[2]}"
+        return f"{FORGE_WEB}/{ORG}/{m[1]}/issues/{m[2]}"
     if unit.startswith("release:"):
-        return f"{FORGE}/{ORG}/{unit[len('release:'):]}"
-    return f"{FORGE}/{ORG}/{COORDINATION}/milestones"
+        return f"{FORGE_WEB}/{ORG}/{unit[len('release:'):]}"
+    return f"{FORGE_WEB}/{ORG}/{COORDINATION}/milestones"
 
 
 def wake_due():
@@ -1747,9 +1826,11 @@ def evaluate(repo, n, dependents=True, seed=False):
         it = Item(repo, n)
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            note_waiting(repo, n, False)
             sync(f"{repo}#{n}", [])
             return
         raise
+    note_waiting(repo, n, waits_on_you(it.issue, it.pr))
     owes, owed, blocked, found = owed_on(it)
     # Only an open item waits: a closed one's lines block nothing.
     now_on = set(found) if it.open else set()
@@ -1846,11 +1927,18 @@ def evaluate_repo(repo, items=False, seed=False):
         if e.code != 404:
             raise
     if items:
-        for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all"):
+        open_now = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
+        for i in open_now:
             try:
                 evaluate(repo, i["number"], dependents=False, seed=seed)
             except Exception as e:
                 log(f"evaluating {repo}#{i['number']} failed: {e!r}")
+        # Only an open item waits on the human: one that closed with no
+        # webhook to say so leaves the index here.
+        still = {i["number"] for i in open_now}
+        for r in q("SELECT number FROM human_waits WHERE repo=?", repo):
+            if r["number"] not in still:
+                note_waiting(repo, r["number"], False)
 
 
 def no_longer_owed(rows):
@@ -2014,24 +2102,70 @@ def last_activity():
     return max([t for t in found if t] or [0])
 
 
-def ci_running():
-    """Whether an Actions run is under way. A run left waiting for over an
-    hour (its pull request closed before a runner took it) doesn't count."""
-    for repo in OWNER_OF:
-        if not has_ci(repo) or cached(("missing", repo), 300, lambda: forge_missing(repo)):
-            continue
-        for status in ("running", "waiting"):
-            runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?status={status}") or {}
-            runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
-            for r in runs or []:
-                if r.get("status") != status:
-                    continue
-                if status == "running":
-                    return True
-                created = datetime.fromisoformat((r.get("created") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
-                if now() - created.timestamp() < 3600:
-                    return True
+# Whether CI is running is read from Forgejo only where it may have changed:
+# a webhook that can start or end a run marks its repository (ci_may_run),
+# and the idler checks the marked ones, and those found busy, once a minute
+# (refresh_ci). The sweep checks every repository, for what no webhook said.
+# So ci_running, which the status page asks every few seconds, reads nothing
+# from Forgejo, and a quiet kit asks it nothing about CI.
+
+CI_LOCK = threading.Lock()
+CI_MARKED = {}   # repo: when a webhook marked it, until a check after that
+CI_BUSY = set()  # repos whose last check found a run under way
+
+
+def ci_may_run(repo):
+    if repo in OWNER_OF and has_ci(repo):
+        with CI_LOCK:
+            CI_MARKED[repo] = now()
+
+
+def ci_busy(repo):
+    """Whether an Actions run is under way on a repository. A run left
+    waiting for over an hour (its pull request closed before a runner took
+    it) doesn't count."""
+    if cached(("missing", repo), 300, lambda: forge_missing(repo)):
+        return False
+    for status in ("running", "waiting"):
+        runs = forge("GET", f"/repos/{ORG}/{repo}/actions/runs?status={status}") or {}
+        runs = runs.get("workflow_runs", []) if isinstance(runs, dict) else runs
+        for r in runs or []:
+            if r.get("status") != status:
+                continue
+            if status == "running":
+                return True
+            created = datetime.fromisoformat((r.get("created") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
+            if now() - created.timestamp() < 3600:
+                return True
     return False
+
+
+def refresh_ci(every=False):
+    """Check the repositories marked or found busy, or with every, all of
+    them. A repository marked again during its check stays marked, and one
+    that can't be checked is marked, so that ci_running errs towards busy."""
+    with CI_LOCK:
+        repos = [r for r in OWNER_OF if has_ci(r)] if every else sorted(set(CI_MARKED) | CI_BUSY)
+    for repo in repos:
+        checked = now()
+        try:
+            busy = ci_busy(repo)
+        except Exception as e:
+            log(f"couldn't tell whether CI runs on {repo}: {e!r}")
+            ci_may_run(repo)
+            continue
+        with CI_LOCK:
+            (CI_BUSY.add if busy else CI_BUSY.discard)(repo)
+            if CI_MARKED.get(repo, checked + 1) <= checked:
+                del CI_MARKED[repo]
+
+
+def ci_running():
+    """Whether an Actions run is under way, or may be: a repository marked
+    and not yet checked counts. From what refresh_ci last found, never from
+    Forgejo."""
+    with CI_LOCK:
+        return bool(CI_MARKED or CI_BUSY)
 
 
 def check_idle():
@@ -2077,6 +2211,10 @@ def idler():
         except Exception as e:
             log(f"moving obligations on failed: {e!r}")
         try:
+            refresh_ci()
+        except Exception as e:
+            log(f"checking CI failed: {e!r}")
+        try:
             check_idle()
         except Exception as e:
             log(f"checking for idleness failed: {e!r}")
@@ -2088,6 +2226,10 @@ def reconciler():
             reconcile()
         except Exception as e:
             log(f"reconciliation failed: {e!r}")
+        try:
+            refresh_ci(every=True)
+        except Exception as e:
+            log(f"checking CI everywhere failed: {e!r}")
         time.sleep(RECONCILE)
 
 
@@ -2482,11 +2624,8 @@ def kit_summary():
     happens until the human acts, on its first line; then one indented line
     for each thing it is doing or waiting on. The same test as check_idle,
     without its wait for quiet."""
-    try:
-        waiting = waiting_on_human()
-        ci = ci_running()
-    except Exception as e:
-        return f"Kit: can't tell ({e!r} from Forgejo)"
+    waiting = waiting_on_human()
+    ci = ci_running()
     wait = (f"{waiting} item{'' if waiting == 1 else 's'} wait{'s' if waiting == 1 else ''} on you"
             if waiting else "nothing waits on you")
     if paused():
@@ -2905,6 +3044,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     STARTED = now()
+    # Until the idler's first check, CI may be running anywhere.
+    for r in OWNER_OF:
+        ci_may_run(r)
     log(f"listening on :8080; agents: {', '.join(AGENTS)}")
     threading.Thread(target=reconciler, daemon=True).start()
     threading.Thread(target=idler, daemon=True).start()

@@ -175,7 +175,7 @@ The kit files its own decisions the same way:
 - a run the extension doesn't list;
 - a step an agent was woken for three times without taking it (`Stalled: <repo>#<n>`, or `Stalled: release:<repo>`, `milestone:<title>` or `kit`), such as a released request nobody verifies.
 
-Each agent is woken for what it owes at once, again as soon as that run ends if it still owes it, then after 15 minutes, twice (`OBLIGATION_BACKOFF`). An agent that can't take a step yet must say why where the kit can see it: a `Blocked-by:` line, `Waiting-on:`, `needs-human` with a decision, or `not-verified`. So a `Stalled:` decision means it did neither, about half an hour after it was first woken. The supervisor (`process`) is woken with it: it finds out why, nudges the agent that should act, and files a recommendation for the gap. See what it said on the item, and `scripts/activity.sh <repo>#<n>`.
+Each agent is woken for what it owes at once, again as soon as that run ends if it still owes it, then after 15 minutes, twice (`OBLIGATION_BACKOFF`). An agent that can't take a step yet must say why where the kit can see it: a `Blocked-by:` line, `Waiting-on:`, `needs-human` with a decision, or `not-verified`. So a `Stalled:` decision means it did neither, about half an hour after it was first woken. If the agent then takes the step, or what it owes changes, the kit comments on the decision and closes it for you. The supervisor (`process`) is woken with it: it finds out why, nudges the agent that should act, and files a recommendation for the gap. See what it said on the item, and `scripts/activity.sh <repo>#<n>`.
 
 Below level 3, the coordinator puts each library's ready release to you as a decision, `Release <repo>`, with the exact command to run.
 

@@ -68,6 +68,7 @@ class Forge:
         self.codeowners, self.releases, self.changelogs = {}, {}, {}
         self.files = {}  # (repo, path, ref): text, for any other file
         self.tags = {}  # repo: [tag], besides each published release's
+        self.runs = {}  # repo: [Actions run], each with its status
 
     def release(self, repo, tag, ago, draft=False):
         """Publish a release: the newest first, as Forgejo lists them."""
@@ -110,6 +111,12 @@ class Forge:
         args = dict(urllib.parse.parse_qsl(query))
         if method != "GET":
             self.writes.append((method, path, body))
+            # An issue the kit opens (a decision) exists from then on, numbered after the others.
+            if method == "POST" and (m := re.fullmatch(r"/repos/org/([\w.-]+)/issues", path)):
+                n = max([k for (r, k) in self.items if r == m[1]] + [900]) + 1
+                self.issue(m[1], n, "dispatcher", ["needs-human"], body=body["body"], title=body["title"],
+                           assignees=body.get("assignees") or ())
+                return {"number": n}
             return {}
         repo, rest = re.fullmatch(r"/repos/org/([\w.-]+)/?(.*)", path).groups()
         # Forgejo serves every comment at once, ignoring page and limit.
@@ -153,7 +160,7 @@ class Forge:
             if repo not in self.codeowners:
                 raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
             return {"content": base64.b64encode(self.codeowners[repo].encode()).decode()}
-        if rest == "contents/CHANGELOG.md":
+        if rest == "contents/CHANGELOG.md" and (repo, "CHANGELOG.md", args.get("ref")) not in self.files:
             if repo not in self.changelogs:
                 raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
             return {"content": base64.b64encode(self.changelogs[repo].encode()).decode()}
@@ -167,6 +174,8 @@ class Forge:
                     if not r["draft"]] + [{"name": n, "commit": {"sha": "t" * 40}} for n in self.tags.get(repo, [])]
         if rest == "releases":
             return self.releases.get(repo, [])
+        if rest == "actions/runs":
+            return {"workflow_runs": [r for r in self.runs.get(repo, []) if r["status"] == args["status"]]}
         if rest == "milestones":
             return [m for m in self.milestones.get(repo, []) if args.get("state", "open") in ("all", m.get("state", "open"))]
         if rest == "labels":
@@ -176,8 +185,11 @@ class Forge:
 
 class Case(unittest.TestCase):
     def setUp(self):
-        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels", "units", "obligations"):
+        for t in ("triggers", "runs", "kv", "notices", "blocked_by", "labels", "units", "obligations",
+                  "human_waits"):
             d.q(f"DELETE FROM {t}")
+        d.CI_MARKED.clear()
+        d.CI_BUSY.clear()
         d.kv_set("rules-seeded", d.now())
         d.kv_set("obligations-started", d.now())
         d._cache.clear()
@@ -929,6 +941,20 @@ class Releases(Case):
         self.assertIn("nothing is labelled ready-for-release, but CHANGELOG.md on main heads v0.3.0",
                       self.descriptions("coordinator")[0])
 
+    def test_lines_under_an_already_released_heading_say_so_demos_235(self):
+        # Written before v0.2.0 was tagged, merged after: its lines land under v0.2.0.
+        self.f.files[(CORE, "CHANGELOG.md", "v0.2.0")] = "## v0.2.0\n\n- a.\n"
+        self.f.changelogs[CORE] = "## v0.2.0\n\n- a.\n- b.\n"
+        self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
+        self.assertEqual(self.release(), ("no entry", ["core"]))
+        self.assertIn("(CHANGELOG.md's newest heading, v0.2.0, is already released, and lines were added under it "
+                      "after v0.2.0 was tagged: move them under a new heading)", self.descriptions("core")[0])
+        # Nothing added: only which heading is the last release.
+        self.f.changelogs[CORE] = "## v0.2.0\n\n- a.\n"
+        self.release()
+        self.assertTrue(d.q("SELECT description FROM obligations WHERE agent='core'")[0]["description"]
+                        .endswith("(CHANGELOG.md's newest heading, v0.2.0, is the last release)"))
+
     def test_a_heading_the_gatekeeper_would_refuse_is_the_owners(self):
         self.f.changelogs[CORE] = "## v0.2.1\n\n- b.\n\n## v0.2.0\n"
         self.f.issue(CORE, 5, "scale", ["request", "accepted", "ready-for-release"])
@@ -1096,6 +1122,39 @@ class Obligations(Case):
         self.clock += 3600
         d.wake_due()
         self.assertEqual(self.queued("core"), [], "and stays so")
+
+    def stall(self):
+        for _ in range(3):
+            self.finish()
+            self.clock += 900
+            d.wake_due()
+        n = max(k for (r, k) in self.f.items if r == COORD)
+        self.assertEqual(self.f.items[(COORD, n)]["title"], f"Stalled: {CORE}#1")
+        return n
+
+    def test_the_decision_links_to_the_item_as_the_browser_reaches_it(self):
+        self.addCleanup(setattr, d, "FORGE_WEB", d.FORGE_WEB)
+        d.FORGE_WEB = "http://localhost:3000"
+        n = self.stall()
+        self.assertIn(f"[{CORE}#1](http://localhost:3000/org/{CORE}/issues/1)", self.f.items[(COORD, n)]["body"])
+
+    def test_a_stalled_decision_is_closed_once_it_moves_on_demos_235(self):
+        n = self.stall()
+        self.f.writes.clear()
+        self.f.items[(CORE, 1)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
+        d.evaluate(CORE, 1)
+        self.assertEqual([w[:2] for w in self.f.writes if COORD in w[1]],
+                         [("POST", f"/repos/org/{COORD}/issues/{n}/comments"), ("PATCH", f"/repos/org/{COORD}/issues/{n}")])
+        said = self.f.writes[[w[1] for w in self.f.writes].index(f"/repos/org/{COORD}/issues/{n}/comments")][2]["body"]
+        self.assertIn("Moved on: `core` no longer owes this (untriaged)", said)
+
+    def test_a_stalled_decision_the_human_closed_is_left_alone(self):
+        n = self.stall()
+        self.f.items[(COORD, n)]["state"] = "closed"
+        self.f.writes.clear()
+        self.f.items[(CORE, 1)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
+        d.evaluate(CORE, 1)
+        self.assertEqual([w for w in self.f.writes if COORD in w[1]], [])
 
     def test_discharged_when_what_it_owes_changes(self):
         self.f.items[(CORE, 1)]["labels"] = [{"name": "request"}, {"name": "accepted"}]
@@ -1534,6 +1593,83 @@ class Draining(Case):
         d.now = lambda: real_now() + d.IDLE + 3600
         d.check_idle()
         self.assertEqual(d.q("SELECT key FROM triggers WHERE run_id IS NULL"), [])
+
+
+class StatusReadsNoForge(Case):
+    """The status page, asked every few seconds, reads nothing from Forgejo:
+    what waits on the human is an index the evaluations keep, and whether CI
+    runs is what refresh_ci last found where a webhook said it may have
+    changed."""
+
+    def no_forge(self):
+        def refuse(method, path, body=None):
+            raise AssertionError(f"the status page called Forgejo: {method} {path}")
+        d.forge = refuse
+
+    def test_what_waits_on_the_human_follows_the_evaluations(self):
+        self.f.issue(CORE, 1, "core", ["needs-human"], assignees=["human"])
+        self.f.pull(CORE, 2, "core", requested=["human"])
+        self.f.issue(CORE, 3, "core", ["request", "accepted"])
+        for n in (1, 2, 3):
+            d.evaluate(CORE, n)
+        self.assertEqual(d.waiting_for_human(), [f"{CORE}#1", f"{CORE}#2"])
+        # Closed, and seen closed.
+        self.f.items[(CORE, 2)]["state"] = "closed"
+        d.evaluate(CORE, 2)
+        self.assertEqual(d.waiting_for_human(), [f"{CORE}#1"])
+        # Closed with no webhook: the sweep's pass over open items drops it.
+        self.f.items[(CORE, 1)]["state"] = "closed"
+        d.evaluate_repo(CORE, items=True)
+        self.assertEqual(d.waiting_for_human(), [])
+
+    def test_ci_is_checked_only_where_a_webhook_marked_it(self):
+        d.ci_may_run(CORE)
+        self.no_forge()
+        self.assertTrue(d.ci_running(), "marked and not yet checked: it may be running")
+        d.forge = self.f
+        self.f.runs[CORE] = [{"status": "running"}]
+        d.refresh_ci()
+        self.assertEqual((d.CI_MARKED, d.CI_BUSY), ({}, {CORE}))
+        self.assertTrue(d.ci_running())
+        # Busy, so checked again until the run is over; then nothing is.
+        self.f.runs[CORE] = []
+        d.refresh_ci()
+        self.assertFalse(d.ci_running())
+        self.no_forge()
+        d.refresh_ci()
+        # A run long left waiting doesn't count.
+        d.forge = self.f
+        self.f.runs[SCALE] = [{"status": "waiting", "created": at(7200)}]
+        d.ci_may_run(SCALE)
+        d.refresh_ci()
+        self.assertFalse(d.ci_running())
+
+    def test_a_mark_during_a_check_stands(self):
+        d.ci_may_run(CORE)
+        busy = d.ci_busy
+        self.addCleanup(setattr, d, "ci_busy", busy)
+
+        def marked_meanwhile(repo):
+            d.CI_MARKED[repo] = d.now() + 1
+            return False
+        d.ci_busy = marked_meanwhile
+        d.refresh_ci()
+        self.assertEqual(set(d.CI_MARKED), {CORE})
+
+    def test_what_can_start_ci_marks_its_repository(self):
+        d.handle("push", {"repository": {"name": CORE, "owner": {"login": "org"}}, "sender": {"login": "core"},
+                          "ref": "refs/heads/agent/x"})
+        d.handle("issue_comment", {"repository": {"name": SCALE, "owner": {"login": "org"}},
+                                   "sender": {"login": "scale"}, "action": "created"})
+        self.assertEqual(set(d.CI_MARKED), {CORE})
+
+    def test_the_status_page_calls_nothing(self):
+        self.f.issue(CORE, 1, "core", ["needs-human"], assignees=["human"])
+        d.evaluate(CORE, 1)
+        self.no_forge()
+        s = d.status()
+        self.assertTrue(s["summary"].startswith("Kit: quiet, nothing happens until you act; 1 item waits on you"),
+                        s["summary"])
 
 
 class Priority(Case):

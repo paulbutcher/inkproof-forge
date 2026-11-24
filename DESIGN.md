@@ -117,7 +117,7 @@ Every code owner's review request blocks the merge until that owner approves, so
 - **Matching `CODEOWNERS`.** Each line is a Go regular expression anchored to a whole path without a leading slash (`API\.lock`, `\.forgejo/.*`). Every matching line adds its owners, so the catch-all line and the `API.lock` line combine. This was read from Forgejo's source on 2026-11-09.
 - **No pushes.** Branch protection's "no pushes" applies to the human too, so the human's own changes, such as the `.forgejo/` files `setup-repo.sh` asks for, also go through pull requests. An admin can merge one without the approval.
 - **Scheduled merges.** Forgejo acts on a scheduled merge only when a review or CI status arrives after it was scheduled. A merge scheduled once everything has already passed would never fire, so `forge pr automerge` merges at once in that case.
-- **Actions webhooks.** Forgejo 17 sends a webhook for a finished Actions run, whether it failed or succeeded (verified 2026-11-08).
+- **Actions webhooks.** Forgejo 17 sends a webhook for a finished Actions run, whether it failed or succeeded (verified 2026-11-08). The kit subscribes to no event for a run starting.
 - **Actions write.** A team's Actions write on a repository lets its members re-run a run (`POST /repos/{owner}/{repo}/actions/runs/{id}/rerun`, by the run's database ID), but not write secrets or variables or get a runner registration token, which need the repository's admin (verified 2026-11-20, and by `scripts/test-stage1.sh`).
 
 ### The gatekeeper
@@ -237,6 +237,10 @@ Webhooks only say which units to evaluate again:
 
 On start, and every 15 minutes (`RECONCILE_SECONDS`), a sweep evaluates every repository's release and open items, the issues closed lately, and the milestones and the kit. So a missed delivery delays work rather than losing it. A state held by a timer is evaluated again when the timer runs out. Before a claim is granted, the dispatcher evaluates again each unit behind the agent's work, and drops what is no longer owed.
 
+The status page (`scripts/status.sh`, and `scripts/watch.sh`, which asks every 15 seconds) reads nothing from Forgejo:
+- **What waits on the human.** The dispatcher keeps an index of the open items assigned to the human or requesting their review. Every evaluation of an item updates the item's entry, and the sweep drops entries for items that closed without a webhook.
+- **Whether CI is running.** No webhook says that an Actions run has started. So any push, branch or tag creation, pull request event, or Actions run event marks its repository. Once a minute the dispatcher lists the Actions runs of the marked repositories, and of those it last found busy. The sweep lists every repository's runs. A repository that is marked but not yet checked counts as running, so a drain waits for it.
+
 Only trusted authors count: an agent's own actions, and comments whose first line is `(no reply needed)`, ask nothing.
 
 ### States
@@ -304,7 +308,7 @@ A request's requester, or a pull request's author, that is neither an agent nor 
 - **up to date**: nothing to release, so finished. There is something to release when an open issue is labelled `ready-for-release`, or `CHANGELOG.md`'s newest heading on `main` is above the last release: the highest `vX.Y.Z` tag, as the gatekeeper finds it, since a repository's tags may predate its releases in Forgejo. The changelog is written only when preparing a release, so its entry asks for one even with nothing labelled (demos#105);
 - **held**: a `ready-for-release` issue that something holds (the human, a wait, a blocker). Held by that issue. So when the coordinator can't release, it says why on the issue with a `Waiting-on:` line for the owner, or a `Blocked-by:` line;
 - **main CI running**, or not yet started: a timer; **main CI stuck** after `CI_LATE_SECONDS`, held by the owner;
-- **no entry**: work labelled, with no heading above the last release. Held by the owner;
+- **no entry**: work labelled, with no heading above the last release. Held by the owner. When the newest heading is the last release's, the wake says so, and if lines were added under it after its tag, that they belong under a new heading (an entry written before the tag and merged after it lands there: demos, 2026-11-23);
 - **wrong entry**: a heading other than the version the gatekeeper would compute from `API.lock` since the last release (`states.next_version`, which a test holds to the gatekeeper's). Held by the owner, to make it the version `forge version` gives;
 - **releasable**: held by the coordinator. At level 3 it releases with `forge release`, naming every `ready-for-release` issue. Below level 3 it puts the release to the human as a `Release <repo>` decision with the exact command. Its wake names the issues and gives the command;
 - **with the human**: below level 3, once that decision is open.
@@ -349,7 +353,7 @@ An agent owes each state it holds, and each ask it hasn't answered: one obligati
 - **Discharged** as soon as the unit no longer owes it: when the state, its holders or the ask change. Its queued work is dropped at the claim. If the same state comes back later, it starts afresh.
 - **At once.** A new obligation wakes its agent at once. A quiet one waits while the agent has anything else queued or running.
 - **Again.** Each time a run it woke ends with the obligation still standing, it wakes the agent again after the next of `OBLIGATION_BACKOFF` (default at once, then 15 minutes, then 15 minutes), its unit first evaluated afresh. The wake says it is woken again, and how to say what it waits for. A run can stop short, and an agent that can't act yet must say why in a way that changes the state: a `Blocked-by:` line, `Waiting-on:`, `needs-human` with a decision, or `not-verified`. A comment that only says what it will do changes nothing, so it is woken again.
-- **Then the human's.** Once as many runs have ended with it standing as there are waits, and the last wait is over, it becomes the decision `Stalled: <unit>`, with what the agent owed. If there is a supervisor, it is woken to find out why. The agent isn't woken for it again until what it owes changes.
+- **Then the human's.** Once as many runs have ended with it standing as there are waits, and the last wait is over, it becomes the decision `Stalled: <unit>`, with what the agent owed. If there is a supervisor, it is woken to find out why. The agent isn't woken for it again until what it owes changes. Once the agent no longer owes it, the dispatcher says so on the decision and closes it, unless the human has closed it already. The decision links to the unit as the human's browser reaches Forgejo (`FORGE_WEB_URL`).
 - A wake counts once its run has ended, so an outage, a cap or a pause, which holds the run back, uses up nothing. A run that never got going is retried without counting (Retries). Work dropped by hand (`/admin/drop`) comes back after the next wait.
 - **Dropped once.** On a ledger from before the obligations, the old rules' work that no run has taken is dropped once, at start, as obligations take its place.
 

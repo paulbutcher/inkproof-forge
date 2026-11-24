@@ -171,6 +171,8 @@ services:
     networks: [agents, forge-web]
     environment:
       FORGE_URL: http://forgejo:3000
+      # Forgejo as the human's browser reaches it, for links in its decisions.
+      FORGE_WEB_URL: http://localhost:${FORGE_PORT:-3000}
       FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
       HUMAN_USER: ${HUMAN_USER:?set HUMAN_USER in .env}
       MAX_RUNS_PER_DAY: ${MAX_RUNS_PER_DAY:-20}
