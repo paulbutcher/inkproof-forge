@@ -96,7 +96,7 @@ class Forge:
         i["pr"] = {"number": n, "state": state, "user": {"login": author}, "head": {"sha": sha},
                    "mergeable": mergeable, "title": title, "body": body, "created_at": at(created),
                    "merged": merged is not None, "merged_at": at(merged) if merged is not None else None,
-                   "requested_reviewers": [{"login": r} for r in requested]}
+                   "requested_reviewers": [{"login": r} for r in requested], "updated_at": i["updated_at"]}
         i["files"] = list(files)
         return i
 
@@ -190,6 +190,7 @@ class Case(unittest.TestCase):
             d.q(f"DELETE FROM {t}")
         d.CI_MARKED.clear()
         d.CI_BUSY.clear()
+        d.ITEMS.clear()
         d.kv_set("rules-seeded", d.now())
         d.kv_set("obligations-started", d.now())
         d._cache.clear()
@@ -1670,6 +1671,86 @@ class StatusReadsNoForge(Case):
         s = d.status()
         self.assertTrue(s["summary"].startswith("Kit: quiet, nothing happens until you act; 1 item waits on you"),
                         s["summary"])
+
+
+class ItemsReadOnce(Case):
+    """An item is read once until it changes: the sweep and the items around
+    it reuse what was read, a webhook or a claim reads afresh, and a listing
+    with a newer updated_at, or age, drops what was read."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+        def counting(method, path, body=None):
+            self.calls.append((method, path.split("?")[0]))
+            return self.f(method, path, body)
+        d.forge = counting
+
+    def reads(self, repo, n):
+        """The reads of an item's own issue, pull request, timeline and reviews, sorted."""
+        mine = {f"/repos/org/{repo}/issues/{n}": "issue", f"/repos/org/{repo}/pulls/{n}": "pr",
+                f"/repos/org/{repo}/issues/{n}/timeline": "timeline", f"/repos/org/{repo}/pulls/{n}/reviews": "reviews"}
+        return sorted(mine[p] for m, p in self.calls if m == "GET" and p in mine)
+
+    def test_an_unchanged_issue_is_read_once(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.reads(CORE, 1), ["issue", "timeline"])
+        self.calls.clear()
+        d.evaluate_repo(CORE, items=True)  # the sweep
+        self.assertEqual(self.reads(CORE, 1), [])
+        # A webhook names it: read afresh.
+        d.evaluate(CORE, 1)
+        self.assertEqual(self.reads(CORE, 1), ["issue", "timeline"])
+
+    def test_a_listing_with_a_newer_update_drops_it(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        d.evaluate(CORE, 1)
+        self.calls.clear()
+        self.f.items[(CORE, 1)]["updated_at"] = at(-5)
+        d.evaluate_repo(CORE, items=True)
+        self.assertEqual(self.reads(CORE, 1), ["issue", "timeline"])
+
+    def test_a_pull_request_is_read_afresh_and_its_update_checks_the_rest(self):
+        self.f.pull(CORE, 7, "core", ci="success")
+        d.evaluate(CORE, 7)
+        self.calls.clear()
+        d.evaluate(CORE, 7, fresh=False)
+        self.assertEqual(self.reads(CORE, 7), ["pr"], "only the pull request itself")
+        self.calls.clear()
+        self.f.items[(CORE, 7)]["pr"]["updated_at"] = at(-5)  # pushed to, say
+        d.evaluate(CORE, 7, fresh=False)
+        self.assertEqual(self.reads(CORE, 7), ["issue", "pr", "pr", "reviews", "timeline"],
+                         "its pull request, changed, and so the rest afresh")
+
+    def test_what_is_too_old_is_read_again(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        d.evaluate(CORE, 1)
+        self.calls.clear()
+        real = d.now
+        self.addCleanup(setattr, d, "now", real)
+        d.now = lambda: real() + d.ITEM_MAX_AGE + 1
+        d.evaluate(CORE, 1, fresh=False)
+        self.assertEqual(self.reads(CORE, 1), ["issue", "timeline"])
+
+    def test_a_read_overtaken_by_a_webhook_is_not_kept(self):
+        self.f.issue(CORE, 1, "scale", ["request", "accepted"])
+        inner = d.forge
+
+        def forgotten_meanwhile(method, path, body=None):
+            if "/timeline" in path:
+                d.forget(CORE, 1)
+            return inner(method, path, body)
+        d.forge = forgotten_meanwhile
+        d.item_reads(CORE, 1)
+        self.assertNotIn((CORE, 1), d.ITEMS)
+
+    def test_a_write_to_an_item_is_one_the_kit_reads_afresh(self):
+        for path, n in ((f"/repos/org/{CORE}/issues/3/labels", 3), (f"/repos/org/{CORE}/pulls/4/merge", 4),
+                        (f"/repos/org/{CORE}/issues/5", 5)):
+            self.assertEqual(int(d.ITEM_PATH.match(path)[2]), n)
+        self.assertIsNone(d.ITEM_PATH.match(f"/repos/org/{CORE}/issues"))
 
 
 class Priority(Case):

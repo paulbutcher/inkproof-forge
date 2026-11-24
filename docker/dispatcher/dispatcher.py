@@ -293,7 +293,12 @@ def add_trigger(agent, key, description, once=False, not_before=None):
 FORGE_SLOTS = threading.BoundedSemaphore(int(os.environ.get("FORGE_CONCURRENCY", "8")))
 
 
+ITEM_PATH = re.compile(r"/repos/[^/]+/([^/]+)/(?:issues|pulls)/(\d+)(?:/|$)")
+
+
 def forge(method, path, body=None):
+    if method != "GET" and (m := ITEM_PATH.match(path)):
+        forget(m[1], int(m[2]))  # what the kit writes, it reads afresh
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(FORGE + "/api/v1" + path, method=method, data=data, headers={
         "Authorization": f"token {secret('token')}", "Accept": "application/json",
@@ -414,6 +419,72 @@ def forge_comments(repo, n):
     """Every comment on an issue or pull request. Forgejo serves them all in
     one response, with no paging."""
     return forge("GET", f"/repos/{ORG}/{repo}/issues/{n}/comments") or []
+
+
+# --- Items, read once until they change -------------------------------------------
+#
+# An issue or pull request as the rules read it (Item): its issue, timeline
+# and reviews, and a pull request's files for its head. Kept until a webhook
+# names the item, the kit writes to it, a listing shows a newer updated_at, or
+# ITEM_CACHE_SECONDS pass, so a sweep or a dependent's evaluation reads only
+# what changed. Forgejo bumps updated_at for labels, comments, assignees, a
+# push to a pull request, a review, an edit and closing, but not for a review
+# request or main moving (checked 2026-11-24): a pull request is read afresh
+# every time (its mergeability, head and requested reviewers), and its
+# updated_at checks the rest.
+
+ITEM_MAX_AGE = int(os.environ.get("ITEM_CACHE_SECONDS", "3600"))
+ITEMS = {}     # (repo, n): what was read, and when
+ITEM_GEN = {}  # (repo, n): bumped by forget, so a read under way isn't kept
+ITEMS_LOCK = threading.Lock()
+
+
+def forget(repo, n):
+    with ITEMS_LOCK:
+        ITEMS.pop((repo, n), None)
+        ITEM_GEN[(repo, n)] = ITEM_GEN.get((repo, n), 0) + 1
+
+
+def listed(repo, items):
+    """Forget what a listing shows has changed since it was read."""
+    with ITEMS_LOCK:
+        stale = [i["number"] for i in items
+                 if (e := ITEMS.get((repo, i["number"]))) and e["updated"] != i.get("updated_at")]
+    for n in stale:
+        forget(repo, n)
+
+
+def prune_items():
+    with ITEMS_LOCK:
+        for key in [k for k, e in ITEMS.items() if now() - e["at"] >= ITEM_MAX_AGE]:
+            del ITEMS[key]
+
+
+def item_reads(repo, n):
+    """An item's issue, pull request, timeline and reviews, read afresh or
+    kept (see above). Raises HTTPError 404 for an item that doesn't exist."""
+    key = (repo, n)
+    with ITEMS_LOCK:
+        kept, gen = ITEMS.get(key), ITEM_GEN.get(key, 0)
+    if kept and now() - kept["at"] >= ITEM_MAX_AGE:
+        kept = None
+    if kept and kept["issue"].get("pull_request") is not None:
+        pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}")
+        kept = dict(kept, pr=pr) if pr.get("updated_at") == kept["updated"] else None
+    if kept:
+        return kept
+    issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+    is_pr = issue.get("pull_request") is not None
+    read = {"at": now(), "updated": issue.get("updated_at"), "issue": issue,
+            "pr": forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}") if is_pr else None,
+            "timeline": forge_all(f"/repos/{ORG}/{repo}/issues/{n}/timeline"),
+            "reviews": sorted(forge_all(f"/repos/{ORG}/{repo}/pulls/{n}/reviews"), key=lambda r: r["id"])
+            if is_pr else [],
+            "files": {}}  # head sha: paths, filled when a rule first asks
+    with ITEMS_LOCK:
+        if ITEM_MAX_AGE > 0 and ITEM_GEN.get(key, 0) == gen:
+            ITEMS[key] = read
+    return read
 
 
 _cache = {}
@@ -975,14 +1046,18 @@ def asks(it):
 class Item:
     """An issue or pull request, read once for all the rules."""
 
-    def __init__(self, repo, n):
-        self.repo, self.n = repo, n
-        self.issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+    def __init__(self, repo, n, fresh=False):
+        """fresh: read afresh, it and what it waits on (blocked_rules), as for
+        a webhook or a claim, rather than what was read before (Items)."""
+        self.repo, self.n, self.fresh = repo, n, fresh
+        if fresh:
+            forget(repo, n)
+        self._read = item_reads(repo, n)
+        self.issue = self._read["issue"]
         self.is_pr = self.issue.get("pull_request") is not None
-        self.pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}") if self.is_pr else None
-        self.events = forge_all(f"/repos/{ORG}/{repo}/issues/{n}/timeline")
-        self.reviews = sorted(forge_all(f"/repos/{ORG}/{repo}/pulls/{n}/reviews"), key=lambda r: r["id"]) \
-            if self.is_pr else []
+        self.pr = self._read["pr"]
+        self.events = self._read["timeline"]
+        self.reviews = self._read["reviews"]
         self.labels = {l["name"] for l in self.issue.get("labels") or []}
         self.author = login(self.issue)
         self.owner = OWNER_OF.get(repo)
@@ -1004,7 +1079,10 @@ class Item:
     def files(self):
         """The paths a pull request changes, read when a rule first asks."""
         if self._files is None:
-            self._files = {f["filename"] for f in forge_all(f"/repos/{ORG}/{self.repo}/pulls/{self.n}/files")}
+            kept = self._read["files"]
+            if self.head not in kept:
+                kept[self.head] = {f["filename"] for f in forge_all(f"/repos/{ORG}/{self.repo}/pulls/{self.n}/files")}
+            self._files = kept[self.head]
         return self._files
 
     def comments(self):
@@ -1105,8 +1183,9 @@ def blockers(it):
 def blocker_state(repo, n):
     """When an issue stopped blocking (closed, or released) and why, and for
     an open upstream issue, the human's latest comment on it."""
-    issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
-    comments = forge_comments(repo, n)
+    read = item_reads(repo, n)
+    issue = read["issue"]
+    comments = [e for e in read["timeline"] if e.get("type") == "comment"]
     labels = {l["name"] for l in issue.get("labels") or []}
     s = {"done": None, "what": None, "human": None}
     # Closed while still labelled ready-for-release, its work isn't released:
@@ -1141,6 +1220,9 @@ def blocked_rules(it):
     found = blockers(it)
     if not found or not it.open or not it.owner:
         return [], None, None, found
+    if it.fresh:
+        for b in found:
+            forget(*b)
     states = {b: blocker_state(*b) for b in found}
     done = sorted((when(s["done"]), s["what"]) for s in states.values() if s["done"])
     blocked = len(done) < len(found)
@@ -1793,14 +1875,14 @@ def keep_blocking(repo, n):
     whose Blocked-by: lines name it: an agent waits on it, so it waits on the
     human. The label assigns it to them and tells them (and, for Lasm, wakes
     the lasm review)."""
-    issue = forge("GET", f"/repos/{ORG}/{repo}/issues/{n}")
+    issue = item_reads(repo, n)["issue"]
     labels = {l["name"] for l in issue.get("labels") or []}
     if issue.get("state") != "open" or "upstream" not in labels:
         return
     want = False
     for d in q("SELECT repo, number FROM blocked_by WHERE on_repo=? AND on_number=?", repo, n):
         try:
-            if forge("GET", f"/repos/{ORG}/{d['repo']}/issues/{d['number']}").get("state") == "open":
+            if item_reads(d["repo"], d["number"])["issue"].get("state") == "open":
                 want = True
                 break
         except urllib.error.HTTPError as e:
@@ -1818,12 +1900,14 @@ def keep_blocking(repo, n):
     log(f"{'labelled' if want else 'unlabelled'} {repo}#{n} blocking")
 
 
-def evaluate(repo, n, dependents=True, seed=False):
+def evaluate(repo, n, dependents=True, seed=False, fresh=True):
     """What an item owes now: its obligations, and its notices queued; keep
     its `blocked` label and the index of what it waits on; then do the same
-    for the items waiting on it, and the issues a pull request refers to."""
+    for the items waiting on it, and the issues a pull request refers to.
+    fresh reads the item afresh, as for a webhook or a claim; the sweep and
+    the items around it use what was read before, if unchanged (Items)."""
     try:
-        it = Item(repo, n)
+        it = Item(repo, n, fresh=fresh)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             note_waiting(repo, n, False)
@@ -1859,12 +1943,12 @@ def evaluate(repo, n, dependents=True, seed=False):
         _cache.pop(("refs", repo), None)
         for k in pr_refs(repo, it.pr):
             try:
-                evaluate(repo, k, dependents=False)
+                evaluate(repo, k, dependents=False, fresh=False)
             except Exception as e:
                 log(f"evaluating {repo}#{k} failed: {e!r}")
     for d in q("SELECT repo, number FROM blocked_by WHERE on_repo=? AND on_number=?", repo, n):
         try:
-            evaluate(d["repo"], d["number"], dependents=False)
+            evaluate(d["repo"], d["number"], dependents=False, fresh=False)
         except Exception as e:
             log(f"evaluating {d['repo']}#{d['number']} failed: {e!r}")
 
@@ -1875,6 +1959,7 @@ def evaluate_release(repo):
     if not OWNER_OF.get(repo) or not has_ci(repo):
         return
     items = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
+    listed(repo, items)
     facts, who, _ = release_facts(repo, items)
     sync(unit, state_owes(unit, "release", ST.state(facts), who, f"the release of {repo}"))
     recheck(unit, who.get("recheck"))
@@ -1928,9 +2013,10 @@ def evaluate_repo(repo, items=False, seed=False):
             raise
     if items:
         open_now = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=all")
+        listed(repo, open_now)
         for i in open_now:
             try:
-                evaluate(repo, i["number"], dependents=False, seed=seed)
+                evaluate(repo, i["number"], dependents=False, seed=seed, fresh=False)
             except Exception as e:
                 log(f"evaluating {repo}#{i['number']} failed: {e!r}")
         # Only an open item waits on the human: one that closed with no
@@ -1966,7 +2052,7 @@ def no_longer_owed(rows):
                 stale.append(r["id"])
     for (repo, n), rs in items.items():
         try:
-            it = Item(repo, n)
+            it = Item(repo, n, fresh=True)
             keys = {o.key for o in blocked_rules(it)[0] + notices(it)}
         except urllib.error.HTTPError as e:
             if e.code != 404:
@@ -1984,15 +2070,20 @@ def sweep(seed=False):
     closed lately (a rejected request), the milestones and the kit
     evaluated: what a missed webhook would have lost, and what no webhook
     brings."""
+    prune_items()
     since = iso(max(float(kv_get("reconciled", 0)) - RECONCILE, now() - 86400))
     ok = True
     for repo in OWNER_OF:
         try:
             evaluate_repo(repo, items=True, seed=seed)
-            for i in forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}"):
-                evaluate(repo, i["number"], dependents=False, seed=seed)
+            closed = forge_all(f"/repos/{ORG}/{repo}/issues?state=closed&type=issues&since={since}")
+            listed(repo, closed)
+            for i in closed:
+                evaluate(repo, i["number"], dependents=False, seed=seed, fresh=False)
             # Upstream issues, once every item's Blocked-by: lines are read.
-            for item in forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=upstream"):
+            upstream = forge_all(f"/repos/{ORG}/{repo}/issues?state=open&type=issues&labels=upstream")
+            listed(repo, upstream)
+            for item in upstream:
                 if "upstream" in {l["name"] for l in item.get("labels") or []}:
                     keep_blocking(repo, item["number"])
             # What waits on the human but isn't assigned to them: from before

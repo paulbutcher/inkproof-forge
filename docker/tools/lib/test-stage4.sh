@@ -111,7 +111,7 @@ The kit's stage 4 test: a request from $HUMAN_USER.")"
 
 consumer-metrics acknowledges (stage 4 test)."
   say "$S4_STRANGER" "$S4_DEP" "$req" "An untrusted comment (stage 4 test)."
-  new_issue "$S4_STRANGER" "$S4_DEP" "Stage 4 test: an untrusted request" request,new "From an untrusted account." >/dev/null
+  echo "UNTRUSTED $(new_issue "$S4_STRANGER" "$S4_DEP" "Stage 4 test: an untrusted request" request,new "From an untrusted account.")"
   # needs-human on a core issue: a notice for the human, work for the coordinator.
   local nh
   nh="$(new_issue core "$S4_LIB" "Stage 4 test: needs the human" needs-human "(no reply needed)
@@ -182,25 +182,29 @@ expect_not() {  # expect_not AGENT PATTERN WHAT
 }
 
 s4_check_triggers() {
-  local pr="$1" req="$2" nh="$3" up="$4" blocked="$5" n
-  expect scale "^untriaged request $S4_DEP#$req$" "a request from the human"
+  local pr="$1" req="$2" nh="$3" up="$4" blocked="$5" untrusted="$6" n
+  expect scale "^issue $S4_DEP#$req \(untriaged\): " "a request from the human"
   expect coordinator "^request filed: $S4_DEP#$req$" "a request filed"
   n="$(pending scale | grep -c "^comment on issue $S4_DEP#$req from " || true)"
   [ "$n" = 1 ] && pending scale | grep -q "^comment on issue $S4_DEP#$req from consumer-metrics: http" && s4_pass "scale has one comment trigger, consumer-metrics's question: its own, the no-reply and the untrusted comments start nothing" \
     || s4_fail "scale has $n comment trigger(s) on #$req; expected 1 (consumer-metrics's question only)"
   expect_not scale "untrusted|$S4_DEP#999" "an untrusted or migrated request"
-  [ "$(pending scale | grep -c "^untriaged request")" = 1 ] && s4_pass "the untrusted account's request started nothing" \
-    || s4_fail "scale has work from an untrusted request"
+  # An untrusted account's request is the owner's to triage, like any other,
+  # from a description that carries only its number.
+  [ "$(pending scale | grep -cE "^issue $S4_DEP#[0-9]+ \(untriaged\): ")" = 2 ] \
+    && pending scale | grep -qE "^issue $S4_DEP#$untrusted \(untriaged\): accept it, counter-propose, or close it saying why" \
+    && s4_pass "the untrusted account's request is scale's to triage, and nothing more" \
+    || s4_fail "scale should have two requests to triage, the human's and the untrusted account's ($S4_DEP#$untrusted)"
   expect coordinator "^needs-human added to issue $S4_LIB#$nh$" "needs-human added"
   expect coordinator "^pull request opened: $S4_LIB#$pr$" "a pull request opened"
-  expect_not coordinator "^review requested from you on pull request $S4_LIB#$pr," "a review requested from it while CI fails"
-  expect core "^review on pull request $S4_LIB#$pr$" "a review of its pull request"
-  expect core "^CI failed on pull request $S4_LIB#$pr$" "a failed Actions run on its pull request"
-  expect_not core "^pull request $S4_LIB#$pr (is behind|conflicts with) main" "its pull request behind main but not conflicting"
+  expect_not coordinator "^pull request $S4_LIB#$pr \(" "a review requested from it while CI fails"
+  expect core "^review on pull request $S4_LIB#$pr by " "a review of its pull request"
+  expect core "^pull request $S4_LIB#$pr \(CI failing\): " "a failed Actions run on its pull request"
+  expect_not core "^pull request $S4_LIB#$pr \(conflicting\)" "its pull request behind main but not conflicting"
   expect core "^$TEST_HUMAN_RE commented on upstream issue $COORDINATION#$up; $S4_LIB#$blocked is blocked on it$" \
     "the human's comment on the upstream issue it's blocked on"
   expect coordinator "^$S4_DEP released $S4_TAG$" "a release"
-  expect_not core "^untriaged request|^request filed" "events on other repositories"
+  expect_not core "^issue $S4_DEP#|^request filed" "events on other repositories"
   local notices
   # The upstream issue core is blocked on is blocking, which is a notice too.
   notices="$(dstatus | jq -r --arg since "$S4_SINCE" '[.notices[] | select(.at >= $since) | .kind] | sort | join(" ")')"
@@ -216,7 +220,7 @@ s4_missed_request() {
     "The kit's stage 4 test."
 }
 s4_check_reconciled() {
-  expect consumer-metrics "^untriaged request inkproof-consumer-metrics#$1$" "a request whose webhook was missed, found by reconciliation"
+  expect consumer-metrics "^issue inkproof-consumer-metrics#$1 \(untriaged\): " "a request whose webhook was missed, found by reconciliation"
   s4_done
 }
 

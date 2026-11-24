@@ -77,7 +77,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 | No agent runs code on GitHub except a site's build | `.github/` is code-owned by the human, and `setup-repo.sh` removes it everywhere but a site's Pages workflow; that workflow gives the repository's code read access to its own contents and nothing else |
 | Every API change still reaches the human once | `scripts/milestone-diff.sh`, against Forgejo, in each milestone issue |
 | Recommendations change nothing until the human decides | Reviewers write only issues on `inkproof-coordination` (the supervisor also comments on items that have stalled, and its mentions wake agents); none can push, and policy files are read-only to every agent |
-| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author; trigger descriptions carry only numbers, names and links, never issue text |
+| Untrusted issues can't steer agents | Dispatcher and Stop hook filter on authorship, and never trust content with an original (migrated) author. An untrusted account's request goes only to its repository's owner, to triage, and its comments start nothing. Trigger descriptions carry only numbers, names and links, never issue text |
 | No internet except essentials | Internal networks; the proxies' allowlists are the only exits, and list only tooling |
 | Nothing in the kit calls GitHub's API | No GitHub credential in any container except Forgejo's mirror credential; `api.github.com` is on no allowlist, and on Forgejo's only while `scripts/migrate.sh` runs |
 | Agents can't loosen their own rules | Managed settings, managed `CLAUDE.md`, git config and hooks are root-owned in the image or mounted read-only |
@@ -239,11 +239,19 @@ Webhooks only say which units to evaluate again:
 
 On start, and every 15 minutes (`RECONCILE_SECONDS`), a sweep evaluates every repository's release and open items, the issues closed lately, and the milestones and the kit. So a missed delivery delays work rather than losing it. A state held by a timer is evaluated again when the timer runs out. Before a claim is granted, the dispatcher evaluates again each unit behind the agent's work, and drops what is no longer owed.
 
+The sweep, and the evaluation of the items around one that changed, read an item only when it has changed. The dispatcher keeps what it last read of each item: its issue, timeline and reviews, and a pull request's files for each head. It drops an item's entry:
+- when a webhook names the item;
+- when the kit writes to it;
+- when a listing shows a newer `updated_at`;
+- after `ITEM_CACHE_SECONDS` (default an hour).
+
+A direct evaluation reads the item, and what it is blocked by, afresh. That covers an evaluation for a webhook and the check before a claim. A pull request itself is read every time, because Forgejo doesn't bump `updated_at` when `main` moves or a review is requested (checked 2026-11-24). It does bump it for labels, comments, assignees, a push, a review, an edit and closing. The pull request's `updated_at` then shows whether the rest has changed.
+
 The status page (`scripts/status.sh`, and `scripts/watch.sh`, which asks every 15 seconds) reads nothing from Forgejo:
 - **What waits on the human.** The dispatcher keeps an index of the open items assigned to the human or requesting their review. Every evaluation of an item updates the item's entry, and the sweep drops entries for items that closed without a webhook.
 - **Whether CI is running.** No webhook says that an Actions run has started. So any push, branch or tag creation, pull request event, or Actions run event marks its repository. Once a minute the dispatcher lists the Actions runs of the marked repositories, and of those it last found busy. The sweep lists every repository's runs. A repository that is marked but not yet checked counts as running, so a drain waits for it.
 
-Only trusted authors count: an agent's own actions, and comments whose first line is `(no reply needed)`, ask nothing.
+Only trusted authors count: an agent's own actions, and comments whose first line is `(no reply needed)`, ask nothing. The exception is a request: one filed by an untrusted account is **untriaged** like any other, so its repository's owner triages it. Its description carries only the request's number.
 
 ### States
 
@@ -551,7 +559,7 @@ The kit is working when these hold.
   - a status posted under CI's name doesn't get a broken build approved or merged;
   - a pull request with an unresolved `CLAUDE.md` finding doesn't merge;
   - an agent's attempt to create a tag or release is refused;
-  - an issue or comment from an untrusted account starts no run;
+  - a comment from an untrusted account starts no run, and its request starts only the owner's run to triage it;
   - a burst of comments between two agents, or between an author and `conformance`, stays within its bound and ends;
   - while paused, nothing starts, merges or releases.
 - **Off GitHub.** The proxies' logs show no GitHub API calls. GitHub receives only:

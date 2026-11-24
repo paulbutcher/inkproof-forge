@@ -7,9 +7,10 @@
 #     and reschedules the merges in your name;
 #   - drain: drain.sh says when it is safe to stop, no run starts while
 #     work is queued, and resume ends it;
-#   - while paused, each kind of event queues work for the right agent, and
-#     untrusted authors, an agent's own comments and no-reply comments queue
-#     nothing; only needs-human (not routine events) makes a notice;
+#   - while paused, each kind of event queues work for the right agent;
+#     an untrusted account's request is its owner's to triage, and its
+#     comments, an agent's own comments and no-reply comments queue nothing;
+#     only needs-human (not routine events) makes a notice;
 #   - a request filed while the dispatcher is down is found by reconciliation;
 #   - a burst of comments becomes one run, and a reached cap stops runs and
 #     tells you.
@@ -74,7 +75,7 @@ fi
 
 echo "== Triggers, while paused"
 phase events "$pr"
-phase check-triggers "$pr" "$(key REQ)" "$(key NH)" "$(key UP)" "$(key BLOCKED)"
+phase check-triggers "$pr" "$(key REQ)" "$(key NH)" "$(key UP)" "$(key BLOCKED)" "$(key UNTRUSTED)"
 
 echo "== Reconciliation"
 docker compose stop dispatcher >/dev/null 2>&1
