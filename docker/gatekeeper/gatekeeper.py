@@ -9,9 +9,13 @@ never reads commit statuses, which any account with write access can post
 under CI's name. It acts only in repositories whose CODEOWNERS on main names
 `@gatekeeper` (scripts/setup-repo.sh <repo> 2 or 3). Branch protection
 dismisses its approval when a new commit arrives, and it approves again once
-that commit's run has succeeded. It polls Forgejo every
-GATEKEEPER_POLL_SECONDS (default 30), so a missed webhook can't lose an
-approval.
+that commit's run has succeeded. Forgejo's webhooks (POST /hook, signed with
+its own secret) say which pull request to look at: a finished Actions run, a
+pull request opened or pushed to, or a push to main, which may change a
+repository's level. Every GATEKEEPER_SWEEP_SECONDS (default 900), on start and
+when the kit is resumed, it looks at every open pull request, so a missed
+webhook delays an approval rather than losing it. It never reads a webhook's
+payload for anything but where to look.
 
 Releases. At level 3 the coordinator asks for a release over HTTP, with a key
 only its container holds; no other agent shares a network with the
@@ -25,10 +29,12 @@ with the human's token (`gatekeeper release --human ...`).
 While the kit is paused (control/paused) it approves and releases nothing.
 """
 import base64
+import hashlib
 import hmac
 import json
 import os
 import pathlib
+import queue
 import re
 import sys
 import threading
@@ -40,10 +46,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 FORGE = os.environ.get("FORGE_URL", "http://forgejo:3000") + "/api/v1"
 ORG = os.environ["FORGE_ORG"]
 ME = "gatekeeper"
-POLL = int(os.environ.get("GATEKEEPER_POLL_SECONDS", "30"))
+SWEEP = int(os.environ.get("GATEKEEPER_SWEEP_SECONDS", "900"))
 WORKFLOW = os.environ.get("GATEKEEPER_WORKFLOW", "checks.yml")
 TOKEN_FILE = pathlib.Path(os.environ.get("TOKEN_FILE", "/run/secrets/gatekeeper/token"))
 COORDINATOR_KEY = pathlib.Path(os.environ.get("COORDINATOR_KEY_FILE", "/run/secrets/gatekeeper/coordinator-key"))
+WEBHOOK_SECRET = pathlib.Path(os.environ.get("WEBHOOK_SECRET_FILE", "/run/secrets/gatekeeper/webhook-secret"))
 PAUSED = pathlib.Path("/control/paused")
 NO_REPLY = "(no reply needed)"
 CODEOWNERS = (".forgejo/CODEOWNERS", ".gitea/CODEOWNERS", "docs/CODEOWNERS", "CODEOWNERS")
@@ -172,36 +179,106 @@ def consider(repo, pr):
     log(f"approved {repo}#{n} at {sha[:12]}")
 
 
-def poll():
+def check(repo, n=None):
+    """Pull request n of repo, or with no n, every open one, if the
+    repository is at level 2 or 3."""
+    if level(repo) < 2:
+        return
+    if n is None:
+        prs = pages(f"/repos/{ORG}/{repo}/pulls?state=open")
+    else:
+        s, pr = forge("GET", f"/repos/{ORG}/{repo}/pulls/{n}", ok=(200, 404))
+        prs = [pr] if s == 200 and pr.get("state") == "open" else []
+    for pr in prs:
+        if PAUSED.exists():
+            return
+        consider(repo, pr)
+
+
+def sweep():
     for r in pages(f"/orgs/{ORG}/repos"):
-        repo = r["name"]
         if r.get("archived") or not r.get("has_pull_requests", True):
             continue
+        if PAUSED.exists():
+            return
         try:
-            if level(repo) < 2:
-                continue
-            for pr in pages(f"/repos/{ORG}/{repo}/pulls?state=open"):
-                if PAUSED.exists():
-                    return
-                consider(repo, pr)
+            check(r["name"])
         except (ForgeError, urllib.error.URLError, OSError, KeyError, ValueError) as e:
-            log(f"{repo}: {e}")
+            log(f"{r['name']}: {e}")
 
 
-def poller():
-    log(f"approving on {WORKFLOW} for {ORG}'s level 2 and 3 repositories, every {POLL}s")
-    was_paused = None
+def where(event, payload):
+    """Where a webhook says to look: [(repo, n)], with n None for a
+    repository's every open pull request."""
+    run = payload.get("run") if isinstance(payload.get("run"), dict) else None
+    repo_info = payload.get("repository") or (run or {}).get("repository") or {}
+    repo = repo_info.get("name")
+    if not repo or (repo_info.get("owner") or {}).get("login", ORG).lower() != ORG.lower():
+        return []
+    if event.startswith("action_run"):
+        try:
+            n = (json.loads((run or {}).get("event_payload") or "{}").get("pull_request") or {}).get("number")
+        except (ValueError, AttributeError):
+            n = None
+        return [(repo, n)]
+    # A new head, or a pull request that may already have one whose run
+    # passed; not its labels, comments or reviews, which change no run.
+    if event == "pull_request_sync" or (event == "pull_request" and payload.get("action") in ("opened", "reopened")):
+        n = (payload.get("pull_request") or {}).get("number")
+        return [(repo, n)] if n else []
+    if event == "push" and payload.get("ref") == "refs/heads/main":
+        return [(repo, None)]  # CODEOWNERS may have changed its level
+    return []
+
+
+# What to look at next, one at a time: (repo, n) from a webhook, or None for
+# a sweep. A job already waiting isn't queued again.
+WORK = queue.Queue()
+_waiting = set()
+_waiting_lock = threading.Lock()
+
+
+def enqueue(job):
+    with _waiting_lock:
+        if job in _waiting:
+            return
+        _waiting.add(job)
+    WORK.put(job)
+
+
+def worker():
+    while True:
+        job = WORK.get()
+        with _waiting_lock:
+            _waiting.discard(job)
+        if PAUSED.exists():
+            continue  # resuming sweeps everything
+        try:
+            if job is None:
+                sweep()
+            else:
+                check(*job)
+        except (ForgeError, urllib.error.URLError, OSError, KeyError, ValueError) as e:
+            log(f"{'sweep' if job is None else '%s#%s' % job} failed: {e}")
+
+
+def scheduler():
+    """A sweep on start, every SWEEP seconds, and on resuming. Watching the
+    pause file reads nothing from Forgejo."""
+    log(f"approving on {WORKFLOW} for {ORG}'s level 2 and 3 repositories, on webhooks, "
+        f"and sweeping every {SWEEP}s")
+    was_paused, next_sweep = None, 0
     while True:
         paused = PAUSED.exists()
         if paused != was_paused:
             log("paused: approving and releasing nothing" if paused else "running")
+            if was_paused and not paused:
+                next_sweep = 0
             was_paused = paused
-        if not paused:
-            try:
-                poll()
-            except (ForgeError, urllib.error.URLError, OSError) as e:
-                log(f"poll failed: {e}")
-        time.sleep(POLL)
+        if not paused and time.time() >= next_sweep:
+            enqueue(None)
+            next_sweep = time.time() + SWEEP
+        time.sleep(5)
 
 
 # --- Releases -------------------------------------------------------------------
@@ -349,6 +426,8 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/hook":
+            return self.hook()
         key = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
         try:
             want = COORDINATOR_KEY.read_text().strip()
@@ -374,9 +453,37 @@ class Handler(BaseHTTPRequestHandler):
             log(f"releasing {repo} failed: {e}")
             self.reply(502, {"error": f"Forgejo: {e}"})
 
+    def hook(self):
+        """A webhook from Forgejo: where to look, queued. A finished run is
+        looked at again a little later, in case the runs API lags its event."""
+        body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 4 << 20))
+        try:
+            secret = WEBHOOK_SECRET.read_text().strip()
+        except OSError:
+            secret = ""
+        given = self.headers.get("X-Forgejo-Signature") or ""
+        if not secret or not hmac.compare_digest(given, hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()):
+            log("refused a webhook with a bad signature")
+            return self.reply(403, {"error": "bad signature"})
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return self.reply(400, {"error": "not JSON"})
+        # The kind (pull_request_sync, pull_request_label, ...), not its group.
+        event = self.headers.get("X-Forgejo-Event-Type") or self.headers.get("X-Forgejo-Event") or ""
+        jobs = where(event, payload) if isinstance(payload, dict) else []
+        self.reply(200, {})
+        for job in jobs:
+            enqueue(job)
+            if event.startswith("action_run"):
+                t = threading.Timer(30, enqueue, [job])
+                t.daemon = True
+                t.start()
+
 
 def serve():
-    threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 
 

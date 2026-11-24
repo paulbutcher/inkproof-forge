@@ -53,7 +53,7 @@ services:
       # Workflows use no `uses:` actions, so nothing is fetched from outside.
       FORGEJO__actions__DEFAULT_ACTIONS_URL: self
       # Webhooks go to the dispatcher and nowhere else.
-      FORGEJO__webhook__ALLOWED_HOST_LIST: dispatcher
+      FORGEJO__webhook__ALLOWED_HOST_LIST: dispatcher,gatekeeper
       # The one-off migration goes through forge-proxy by Forgejo's own setting.
       FORGEJO__proxy__PROXY_ENABLED: "true"
       FORGEJO__proxy__PROXY_URL: http://forge-proxy:3128
@@ -64,8 +64,8 @@ services:
       https_proxy: http://forge-proxy:3128
       HTTP_PROXY: http://forge-proxy:3128
       http_proxy: http://forge-proxy:3128
-      NO_PROXY: dispatcher,forgejo,localhost,127.0.0.1
-      no_proxy: dispatcher,forgejo,localhost,127.0.0.1
+      NO_PROXY: dispatcher,gatekeeper,forgejo,localhost,127.0.0.1
+      no_proxy: dispatcher,gatekeeper,forgejo,localhost,127.0.0.1
     volumes:
       - forgejo-data:/var/lib/gitea
       - forgejo-config:/etc/gitea
@@ -217,7 +217,7 @@ services:
     environment:
       FORGE_URL: http://forgejo:3000
       FORGE_ORG: ${FORGE_ORG:?set FORGE_ORG in .env}
-      GATEKEEPER_POLL_SECONDS: ${GATEKEEPER_POLL_SECONDS:-30}
+      GATEKEEPER_SWEEP_SECONDS: ${GATEKEEPER_SWEEP_SECONDS:-900}
     volumes:
       - ${STATE_DIR:-.}/secrets/gatekeeper:/run/secrets/gatekeeper:ro
       - ${STATE_DIR:-.}/control:/control:ro

@@ -21,7 +21,7 @@ What the kit enforces, how, and why. This is the specification the kit is built 
 | one container per agent in `agents.conf`: the coordinator, each library, each reviewer | compose service, generated from `agents.conf` | that agent's Forgejo token and runner key, and the Claude token | Forgejo, dispatcher, `proxy`; the coordinator also reaches `gatekeeper` |
 | `agent-runner` (inside each agent container) | the agent's user | nothing beyond the container's | dispatcher (claims work, reports runs); writes the run archive |
 | `run-archive` volume | | every agent's run logs and transcripts, the human's sessions included | read-only to the process reviewer |
-| `gatekeeper` | compose service | gatekeeper account token, which no agent can read | Forgejo, by polling; it also answers the coordinator |
+| `gatekeeper` | compose service | gatekeeper account token and webhook secret, which no agent can read | Forgejo; it also answers Forgejo's webhooks and the coordinator |
 | host scripts | the human, on macOS | the human's Forgejo admin token (`secrets/human/token`) | Forgejo and dispatcher on `127.0.0.1` |
 
 ### What runs where
@@ -124,7 +124,9 @@ Every code owner's review request blocks the merge until that owner approves, so
 
 The gatekeeper is a Python program, not a Claude agent, so it costs nothing per pull request.
 
-It polls Forgejo (`GATEKEEPER_POLL_SECONDS`, default 30) rather than taking webhooks. That way nothing needs to reach it except the coordinator, and a lost delivery can't lose an approval.
+Forgejo's webhooks tell it where to look: a finished Actions run, a pull request opened or pushed to, or a push to `main`, which may change a repository's level. They come over the `gate` network, which it shares only with Forgejo, signed with its own secret (`secrets/gatekeeper/webhook-secret`). It reads nothing from a webhook but where to look, and looks again 30 seconds after a finished run, in case the runs API lags the event.
+
+On start, when the kit is resumed, and every 15 minutes (`GATEKEEPER_SWEEP_SECONDS`), it looks at every open pull request. So a lost delivery delays an approval rather than losing it, and nothing polls Forgejo in between.
 
 It acts only:
 - in repositories whose `CODEOWNERS` on `main` names `@gatekeeper`, which is how `setup-repo.sh` marks levels 2 and 3;

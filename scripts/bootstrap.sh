@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Create your admin account and token if needed, then converge Forgejo on the
-# organisation, the kit's accounts and tokens, teams and the dispatcher's
-# webhook. Safe to re-run; run it again after adding repositories or agents.
+# organisation, the kit's accounts and tokens, teams and the dispatcher's and
+# gatekeeper's webhooks. Safe to re-run; run it again after adding repositories
+# or agents.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 : "${HUMAN_USER:?set HUMAN_USER in $KIT_ENV}" "${HUMAN_EMAIL:?set HUMAN_EMAIL in $KIT_ENV}"
-confirm "This brings Forgejo's organisation, accounts, tokens, teams and webhook into line with the kit"
+confirm "This brings Forgejo's organisation, accounts, tokens, teams and webhooks into line with the kit"
 
 fj() { docker compose exec -T forgejo forgejo "$@"; }
 

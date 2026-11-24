@@ -14,12 +14,12 @@ A script that changes the kit (`up`, `down`, `pause`, `drain`, `resume`, `stop-r
    - your Forgejo username: use your GitHub username, so `CODEOWNERS` entries carry over;
    - your email;
    - your UID and GID (`id -u`, `id -g`).
-2. `scripts/up.sh` builds the images, generates the CI runner's and webhook's secrets, starts everything, and loads the CI image into CI's own Docker engine.
+2. `scripts/up.sh` builds the images, generates the CI runner's and webhooks' secrets, starts everything, and loads the CI image into CI's own Docker engine.
 3. `scripts/bootstrap.sh` asks you to choose a password for your Forgejo admin account. It then creates:
    - an admin token for the kit's scripts (`secrets/human/token`);
    - the organisation;
    - every account in `agents.conf`, plus `gatekeeper`, `dispatcher` and `ci-reader`, with their tokens and teams;
-   - the webhook to the dispatcher.
+   - the webhooks to the dispatcher and the gatekeeper.
 
    It reports what it changed. Re-running it changes nothing unless something has drifted.
 4. Sign in at <http://localhost:3000/> as yourself.
@@ -325,7 +325,7 @@ The kit's dev container mounts this checkout and has a Docker engine of its own,
 
 | Test | Checks |
 | --- | --- |
-| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out, and the completeness checks of its states, over every combination of each unit's facts (`test_states.py`). Quick, isolated, and safe anywhere. |
+| `scripts/test-dispatcher.sh` | The dispatcher's unit tests, with Forgejo stubbed out, the completeness checks of its states, over every combination of each unit's facts (`test_states.py`), and the gatekeeper's handling of webhooks (`test_gatekeeper.py`). Quick, isolated, and safe anywhere. |
 | `scripts/test-hook.sh` | Unit tests for the guard on your sessions in agents' containers, and for `forge version`, held to the gatekeeper's versioning rule. Quick, isolated, and safe anywhere. |
 | `scripts/test-stage1.sh` | Bootstrap, networks and proxies, CI in its own engine, that agents can't tag or release, and Actions webhooks. |
 | `scripts/test-stage2.sh` | Migration from GitHub, attribution, mirrors, and dependencies fetched from Forgejo. With `MIRROR_TEST_REPO`, a round trip through a scratch GitHub repository. |

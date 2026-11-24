@@ -120,26 +120,32 @@ ensure_team() {
   done
 }
 
-WEBHOOK_URL="http://dispatcher:8080/hook"
-WEBHOOK_EVENTS='["create","delete","push","issues","issue_assign","issue_label","issue_milestone","issue_comment","pull_request","pull_request_assign","pull_request_label","pull_request_milestone","pull_request_comment","pull_request_review_approved","pull_request_review_rejected","pull_request_review_comment","pull_request_sync","pull_request_review_request","release","action_run_failure","action_run_success"]'
+DISPATCHER_HOOK_EVENTS='["create","delete","push","issues","issue_assign","issue_label","issue_milestone","issue_comment","pull_request","pull_request_assign","pull_request_label","pull_request_milestone","pull_request_comment","pull_request_review_approved","pull_request_review_rejected","pull_request_review_comment","pull_request_sync","pull_request_review_request","release","action_run_failure","action_run_success"]'
+# The gatekeeper's: where an approval may now be due. Forgejo stores
+# pull_request as all of its kinds, listed here so that a re-run finds nothing
+# to change; the gatekeeper acts only on a pull request opened, reopened or
+# pushed to (gatekeeper.py, where).
+GATEKEEPER_HOOK_EVENTS='["push","pull_request","pull_request_assign","pull_request_label","pull_request_milestone","pull_request_comment","pull_request_review_approved","pull_request_review_rejected","pull_request_review_comment","pull_request_sync","pull_request_review_request","action_run_success"]'
 
+# ensure_webhook WHO EVENTS: the organisation webhook to WHO's /hook, signed
+# with secrets/WHO/webhook-secret.
 ensure_webhook() {
-  local hooks id secret body
-  secret="$(tr -d '[:space:]' < /secrets/dispatcher/webhook-secret)"
+  local who="$1" events="$2" url="http://$1:8080/hook" hooks id secret body
+  secret="$(tr -d '[:space:]' < "/secrets/$who/webhook-secret")"
   hooks="$(call 200 GET "/orgs/$ORG/hooks")"
-  id="$(jq -r --arg u "$WEBHOOK_URL" '.[] | select(.config.url == $u) | .id' <<<"$hooks" | head -1)"
-  body="$(jq -nc --arg u "$WEBHOOK_URL" --arg s "$secret" --argjson e "$WEBHOOK_EVENTS" \
+  id="$(jq -r --arg u "$url" '.[] | select(.config.url == $u) | .id' <<<"$hooks" | head -1)"
+  body="$(jq -nc --arg u "$url" --arg s "$secret" --argjson e "$events" \
     '{type: "forgejo", active: true, events: $e, branch_filter: "*",
       config: {url: $u, content_type: "json", http_method: "post", secret: $s}}')"
   if [ -z "$id" ]; then
     call 201 POST "/orgs/$ORG/hooks" "$body" >/dev/null
-    changed "created the organisation webhook to the dispatcher"
+    changed "created the organisation webhook to the $who"
     return
   fi
-  if [ "$(jq -c --arg u "$WEBHOOK_URL" '.[] | select(.config.url == $u) | [.active, (.events | sort)]' <<<"$hooks")" \
-       != "$(jq -c '[true, sort]' <<<"$WEBHOOK_EVENTS")" ]; then
+  if [ "$(jq -c --arg u "$url" '.[] | select(.config.url == $u) | [.active, (.events | sort)]' <<<"$hooks")" \
+       != "$(jq -c '[true, sort]' <<<"$events")" ]; then
     call 200 PATCH "/orgs/$ORG/hooks/$id" "$body" >/dev/null
-    changed "updated the organisation webhook"
+    changed "updated the organisation webhook to the $who"
   fi
 }
 
@@ -223,7 +229,8 @@ cmd_bootstrap() {
   ensure_team ci-read "$(units read none none)" ci-reader "*"
   ensure_ci_secret "$FRESH_TOKEN"
   ensure_ci_variable DEPS_GITHUB_OWNERS "$GH_OWNERS"
-  ensure_webhook
+  ensure_webhook dispatcher "$DISPATCHER_HOOK_EVENTS"
+  ensure_webhook gatekeeper "$GATEKEEPER_HOOK_EVENTS"
   # The protocol's labels, on every repository that exists (setup-repo also
   # makes them, but upstream issues go on inkproof-coordination whatever its
   # level).

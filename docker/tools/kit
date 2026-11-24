@@ -2,7 +2,7 @@
 # Admin tasks against Forgejo, run in the tools container by the host scripts.
 #   kit init-secrets   generate the runner and webhook secrets, if missing
 #   kit check-human    succeed if secrets/human/token is a working admin token
-#   kit bootstrap      converge accounts, tokens, teams and the webhook
+#   kit bootstrap      converge accounts, tokens, teams and the webhooks
 #   kit migrate        import the repositories in agents.conf from GitHub
 #   kit mirrors [--rotate]  push-mirror them to GitHub
 #   kit mirror-status  each push mirror's last sync and error
@@ -41,6 +41,8 @@ cmd_init_secrets() {
   # Only the coordinator's container holds it: the gatekeeper releases only on
   # requests that carry it.
   secret_file gatekeeper/coordinator-key 32
+  # Forgejo signs its webhooks to the gatekeeper with it.
+  secret_file gatekeeper/webhook-secret 32
   # Each agent's runner proves who it is to the dispatcher with its own key.
   local name
   for name in $(grep -v '^[[:space:]]*\(#\|$\)' /etc/kit/agents.conf | awk '{ print $1 }'); do
