@@ -6,6 +6,7 @@ Labels used below:
 - **[policy]** is GitHub's own documentation or terms.
 - **[anecdote]** is someone else's report.
 - **[inference]** is our reasoning.
+- **[experience]** is from running [lean-bump](https://github.com/paulbutcher/lean-bump)'s GitHub App, which fans out across about 35 repositories, measured from its logs in November 2026.
 
 The sources were gathered on 2026-11-23. Treat the anecdotes as unverified.
 
@@ -89,7 +90,16 @@ Source: [GitHub's REST rate-limit docs](https://docs.github.com/en/rest/using-th
 |---|---|
 | User | 5,000 requests an hour, shared across all its tokens |
 | App installation | 5,000 an hour, plus 50 for each repo or user above 20, up to 12,500 |
-| GraphQL | 5,000 points an hour |
+| GraphQL | 5,000 points an hour, a separate budget from REST |
+| `GITHUB_TOKEN` in Actions | 1,000 an hour per repository, separate again |
+
+By that formula this kit gets the base 5,000 an hour. It has 13 repositories in `agents.conf`, and one App acting for every agent leaves the organisation with one or two members.
+
+GitHub doesn't keep to its own formula **[experience]**:
+- lean-bump's App, on about 35 repositories, read 12,500 from `GET /rate_limit`. The formula gives 5,750.
+- Its readings fell into two counts that dropped independently. One was mostly runs using all-repository tokens, the other mostly single-repository tokens, but not consistently.
+
+So plan for 5,000, and read the real budget. `GET /rate_limit` costs nothing against any limit. Log `remaining/limit` and the reset time for `core` and `graphql` regularly, and warn when either falls below about 25%. Read the logs before acting on a suspected rate limit: lean-bump's suspected one turned out to be something else (section 10).
 
 ### Secondary limits
 
@@ -103,7 +113,7 @@ These apply to **every** identity, Apps included.
 | CPU time | at most 90 s per 60 s |
 | Requests that create content | **80 a minute and 500 an hour**, web UI included |
 
-The secondary limits can't be queried and can change without notice.
+The secondary limits can't be queried and can change without notice. GitHub sends no headers for them, so the first sign of one is a 403 or 429. For a kit whose agents write a lot, they, not the hourly budget, are the real constraint **[experience]**. Overlapping work adds up: three of lean-bump's runs at once made about 90 writes in one minute, more than the documented 80, without being throttled. Don't count on that.
 
 ### GitHub's recommendations
 
@@ -112,6 +122,12 @@ The secondary limits can't be queried and can change without notice.
 - Wait at least 1 s between writes.
 - Honour `retry-after` and `x-ratelimit-reset`. Without them, wait a minute, then back off exponentially.
 - Make conditional requests: a **304 doesn't count** against the primary limit.
+
+From experience **[experience]**:
+- On a 403 or 429, wait for `retry-after` if it's given. If `x-ratelimit-remaining` is 0, wait until `x-ratelimit-reset`. If the message names a secondary limit, wait at least 60 s and back off exponentially. Give up after a few tries.
+- On a 502, 503 or 504, retry a read with backoff, but **never retry a write**, because it may already have taken effect.
+- Events caused by `GITHUB_TOKEN`, including tags it pushes, start no other workflows. Anything that must trigger downstream workflows needs the App's token.
+- Reads can cost more than the writes they save. lean-bump's filter on which repositories need an event cut writes per event from about 33 to 5–8, but raised reads from about 35 to about 135, so a burst ran at about 9,000 an hour. GraphQL batches reads: one search returns 100 repositories, and `object(expression: "HEAD:path")` reads a file in the same query.
 
 ## 4. Getting webhooks to a Mac behind NAT
 
@@ -138,7 +154,7 @@ The current dispatcher already treats webhooks as hints and runs a reconciliatio
 
 ### Backups
 
-- Use `git clone --mirror`, plus an export of issues and PRs, for example with [python-github-backup](https://github.com/josegonzalez/python-github-backup).
+- Use `git clone --mirror`, plus an export of issues and PRs, for example with [python-github-backup](https://github.com/josegonzalez/python-github-backup). The kit has no Python (`lean-core.md`, Decision), so the export would be written in Lean or shell, or run outside the kit.
 - The org migrations API produces archives that can't be restored on github.com, so it is for archiving only **[policy]**.
 - Run backups as an identity separate from the agents', and store them off GitHub.
 - A push-mirror to a Forgejo you control gives somewhere to carry on working.
@@ -150,18 +166,21 @@ These are ranked by how well the evidence supports them.
 1. **One client, one queue.**
    - Only the dispatcher talks to GitHub, and its requests are serial.
    - Writes are at least 1 s apart, with a budget well under 80 a minute and 500 an hour, counting every agent together.
-   - It honours the rate-limit headers and stops outright while limited.
+   - It honours the rate-limit headers and stops outright while limited, and retries as in section 3: reads after a 5xx, never writes.
+   - It reads its real budget from `GET /rate_limit` and logs it.
    - Agents reach GitHub only through it. Today's `forge` wrapper is the natural place for this.
 
    The current `FORGE_CONCURRENCY=8` would become 1 for writes **[policy]**.
 2. **Webhooks, plus a reconciliation sweep using conditional requests.**
    - Webhooks arrive through a production-grade tunnel or relay.
-   - The sweep uses ETags and `since=`, so that sweeps which find nothing new cost nothing. Today's sweep reads all of every repo's open items, so this is a change **[policy]**.
+   - The sweep uses ETags and `since=`, so that sweeps which find nothing new cost nothing. Since 2026-11-24 the sweep re-reads only items whose `updated_at` has changed, plus each open PR (section 8). On GitHub those reads could also be conditional **[policy]**.
+   - Better still, the sweep's listings could be a few GraphQL queries: one can return every open issue and PR across the repositories, with their labels and `updatedAt`, instead of one REST listing per repository per kind **[experience]**.
+   - Where the kit can't tell whether something needs doing, because a read failed or a list was cut short, it acts as if it does. A wasted check costs less than a missed one **[experience]**. The CI flags already do this: a repository that can't be checked counts as busy.
 3. **An org-owned GitHub App, not a machine user.**
    - It uses short-lived installation tokens, with no password and no user account to suspend.
-   - Its budget grows with the org.
+   - Its budget grows with the org in principle, though not for this kit's size (section 3).
    - It is the identity GitHub's own agents use **[policy]**. That Apps face less abuse risk is **[inference]**, backed by the gatekeeper having survived.
-   - One App can serve every agent, with the agent named in each comment's `From:` line, as now. Several Apps would make agents distinct to GitHub, for approvals for example, but cost more to set up.
+   - One App can't serve every agent. Required approvals need distinct identities: the gatekeeper's, conformance's and the coordinator's, at least. The other agents could share one App, named in each comment's `From:` line as now **[inference]**.
 4. **Continuous backup and a mirror forge**, run as a separate identity. **Keeping the forge swappable** (question 1 of the overall investigation) makes "carry on in Forgejo" the plan for a suspension.
 5. **Ramp up gradually.** Start a new installation slowly, add jitter to scheduled work, cap PRs and issues per hour, and batch commits **[anecdote/inference]**.
 6. **Avoid refusals in the first place.** Check rulesets and protected refs locally before pushing **[inference]**. This is cheap.
@@ -214,14 +233,116 @@ The busiest writers were the coordinator, the gatekeeper, demos, conformance, we
 
 ### What this means
 
-**Reads are the problem, not writes.** A GitHub version needs:
-- **A status page that reads the dispatcher's own state**, or a cache, instead of polling every repo. This alone removes about 80% of the quiet traffic.
-- **A gatekeeper driven by webhooks**, or one sharing the dispatcher's view of the forge, instead of a 30 s poll.
-- **Evaluation from a local cache of issues and PRs**, refreshed by webhook payloads and conditional requests, so that a burst re-reads only what changed.
+**Reads are the problem, not writes.** Writes need pacing and a budget, not redesign: a queue that sends at most one write a second keeps them under 80 a minute. An hourly budget of about 400 covers the observed peak of 351, as long as every agent shares one App identity.
 
-**Writes need pacing and a budget, not redesign.** A queue that sends at most one write a second keeps them under 80 a minute. An hourly budget of about 400 covers the observed peak of 351, as long as every agent shares one App identity.
+## 8. What has been fixed (2026-11-24)
 
-## 8. Open questions
+Three changes take out the read traffic measured above. None of them depends on GitHub, so they apply to the kit on Forgejo now. They were tested in the dev container's kit, with `scripts/test-dispatcher.sh`, stage 6 and stage 4, then deployed to the Mac's kit and measured there ("Measured on the Mac" below).
 
-- **Local testing without Forgejo standing in for GitHub.** The stage tests need either a fake GitHub API, which drifts from the real one, or a test org on real GitHub, which carries suspension risk of its own. Possibly the forge seam can be tested against Forgejo, with only a thin GitHub adapter tested live.
-- **One App or one per agent.** This depends on whether the design needs agents to approve each other's PRs.
+| | Before | After |
+|---|---|---|
+| Status page (`status.sh`, `watch.sh` every 15 s) | about 54 requests per redraw, about 12,600 an hour | none |
+| Gatekeeper | a poll every 30 s, about 3,400 an hour | only what webhooks name, plus a sweep every 15 minutes |
+| Sweep, every 15 minutes | every open item read in full | one read per open PR, plus the listings |
+
+What each change does:
+
+- **The status page reads nothing from Forgejo.**
+  - What waits on the human is an index in the dispatcher's database. Every evaluation of an item updates it, and the sweep prunes it.
+  - Whether CI is running is a per-repository flag. A webhook that can start or end a run marks the repository, and the dispatcher checks only the marked repositories and those it last found busy, once a minute. The sweep checks them all.
+  - When the kit is quiet, the dispatcher asks Forgejo nothing about either.
+- **The gatekeeper takes webhooks.**
+  - Forgejo sends signed webhooks over the gatekeeper's own network, for a finished Actions run, a PR opened, reopened or pushed to, and a push to `main`. The gatekeeper checks only the PR or repository named.
+  - A sweep every 15 minutes (`GATEKEEPER_SWEEP_SECONDS`), on start and on resume, means a missed webhook delays an approval rather than losing it.
+  - Stage 6 passes.
+- **The dispatcher reads an item only when it has changed.**
+  - It keeps its last read of each item: the issue, timeline and reviews, and a PR's files for each head.
+  - It drops an item's entry when a webhook names the item, when the kit writes to it, when a listing shows a newer `updated_at`, or after `ITEM_CACHE_SECONDS` (default an hour).
+  - A PR itself is re-read every time, because Forgejo doesn't bump `updated_at` when `main` moves or a review is requested.
+  - An evaluation for a webhook, and the check before a claim, read the item and its blockers fresh.
+  - In the dev container's kit, a warm sweep read no unchanged items.
+
+### Measured on the Mac (2026-11-24)
+
+This comes from Forgejo's request log for 12:07 to 15:46 UTC, after the deploy, with `scripts/watch.sh` open throughout. The kit was moderately active, with 19 to 45 webhooks an hour. Requests through `ports`, which came from this investigation reading Forgejo from the dev container, are left out.
+
+| | Before (section 7) | After |
+|---|---|---|
+| Dispatcher | 13,000–21,000 an hour active, about 12,600 quiet | 970–1,580 an hour |
+| Gatekeeper | about 3,400 an hour | 97–165 an hour |
+| Both together | 16,400–24,400 an hour | about 1,070–1,750 an hour |
+| Busiest minute | 1,644 requests | about 300, a sweep |
+| Writes | up to 351 an hour, at a peak | 11–32 an hour, in this window |
+
+Read traffic is down by about 93%, and under GitHub's base 5,000 an hour for an App, with room to spare. What's left of the dispatcher's 5,394 reads in the window:
+- **Issue listings: 1,243,** from the sweep and from release evaluations. GraphQL could batch these.
+- **Actions-run checks: 520,** for repositories a webhook marked as possibly running CI.
+- **Fresh reads of changed items: about 930,** issues and timelines.
+- **`main`, `CHANGELOG.md`, `CODEOWNERS` and tags: about 1,000.**
+
+The window had no quiet hour and no peak like the afternoon of the first measurement.
+
+### What this means for a GitHub version
+
+- **The design carries over, but GitHub will cost more requests than Forgejo for the same work.** The dispatcher and gatekeeper now work the way GitHub recommends: webhooks first, a slow reconciliation sweep, and a cache of what was last read. But the cache relies on `updated_at`, and GitHub may bump it for different changes than Forgejo does, so that would need checking again on GitHub. GitHub does support conditional requests, and a 304 doesn't count against the hourly limit. So on GitHub, the PR re-read and the sweep's listings could be conditional, and would then cost nothing when unchanged.
+- **Still to do:**
+  - measure a quiet hour and a busy one, which the second measurement didn't include;
+  - the write queue and budget;
+  - webhook delivery from GitHub to the Mac, through a relay or tunnel;
+  - the generic/specific split, with the forge as a swappable part.
+
+## 9. Contributions from outside the project
+
+A major reason to support GitHub is to find out whether the kit can accept issues and PRs from people outside the project. It isn't a hard requirement if the problems prove insurmountable. Forgejo mode can't do it, because its Forgejo is private to the Mac, so this is about GitHub mode.
+
+### How trust works today
+
+- Only trusted authors count: the kit's accounts and the human.
+- An untrusted account's request goes to its repository's owner to triage, with a description that carries only its number. Its comments start nothing.
+- Imported content is never trusted.
+
+The kit has never had to act on what an outsider wrote, beyond deciding whether to triage it.
+
+### Issues
+
+Accepting outsiders' issues is feasible with gates. The risks:
+- **Prompt injection.** An agent that reads an outsider's text can be steered by it. The kit's guardrails bound what a steered agent can do: it can't merge without the gatekeeper and conformance, can't release, can't change files only the human may change, and reaches the internet only through the allowlist. But it can still comment with its own token, and its container holds its forge token and Claude token.
+- **Cost.** Every outside request costs runs and rate limit, and on a public repository volume and spam are outside the kit's control.
+
+A design that addresses both:
+1. **A quarantine agent.** One agent, with a token that can only comment and label, reads outsiders' issues. It writes each up as a request in its own words, and never quotes instructions. Owners act on that write-up, not on the original.
+2. **A human gate.** An outsider's request reaches an owner only once the human, or a rule the human sets, accepts it. Before then it costs one quarantine run at most.
+3. **Caps.** Per outside author, and per day, using GitHub's interaction limits for new accounts.
+
+### PRs
+
+Accepting outsiders' PRs is harder, because of code execution.
+- **Building a Lean PR runs its code.** `lakefile.lean` is a Lean program, and macros, `run_cmd` and `#eval` run during elaboration. An agent that checks out and builds an outsider's PR gives its author code execution inside the agent's container, with the agent's tokens. So **agents must never build an outsider's PR.**
+- **CI is safe on GitHub's runners.** A `pull_request` workflow from a fork runs with a read-only token and no secrets **[policy]**. A self-hosted runner on the Mac should never run them: GitHub says self-hosted runners "should almost never be used for public repositories" **[policy]**. GitHub can also require a maintainer's approval before a fork's workflows run.
+- **Review is text.** Conformance and the coordinator can review the diff without building it. The diff is still untrusted text, with the same prompt-injection risk as an issue.
+- **Merging needs a human.** An outsider's PR merges only with the human's approval, on top of CI and the agents' reviews. Alternatively, an owner agent reimplements the change from the reviewed diff, in a PR of its own.
+
+### Verdict so far [inference]
+
+- **Issues:** feasible, with a quarantine agent, a human gate and caps.
+- **PRs:** feasible only under strict rules: never built by agents, CI on GitHub's runners alone, and the human approving every merge. Without those, they are the insurmountable case.
+
+**Decision (2026-11-24): issues only, at first.** Outsiders' PRs are closed automatically, with a note asking for an issue instead. The quarantine agent, the human gate and the caps are the first things to build. PRs can come later on the same machinery, with the extra rules above: agents never build them, CI runs on GitHub's runners, merges need the human, and contribution terms are decided.
+
+## 10. Open questions
+
+- **Local testing without Forgejo standing in for GitHub.** The stage tests need either a fake GitHub API, which drifts from the real one, or a test org on real GitHub, which carries suspension risk of its own. Possibly the forge seam can be tested against Forgejo, with only a thin GitHub adapter tested live. The adapter's retry logic, at least, can be tested without GitHub: a fake `curl` on `PATH` serving canned responses, such as a 429 then a success, makes retries quick and deterministic **[experience]**.
+- **Stalls that look like rate limiting.** These are input for the Lean investigation's list of stalls more than for the GitHub question. lean-bump's pipeline stopped mid-cascade, and none of the causes was a rate limit **[experience]**:
+  - a "needs a human" label that nothing removed once its cause went away;
+  - a "handled already" marker that recorded only the commit, so a successful re-run on that commit was skipped;
+  - an update with no changes, which pushed nothing, so CI never re-ran and nothing checked the item again;
+  - a validator stricter than the instructions it enforced;
+  - configuration missing in one repository.
+
+  This kit has had the same kind of bug, which is why `unstall` exists and why `needs-human` without a written decision is refused. A model of the states could rule out the first three by construction.
+- **How many Apps.** At least one per reviewing role, for distinct approvals (section 6). Whether the library agents also need one each depends on whether anything must tell them apart on GitHub, beyond the `From:` line.
+- **Adopting existing projects.** The kit must be able to adopt a project already on GitHub, owned by a single account, either working in place on GitHub or by importing it to Forgejo and mirroring back. `generic-specific-split.md` ("Forges and adoption") covers this. Two points belong here:
+  - Repositories can stay on a personal account. A private App can be installed only on the account that owns it, but a public App can be installed on other accounts **[policy]**. So the App can be owned by a separate organisation, made public, and installed on the personal account, which then never owns an App. No repositories move.
+  - On GitHub Free, a personal account's private repositories get no branch protection or rulesets. They need GitHub Pro **[policy]**. Public repositories have both on Free.
+  - Outside contributors' issues and PRs: section 9.
+- **Does an App's approval count as a required review?** GitHub's docs say only that approvals must come from those with write access. A community thread says a dedicated App's approval counts, while `github-actions[bot]`'s doesn't **[anecdote]**. Test it on a real repository. If it doesn't count, the kit falls back to what the old kit did: a required status check pinned to a specific App.

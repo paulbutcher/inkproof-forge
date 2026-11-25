@@ -1,0 +1,6 @@
+name = "kitmodel"
+version = "0.1.0"
+defaultTargets = ["Kitmodel"]
+
+[[lean_lib]]
+name = "Kitmodel"
