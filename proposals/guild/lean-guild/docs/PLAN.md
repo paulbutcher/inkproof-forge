@@ -4,8 +4,8 @@ The order of work for the guild, from an empty repository to a kit a project can
 
 ## The reference
 
-- [inkproof-forge](https://github.com/paulbutcher/inkproof-forge) at commit `REFERENCE_COMMIT`.
-- Clone it with `git clone https://github.com/paulbutcher/inkproof-forge ../inkproof-forge && git -C ../inkproof-forge checkout REFERENCE_COMMIT`. Read it; never change it.
+- [inkproof-forge](https://github.com/paulbutcher/inkproof-forge) at commit `c82e23a54bc2854f18130d88a519d9e63766836d`.
+- Clone it with `git clone https://github.com/paulbutcher/inkproof-forge ../inkproof-forge && git -C ../inkproof-forge checkout c82e23a54bc2854f18130d88a519d9e63766836d`. Read it; never change it.
 
 ## How to work
 

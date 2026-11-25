@@ -4,8 +4,8 @@ The order of work for Inkproof's instance of the guild. [REQUIREMENTS.md](REQUIR
 
 ## The reference
 
-- [inkproof-forge](https://github.com/paulbutcher/inkproof-forge) at commit `REFERENCE_COMMIT`, the same commit the guild's plan names.
-- Clone it with `git clone https://github.com/paulbutcher/inkproof-forge ../inkproof-forge && git -C ../inkproof-forge checkout REFERENCE_COMMIT`. Read it; never change it.
+- [inkproof-forge](https://github.com/paulbutcher/inkproof-forge) at commit `c82e23a54bc2854f18130d88a519d9e63766836d`, the same commit the guild's plan names.
+- Clone it with `git clone https://github.com/paulbutcher/inkproof-forge ../inkproof-forge && git -C ../inkproof-forge checkout c82e23a54bc2854f18130d88a519d9e63766836d`. Read it; never change it.
 
 ## How to work
 
